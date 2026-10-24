@@ -100,12 +100,20 @@ type MachineConfig struct {
 	MemoryMiB int64 `json:"mem_size_mib"`
 }
 
+// Validate checks the supported minimal machine profile.
+func (config MachineConfig) Validate() error {
+	if config.VCPUCount < 1 || config.VCPUCount > 32 || config.MemoryMiB <= 0 {
+		return errors.New("invalid Firecracker machine configuration: requires 1-32 vCPUs and positive memory MiB")
+	}
+	return nil
+}
+
 // ConfigureMachine sets the complete minimal machine profile before boot.
 // An error after sending a request does not prove the mutation was not applied.
 // The runtime owner must reconcile uncertain outcomes before further mutations.
 func (c *Client) ConfigureMachine(ctx context.Context, config MachineConfig) error {
-	if config.VCPUCount < 1 || config.VCPUCount > 32 || config.MemoryMiB <= 0 {
-		return errors.New("invalid Firecracker machine configuration: requires 1-32 vCPUs and positive memory MiB")
+	if err := config.Validate(); err != nil {
+		return err
 	}
 	return c.putJSON(ctx, "/machine-config", config)
 }
