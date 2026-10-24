@@ -11,6 +11,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - A runtime-internal Firecracker Unix-socket API client for instance metadata
   and minimal pre-boot CPU/memory configuration, with bounded requests and fake
   socket regression/fuzz tests. No real VM execution is implemented.
+- Fake-socket-tested Firecracker boot-source, virtio-blk root-drive, and
+  instance-start API methods, with artifact-path validation and no automatic
+  mutation retries. No VM launcher or guest images are included.
 - CLI subprocess e2e tests and a pinned kind/Sonobuoy Kubernetes baseline
   workflow with PR smoke tests, weekly/manual full conformance, and retained
   diagnostics. These do not qualify Brie for Node Conformance.
