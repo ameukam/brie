@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build fmt fmt-check vet test e2e conformance-smoke conformance fuzz lint vuln release-check check
+.PHONY: build fmt fmt-check vet test e2e registration-e2e conformance-smoke conformance fuzz lint vuln release-check check
 
 build:
 	$(GO) build -trimpath -o bin/brie-node ./cmd/brie-node
@@ -32,6 +32,9 @@ fuzz:
 
 e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e
+
+registration-e2e:
+	bash tests/registration/run.sh
 
 conformance-smoke:
 	bash tests/e2e/conformance.sh quick
