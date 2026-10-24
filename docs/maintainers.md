@@ -93,19 +93,3 @@ deps.dev indexing and refresh are controlled by that service; there is no
 repository workflow that guarantees immediate inclusion or a particular score.
 See the [deps.dev FAQ](https://docs.deps.dev/faq/) and
 [Scorecard check definitions](https://github.com/ossf/scorecard/blob/main/docs/checks.md).
-
-## Repo-agent
-
-Install repo-agent and its dependencies outside this project. Register the
-repository through its UI or apply `examples/repoboard.yaml` in the member's
-namespace after reviewing the resource and granting explicit approval.
-
-The example uses the current `RepoBoard` API, not the retired `RepoWatch` or
-ConfigDir flow. Automatic recipe rules are empty and automatic follow-up
-pushes are disabled. New automation requires an explicit decision about scope
-and resource limits.
-
-Keep credentials in the operator's credential settings. Agent sandboxes need
-the tools documented in `CONTRIBUTING.md` and access to public Go modules.
-Use `make check` for proposed changes. A board's ready-to-merge indicator does
-not override GitHub rules or replace human review.
