@@ -26,6 +26,7 @@ test:
 
 fuzz:
 	$(GO) test ./cmd/brie-node -run='^$$' -fuzz='^FuzzRun$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzDecodeInfo$$' -fuzztime=10s -parallel=2
 
 e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e

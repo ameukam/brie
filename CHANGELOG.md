@@ -8,6 +8,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 ### Added
 
 - A Go module and version-only `brie-node` command.
+- A runtime-internal Firecracker Unix-socket API client for instance metadata
+  and minimal pre-boot CPU/memory configuration, with bounded requests and fake
+  socket regression/fuzz tests. No real VM execution is implemented.
 - CLI subprocess e2e tests and a pinned kind/Sonobuoy Kubernetes baseline
   workflow with PR smoke tests, weekly/manual full conformance, and retained
   diagnostics. These do not qualify Brie for Node Conformance.
