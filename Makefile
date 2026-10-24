@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build fmt fmt-check vet test fuzz lint vuln release-check check
+.PHONY: build fmt fmt-check vet test e2e conformance-smoke conformance fuzz lint vuln release-check check
 
 build:
 	$(GO) build -trimpath -o bin/brie-node ./cmd/brie-node
@@ -26,6 +26,15 @@ test:
 
 fuzz:
 	$(GO) test ./cmd/brie-node -run='^$$' -fuzz='^FuzzRun$$' -fuzztime=10s -parallel=2
+
+e2e:
+	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e
+
+conformance-smoke:
+	bash tests/e2e/conformance.sh quick
+
+conformance:
+	bash tests/e2e/conformance.sh certified-conformance
 
 lint:
 	golangci-lint run

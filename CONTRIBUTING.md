@@ -30,6 +30,46 @@ generated binaries, coverage output, or release archives.
 
 Update `CHANGELOG.md` under `Unreleased` for user-visible changes.
 
+## E2E and Kubernetes baseline
+
+`make e2e` requires Go from `go.mod` and `jq`. It builds and executes development
+and release-version CLI binaries, checking exit codes, stdout, and stderr. It
+also tests the baseline result gate against empty, skipped, failed, unknown,
+and malformed results.
+
+The [Kubernetes baseline workflow](.github/workflows/e2e.yml) runs Sonobuoy's
+`quick` Pod creation/deletion test on PRs and main pushes. Weekly and manual
+runs use `certified-conformance`: the complete upstream `[Conformance]` selection,
+including serial and disruptive tests, without extra skip filters. Results
+fail closed if selected tests are absent, skipped, or unsuccessful.
+
+To reproduce on a **disposable local Docker environment**, install kind v0.33.0,
+kubectl v1.37.0, Sonobuoy v0.57.5, and jq, then run:
+
+```sh
+make conformance-smoke
+make conformance
+```
+
+The harness creates a uniquely named, single-node kind cluster using the stock
+upstream scheduler and kubelet, an isolated temporary kubeconfig, and pinned node,
+Sonobuoy, and conformance images. It never targets the current kubeconfig. Each
+invocation deletes only its own cluster on exit. Full runs can take four hours;
+do not interrupt cleanup. Set `ARTIFACTS_DIR` to retain separate run directories
+(default: `artifacts/conformance`). The workflow checks tool download hashes
+and preserves the Sonobuoy archive (including JUnit), detailed results, versions,
+and kind logs for 14 days, including on failure. Kubeconfigs are not uploaded.
+
+This is an **upstream Kubernetes cluster baseline**, not Brie Node Conformance
+or CNCF certification. Brie still implements only a version CLI. No node-agent,
+Brie runtime/guest execution, Firecracker, Arm64/KVM, restart-survival, or
+hibernation behavior is exercised.
+The chosen Kubernetes version is a baseline pin, not a resolved D4 support matrix.
+Before claiming G1 in [DESIGN.md](DESIGN.md), implement and qualify the M0-M1
+node/runtime stack, pin its complete compatibility profile, run the complete
+upstream **Node Conformance** suite against Brie on that profile, publish the
+results, and resolve every failure. Application lifecycle tests remain separate.
+
 ## Pull requests
 
 Explain what changed and why. Keep unrelated work separate and make the
