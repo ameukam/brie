@@ -16,7 +16,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - Linux amd64 and arm64 release archives, SHA-256 checksums, and signed build
   provenance on GitHub Releases.
 - Dated nightly prereleases.
-- Apache-2.0 licensing, contributor guidance, and repo-agent configuration.
+- Apache-2.0 licensing and contributor guidance.
 
 ### Changed
 
