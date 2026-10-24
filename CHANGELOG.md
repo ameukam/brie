@@ -8,6 +8,13 @@ versioning. Dated nightly prereleases are development builds, not stable release
 ### Added
 
 - A Go module and version-only `brie-node` command.
+- An opt-in `brie-node --run --node-name=NAME` scaffold with validated host
+  identity and clean SIGINT/SIGTERM shutdown. It does not register a node,
+  connect to Kubernetes, or invoke Firecracker.
+- Optional explicit `--kubeconfig=/absolute/path` host registration, using
+  Kubernetes v1.37 clients, NotReady status, zero advertised resources, and
+  Node Lease heartbeats. Registered Nodes remain cordoned and tainted; no
+  workloads are executed. New HTTP/2 dependencies include security fixes.
 - A runtime-internal Firecracker Unix-socket API client for instance metadata
   and minimal pre-boot CPU/memory configuration, with bounded requests and fake
   socket regression/fuzz tests. No real VM execution is implemented.

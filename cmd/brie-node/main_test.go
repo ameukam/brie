@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -69,6 +70,18 @@ func TestRun(t *testing.T) {
 			args:    []string{"--version", "start"},
 			wantErr: "unexpected arguments",
 		},
+		{name: "run without name", args: []string{"--run"}, wantErr: "validate agent configuration"},
+		{name: "invalid name", args: []string{"--run", "--node-name=Bad"}, wantErr: "validate agent configuration"},
+		{name: "conflicting modes", args: []string{"--run", "--version"}, wantErr: "cannot be combined"},
+		{name: "name without run", args: []string{"--node-name=node-1"}, wantErr: "requires --run"},
+		{name: "empty name without run", args: []string{"--node-name="}, wantErr: "requires --run"},
+		{name: "name with version", args: []string{"--version", "--node-name=node-1"}, wantErr: "requires --run"},
+		{name: "disabled run", args: []string{"--run=false"}, wantErr: "node execution is not implemented"},
+		{name: "cancelled agent", args: []string{"--run", "--node-name=node-1"}},
+		{name: "cancelled registration", args: []string{"--run", "--node-name=node-1", "--kubeconfig=/unused"}},
+		{name: "empty kubeconfig", args: []string{"--run", "--node-name=node-1", "--kubeconfig="}, wantErr: "must not be empty"},
+		{name: "kubeconfig without run", args: []string{"--kubeconfig=/unused"}, wantErr: "requires --run"},
+		{name: "relative kubeconfig", args: []string{"--run", "--node-name=node-1", "--kubeconfig=relative"}, wantErr: "absolute kubeconfig"},
 	}
 
 	for _, tt := range tests {
@@ -76,7 +89,9 @@ func TestRun(t *testing.T) {
 			t.Parallel()
 
 			var stdout, stderr bytes.Buffer
-			err := run(tt.args, "v0.0.0-test", &stdout, &stderr)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			err := run(ctx, tt.args, "v0.0.0-test", &stdout, &stderr)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("run() error = %v", err)
@@ -99,7 +114,7 @@ func TestRunWriteError(t *testing.T) {
 
 	writeErr := errors.New("output unavailable")
 	var stderr bytes.Buffer
-	err := run([]string{"--version"}, "test", failingWriter{err: writeErr}, &stderr)
+	err := run(t.Context(), []string{"--version"}, "test", failingWriter{err: writeErr}, &stderr)
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("run() error = %v, want wrapped %v", err, writeErr)
 	}
@@ -117,13 +132,17 @@ func FuzzRun(f *testing.F) {
 	for _, seed := range []string{
 		"", "--version", "--help", "-h", "--version=false",
 		"--unknown", "--version extra", "--version=invalid", "-- --version",
+		"--run", "--run --node-name=node-1", "--run --version", "--node-name=",
+		"--run --node-name=node-1 --kubeconfig=/unused", "--run --kubeconfig=",
 	} {
 		f.Add(seed)
 	}
 
 	f.Fuzz(func(t *testing.T, input string) {
 		var stdout, stderr bytes.Buffer
-		err := run(strings.Fields(input), "fuzz", &stdout, &stderr)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		err := run(ctx, strings.Fields(input), "fuzz", &stdout, &stderr)
 		if err != nil && stdout.Len() != 0 {
 			t.Fatalf("failed command wrote to stdout: %q", stdout.String())
 		}
