@@ -40,7 +40,7 @@ lint:
 	golangci-lint run
 
 vuln:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 release-check:
 	goreleaser check
