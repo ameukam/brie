@@ -22,6 +22,7 @@ import (
 	coordinationclient "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -126,6 +127,12 @@ func register(ctx context.Context, config Config, nodes coreclient.NodeInterface
 }
 
 func heartbeat(ctx context.Context, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, name string, uid types.UID) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return heartbeatOnce(ctx, nodes, leases, name, uid)
+	})
+}
+
+func heartbeatOnce(ctx context.Context, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, name string, uid types.UID) error {
 	node, err := nodes.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("read Node for heartbeat: %w", err)

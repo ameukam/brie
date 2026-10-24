@@ -7,6 +7,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A disposable kind registration test and CI job covering Node and Lease
+  lifecycle, heartbeat loss, restart, and node-scoped permission denials.
 - A Go module and version-only `brie-node` command.
 - An opt-in `brie-node --run --node-name=NAME` scaffold with validated host
   identity and clean SIGINT/SIGTERM shutdown. It does not register a node,
@@ -33,6 +35,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Changed
 
+- Retry bounded Node/Lease resource-version conflicts during registration
+  heartbeats, revalidating Node identity and scheduling guards on each attempt.
 - Reduced the README to an abstract ten-word sentence.
 
 [Unreleased]: https://github.com/ameukam/brie/commits/main

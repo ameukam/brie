@@ -199,6 +199,57 @@ func (w cancelWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func TestHeartbeatConflictRetries(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		persistent bool
+		replace    bool
+		wantCalls  int
+	}{
+		{name: "transient status conflict", wantCalls: 2},
+		{name: "persistent status conflict", persistent: true, wantCalls: 5},
+		{name: "identity changes after conflict", replace: true, wantCalls: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fake.NewClientset(testNode())
+			calls := 0
+			client.PrependReactor("update", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "status" {
+					return false, nil, nil
+				}
+				calls++
+				if calls == 1 || tt.persistent {
+					if tt.replace {
+						node := testNode()
+						node.UID = "replacement"
+						if err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), node, ""); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, "worker-1", errors.New("changed"))
+				}
+				return false, nil, nil
+			})
+			err := heartbeat(t.Context(), client.CoreV1().Nodes(), client.CoordinationV1().Leases(leaseNamespace), "worker-1", "node-uid")
+			switch {
+			case tt.persistent:
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("expected exhausted conflict, got %v", err)
+				}
+			case tt.replace:
+				if err == nil || !strings.Contains(err.Error(), "changed identity") {
+					t.Fatalf("expected identity refusal, got %v", err)
+				}
+			case err != nil:
+				t.Fatal(err)
+			}
+			if calls != tt.wantCalls {
+				t.Fatalf("status attempts = %d, want %d", calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
 func TestRegistrationConfiguration(t *testing.T) {
 	for _, tt := range []struct{ name, config, want string }{
 		{name: "missing file", want: "load registration kubeconfig"},
