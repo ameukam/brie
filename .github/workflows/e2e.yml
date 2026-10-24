@@ -1,0 +1,62 @@
+name: Kubernetes baseline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: k8s-baseline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  baseline:
+    name: Upstream kind baseline (not Brie qualification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 270
+    permissions:
+      contents: read
+    env:
+      MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'certified-conformance' || 'quick' }}
+      ARTIFACTS_DIR: ${{ github.workspace }}/artifacts/conformance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified baseline tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/baseline-tools"
+          mkdir -p "$tools"
+          cd "$tools"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64 -o kind
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl -o kubectl
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/vmware-tanzu/sonobuoy/releases/download/v0.57.5/sonobuoy_0.57.5_linux_amd64.tar.gz -o sonobuoy.tar.gz
+          printf '%s\n' \
+            'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind' \
+            '6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f  kubectl' \
+            '7c5c2250e5103c98f4dad2bcab86baf954e319c57c419c113f28f5060e62f129  sonobuoy.tar.gz' \
+            | sha256sum --check --strict
+          tar -xzf sonobuoy.tar.gz sonobuoy
+          chmod +x kind kubectl sonobuoy
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Run upstream baseline
+        shell: bash
+        run: bash tests/e2e/conformance.sh "$MODE"
+      - name: Preserve results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: upstream-kind-${{ env.MODE }}-${{ github.run_attempt }}
+          path: artifacts/conformance/
+          if-no-files-found: error
+          retention-days: 14
