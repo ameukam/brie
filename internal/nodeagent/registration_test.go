@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -98,6 +99,88 @@ func TestRegistrationHeartbeat(t *testing.T) {
 	})
 }
 
+func TestHeartbeatPreservesOtherStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		hasReady bool
+		conflict bool
+	}{
+		{name: "adds Ready"},
+		{name: "updates Ready", hasReady: true},
+		{name: "preserves concurrent maintenance update", hasReady: true, conflict: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			node := testNode()
+			before := metav1.NewTime(time.Now().Add(-time.Hour))
+			for _, kind := range []corev1.NodeConditionType{
+				corev1.NodeDrainInProgress, corev1.NodeDrained,
+				corev1.NodeMaintenancePlanned, corev1.NodeMaintenanceInProgress,
+				corev1.NodeGracefulNodeShutdownInProgress, corev1.NodeNetworkUnavailable,
+				"example.com/CustomCondition",
+			} {
+				node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+					Type: kind, Status: corev1.ConditionUnknown, Reason: "ExternalObservation",
+					Message: "owned by another controller", LastHeartbeatTime: before, LastTransitionTime: before,
+				})
+			}
+			external := append([]corev1.NodeCondition(nil), node.Status.Conditions...)
+			if tt.hasReady {
+				node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+					Type: corev1.NodeReady, Status: corev1.ConditionTrue, LastTransitionTime: before,
+				})
+			}
+			node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "192.0.2.1"}}
+			node.Status.NodeInfo.BootID = "observed-boot"
+			want := node.Status.DeepCopy()
+			client := fake.NewClientset(node)
+			calls := 0
+			client.PrependReactor("update", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "status" {
+					return false, nil, nil
+				}
+				calls++
+				if tt.conflict && calls == 1 {
+					changed := node.DeepCopy()
+					changed.Status.Conditions[0].Status = corev1.ConditionTrue
+					changed.Status.Conditions[0].Reason = "DrainStarted"
+					external[0] = changed.Status.Conditions[0]
+					if err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("nodes"), changed, ""); err != nil {
+						t.Fatal(err)
+					}
+					return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, node.Name, errors.New("maintenance updated"))
+				}
+				return false, nil, nil
+			})
+			for range 2 {
+				if err := heartbeat(t.Context(), client.CoreV1().Nodes(), client.CoordinationV1().Leases(leaseNamespace), node.Name, node.UID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := client.CoreV1().Nodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Status.Conditions) != len(external)+1 ||
+				!reflect.DeepEqual(got.Status.Conditions[:len(external)], external) {
+				t.Fatalf("external conditions changed: %+v", got.Status.Conditions)
+			}
+			ready := got.Status.Conditions[len(external)]
+			if ready.Type != corev1.NodeReady || ready.Status != corev1.ConditionFalse ||
+				ready.Reason != "RuntimeNotImplemented" || !ready.LastTransitionTime.After(before.Time) {
+				t.Fatalf("unsafe Ready condition: %+v", ready)
+			}
+			// Normalize only fields registration owns to compare all remaining status.
+			got.Status.Conditions = want.Conditions
+			got.Status.Capacity = want.Capacity
+			got.Status.Allocatable = want.Allocatable
+			got.Status.NodeInfo.OperatingSystem = want.NodeInfo.OperatingSystem
+			got.Status.NodeInfo.Architecture = want.NodeInfo.Architecture
+			if !reflect.DeepEqual(&got.Status, want) {
+				t.Fatalf("unrelated Node status changed: %+v", got.Status)
+			}
+		})
+	}
+}
 func TestRegistrationRefusesUnsafeState(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

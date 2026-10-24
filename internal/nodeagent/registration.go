@@ -161,14 +161,24 @@ func heartbeatOnce(ctx context.Context, nodes coreclient.NodeInterface, leases c
 			transition = condition.LastTransitionTime
 		}
 	}
-	node.Status = corev1.NodeStatus{
-		Capacity: zero.DeepCopy(), Allocatable: zero.DeepCopy(),
-		NodeInfo: corev1.NodeSystemInfo{OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH},
-		Conditions: []corev1.NodeCondition{{
-			Type: corev1.NodeReady, Status: corev1.ConditionFalse,
-			Reason: "RuntimeNotImplemented", Message: "Brie registration only; workload execution is not implemented",
-			LastHeartbeatTime: now, LastTransitionTime: transition,
-		}},
+	node.Status.Capacity = zero.DeepCopy()
+	node.Status.Allocatable = zero.DeepCopy()
+	node.Status.NodeInfo.OperatingSystem = runtime.GOOS
+	node.Status.NodeInfo.Architecture = runtime.GOARCH
+	ready := corev1.NodeCondition{
+		Type: corev1.NodeReady, Status: corev1.ConditionFalse,
+		Reason: "RuntimeNotImplemented", Message: "Brie registration only; workload execution is not implemented",
+		LastHeartbeatTime: now, LastTransitionTime: transition,
+	}
+	foundReady := false
+	for i := range node.Status.Conditions {
+		if node.Status.Conditions[i].Type == corev1.NodeReady {
+			node.Status.Conditions[i] = ready
+			foundReady = true
+		}
+	}
+	if !foundReady {
+		node.Status.Conditions = append(node.Status.Conditions, ready)
 	}
 	if _, err := nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("update Node status: %w", err)
