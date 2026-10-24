@@ -1,0 +1,53 @@
+version: 2
+project_name: brie
+
+builds:
+  - id: brie-node
+    main: ./cmd/brie-node
+    binary: brie-node
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - ids:
+      - brie-node
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Version }}-snapshot.{{ .ShortCommit }}"
+
+changelog:
+  use: git
+  sort: asc
+
+release:
+  github:
+    owner: ameukam
+    name: brie
+  draft: true
+  prerelease: auto
+  make_latest: "false"
+  target_commitish: "{{ .FullCommit }}"
+  replace_existing_artifacts: false
+  preflight:
+    fail_on_error: true

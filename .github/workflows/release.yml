@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Publish Linux release
+    needs: checks
+    if: github.repository == 'ameukam/brie'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+      - name: Select immutable release tag
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commits must be reachable from main." >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "Nightly releases must run from main." >&2
+              exit 1
+            fi
+            tag="v0.0.0-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+            git tag "$tag"
+          fi
+
+          prerelease=false
+          latest=true
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+            latest=false
+          fi
+          printf 'tag=%s\nprerelease=%s\nlatest=%s\n' \
+            "$tag" "$prerelease" "$latest" >> "$GITHUB_OUTPUT"
+      - name: Build and upload draft release
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.18.3
+          args: release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GORELEASER_CURRENT_TAG: ${{ steps.metadata.outputs.tag }}
+      - name: Attest release archives and checksums
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          create-storage-record: false
+      - name: Upload provenance and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+          LATEST: ${{ steps.metadata.outputs.latest }}
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          jq -e -c '
+            .dsseEnvelope
+            | select(.payloadType == "application/vnd.in-toto+json")
+            | select((.payload | @base64d | fromjson | .predicateType) == "https://slsa.dev/provenance/v1")
+            | select(.signatures | length > 0)
+          ' "$BUNDLE_PATH" > dist/provenance.intoto.jsonl
+          cp "$BUNDLE_PATH" dist/attestation.sigstore.json
+          gh release upload "$RELEASE_TAG" \
+            dist/attestation.sigstore.json dist/provenance.intoto.jsonl
+          gh release edit "$RELEASE_TAG" --draft=false \
+            --prerelease="$PRERELEASE" --latest="$LATEST"
