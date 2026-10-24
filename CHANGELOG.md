@@ -7,9 +7,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
-- A runtime-internal, in-memory process owner with serialized lifecycle
-  operations, bounded waits, and fake-process supervision tests. No real
-  launcher, durable journal, or node-agent integration is included.
+- The runtime owner now journals lifecycle state and prevents concurrent owners
+  for the same execution on one host.
+- The owner can configure a Firecracker machine and request instance start.
+  This does not launch a VM.
 - A disposable kind registration test and CI job covering Node and Lease
   lifecycle, heartbeat loss, restart, and node-scoped permission denials.
 - A Go module and version-only `brie-node` command.

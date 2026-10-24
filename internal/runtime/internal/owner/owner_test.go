@@ -6,6 +6,7 @@ package owner
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,25 +58,48 @@ func testConfig() Config {
 
 func newOwner(t *testing.T, launch Launcher) *Owner {
 	t.Helper()
-	o, err := New(testConfig(), launch)
+	config := testConfig()
+	config.JournalDir = filepath.Join(t.TempDir(), "journal")
+	o, err := New(config, launch)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		state := o.Status().State
+		if state == Idle || state == Exited {
+			if err := o.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
 	return o
 }
 
 func TestConfig(t *testing.T) {
 	t.Parallel()
+	valid := testConfig()
+	valid.JournalDir = filepath.Join(t.TempDir(), "journal")
+	missingSandbox := valid
+	missingSandbox.SandboxUID = ""
+	blankPod := valid
+	blankPod.PodUID = " \n"
+	zeroTimeout := valid
+	zeroTimeout.OperationTimeout = 0
+	negativeTimeout := valid
+	negativeTimeout.OperationTimeout = -time.Second
+	missingJournal := valid
+	missingJournal.JournalDir = ""
 	for _, tt := range []struct {
 		name   string
 		config Config
 		nilRun bool
 	}{
-		{name: "missing sandbox", config: Config{PodUID: "pod", OperationTimeout: time.Second}},
-		{name: "blank Pod", config: Config{SandboxUID: "sandbox", PodUID: " \n", OperationTimeout: time.Second}},
-		{name: "zero timeout", config: Config{SandboxUID: "sandbox", PodUID: "pod"}},
-		{name: "negative timeout", config: Config{SandboxUID: "sandbox", PodUID: "pod", OperationTimeout: -time.Second}},
-		{name: "missing launcher", config: testConfig(), nilRun: true},
+		{name: "missing sandbox", config: missingSandbox},
+		{name: "blank Pod", config: blankPod},
+		{name: "zero timeout", config: zeroTimeout},
+		{name: "negative timeout", config: negativeTimeout},
+		{name: "missing journal", config: missingJournal},
+		{name: "missing launcher", config: valid, nilRun: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var launch Launcher = launchFunc(func(context.Context, Config) (Process, error) {
@@ -98,7 +122,9 @@ func TestLifecycle(t *testing.T) {
 		starts := 0
 		o := newOwner(t, launchFunc(func(_ context.Context, config Config) (Process, error) {
 			starts++
-			if config != testConfig() {
+			expected := testConfig()
+			if config.SandboxUID != expected.SandboxUID || config.PodUID != expected.PodUID ||
+				config.OperationTimeout != expected.OperationTimeout || config.JournalDir == "" {
 				t.Errorf("launcher config = %+v", config)
 			}
 			return p, nil
@@ -155,6 +181,7 @@ func TestStartFailure(t *testing.T) {
 			if o.Status().State != Unknown || o.Status().Err == nil {
 				t.Fatalf("failed launch status = %+v", o.Status())
 			}
+			assertJournalState(t, o.journal.path, Unknown, BootUnconfigured)
 			if err := o.Start(t.Context()); err == nil {
 				t.Fatal("retried failed launch")
 			}
@@ -205,6 +232,23 @@ func TestCanceledCallsDoNotMutate(t *testing.T) {
 	}
 	if o.Status().State != Idle {
 		t.Fatalf("cancelled operation changed status: %+v", o.Status())
+	}
+}
+
+func TestClosePreventsStartAfterReleasingFence(t *testing.T) {
+	starts := 0
+	o := newOwner(t, launchFunc(func(context.Context, Config) (Process, error) {
+		starts++
+		return nil, errors.New("unexpected launch")
+	}))
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(t.Context()); err == nil {
+		t.Fatal("closed owner started")
+	}
+	if starts != 0 {
+		t.Fatalf("closed owner launch attempts = %d", starts)
 	}
 }
 
@@ -272,6 +316,7 @@ func TestStopUncertainty(t *testing.T) {
 				if !errors.Is(err, wantErr) || o.Status().State != tt.wantState {
 					t.Fatalf("Stop() = %v, status=%+v", err, o.Status())
 				}
+				assertJournalState(t, o.journal.path, tt.wantState, BootUnconfigured)
 				if err := o.Stop(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("second Stop() = %v", err)
 				}
@@ -283,6 +328,7 @@ func TestStopUncertainty(t *testing.T) {
 				if err := o.Stop(t.Context()); err != nil || o.Status().State != Exited {
 					t.Fatalf("observed exit: err=%v status=%+v", err, o.Status())
 				}
+				assertJournalState(t, o.journal.path, Exited, BootUnknown)
 			})
 		})
 	}

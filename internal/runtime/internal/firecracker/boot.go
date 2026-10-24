@@ -18,14 +18,22 @@ type BootSource struct {
 	BootArgs        string `json:"boot_args"`
 }
 
-// ConfigureBootSource replaces the pre-boot kernel configuration. Initrd boot
-// is not supported by this minimal profile. It does not inspect or open files.
-func (c *Client) ConfigureBootSource(ctx context.Context, source BootSource) error {
+// Validate checks the kernel path and command line before any machine mutation.
+func (source BootSource) Validate() error {
 	if !validArtifactPath(source.KernelImagePath) {
 		return errors.New("invalid Firecracker kernel path: must be absolute UTF-8 and contain no NUL bytes")
 	}
 	if !utf8.ValidString(source.BootArgs) || strings.ContainsRune(source.BootArgs, '\x00') {
 		return errors.New("invalid Firecracker boot arguments: must be UTF-8 and contain no NUL bytes")
+	}
+	return nil
+}
+
+// ConfigureBootSource replaces the pre-boot kernel configuration. Initrd boot
+// is not supported by this minimal profile. It does not inspect or open files.
+func (c *Client) ConfigureBootSource(ctx context.Context, source BootSource) error {
+	if err := source.Validate(); err != nil {
+		return err
 	}
 	return c.putJSON(ctx, "/boot-source", source)
 }
@@ -37,12 +45,20 @@ type RootDrive struct {
 	ReadOnly   bool
 }
 
+// Validate checks the root filesystem path before any machine mutation.
+func (drive RootDrive) Validate() error {
+	if !validArtifactPath(drive.PathOnHost) {
+		return errors.New("invalid Firecracker root drive path: must be absolute UTF-8 and contain no NUL bytes")
+	}
+	return nil
+}
+
 // ConfigureRootDrive sets the single rootfs drive before boot, using the Sync
 // IO engine and Writeback cache so guest flush requests are honored. This does
 // not establish checkpoint durability or ownership of the backing file.
 func (c *Client) ConfigureRootDrive(ctx context.Context, drive RootDrive) error {
-	if !validArtifactPath(drive.PathOnHost) {
-		return errors.New("invalid Firecracker root drive path: must be absolute UTF-8 and contain no NUL bytes")
+	if err := drive.Validate(); err != nil {
+		return err
 	}
 	return c.putJSON(ctx, "/drives/rootfs", struct {
 		ID        string `json:"drive_id"`
