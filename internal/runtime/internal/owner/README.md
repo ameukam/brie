@@ -23,9 +23,17 @@ stop requests are not repeated either: subsequent calls only wait for observed
 exit. Canceling a caller does not discard or implicitly terminate its process.
 Unexpected exits remain visible with their error. An exited owner cannot restart.
 
-There is no production launcher or CLI wiring. Tests use fake processes only.
-This package does not provide owner crash recovery or survival across
-node-agent restart. Those remain required before accepting workloads.
+The Linux `FirecrackerLauncher` starts a foreground VMM in a fresh private
+directory, records output in `vmm.log`, and waits for matching pre-boot API
+metadata. It passes no parent environment to the child. Failed startup kills
+and reaps that child; cancellation after startup does not terminate it.
+`Stop` kills the owned process and `Wait` observes its exit. This is not a
+graceful guest shutdown. Runtime directories and logs are retained.
+
+This launcher is for disposable host experiments, not tenant workloads: there
+is no jailer, privilege separation, resource isolation, CLI wiring, or owner
+crash recovery. Tests run fake VMM subprocesses without KVM. Survival across
+node-agent restart is not implemented.
 
 After an injected process is owned, `Boot` sends the complete machine, kernel,
 and root-drive profile in order, followed by one `InstanceStart` request.

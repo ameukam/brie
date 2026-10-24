@@ -54,8 +54,7 @@ func openLifecycleJournal(dir, sandboxUID, podUID string) (*lifecycleJournal, er
 		return nil, errors.New("owner journal directory must not be accessible by group or others")
 	}
 
-	sum := sha256.Sum256([]byte(sandboxUID + "\x00" + podUID))
-	identity := hex.EncodeToString(sum[:])
+	identity := executionIdentity(sandboxUID, podUID)
 	base := "owner-" + identity
 	lockPath := filepath.Join(dir, base+".lock")
 	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
@@ -96,6 +95,11 @@ func openLifecycleJournal(dir, sandboxUID, podUID string) (*lifecycleJournal, er
 		return nil, closeLock(fmt.Errorf("initialize owner journal: %w", err))
 	}
 	return journal, nil
+}
+
+func executionIdentity(sandboxUID, podUID string) string {
+	sum := sha256.Sum256([]byte(sandboxUID + "\x00" + podUID))
+	return hex.EncodeToString(sum[:])
 }
 
 func (j *lifecycleJournal) write(record journalRecord) error {
