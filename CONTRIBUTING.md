@@ -54,6 +54,11 @@ each run you want to retain. CI keeps results, versions, and kind logs for
 This tests upstream Kubernetes, not Brie Node Conformance or CNCF certification.
 It does not exercise Brie's runtime, node registration, or hibernation.
 
+`make registration-e2e` uses a separate disposable kind cluster to check Brie
+registration, including preservation of administrator-owned Kubernetes 1.37 Node
+lifecycle conditions across heartbeats and agent restarts. These conditions are
+observations, not commands to drain or shut down a node.
+
 ## Pull requests
 
 Explain what changed and why. Keep unrelated work separate and wait for required

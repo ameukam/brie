@@ -41,6 +41,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Changed
 
+- Registration heartbeats preserve externally managed Node conditions and status.
 - Retry bounded Node/Lease resource-version conflicts during registration
   heartbeats, revalidating Node identity and scheduling guards on each attempt.
 - Reduced the README to an abstract ten-word sentence.

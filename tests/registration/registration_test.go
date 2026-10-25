@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"os"
@@ -23,8 +24,10 @@ import (
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -130,6 +133,42 @@ func TestRegistration(t *testing.T) {
 	node := getNode(ctx, t, admin, name)
 	assertSafeNode(t, node)
 	uid := node.UID
+	externalConditions := []corev1.NodeCondition{}
+	for _, kind := range []corev1.NodeConditionType{
+		corev1.NodeDrainInProgress, corev1.NodeDrained, corev1.NodeMaintenancePlanned,
+		corev1.NodeMaintenanceInProgress, corev1.NodeGracefulNodeShutdownInProgress,
+	} {
+		externalConditions = append(externalConditions, corev1.NodeCondition{
+			Type: kind, Status: corev1.ConditionFalse, Reason: "LifecycleTest",
+			Message:            "administrator-owned test observation",
+			LastTransitionTime: metav1.NewTime(time.Now().UTC().Truncate(time.Second)),
+		})
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"uid": uid, "resourceVersion": node.ResourceVersion},
+		"status":   map[string]any{"conditions": externalConditions},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.CoreV1().Nodes().Patch(ctx, name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "status"); err != nil {
+		t.Fatal(err)
+	}
+	assertExternalConditions := func() {
+		t.Helper()
+		current := getNode(ctx, t, admin, name)
+		for _, expected := range externalConditions {
+			found := false
+			for _, condition := range current.Status.Conditions {
+				if condition.Type == expected.Type {
+					found = equality.Semantic.DeepEqual(condition, expected)
+				}
+			}
+			if !found {
+				t.Fatalf("external condition %s lost or changed: %+v", expected.Type, current.Status.Conditions)
+			}
+		}
+	}
 	lease, err := admin.CoordinationV1().Leases("kube-node-lease").Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +187,7 @@ func TestRegistration(t *testing.T) {
 		}
 		return current.Spec.RenewTime != nil && current.Spec.RenewTime.After(firstRenew), nil
 	})
+	assertExternalConditions()
 	controlNodes, err := admin.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/control-plane"})
 	if err != nil || len(controlNodes.Items) != 1 {
 		t.Fatalf("expected one disposable control-plane node: %v", err)
@@ -198,6 +238,7 @@ func TestRegistration(t *testing.T) {
 	})
 	node = getNode(ctx, t, admin, name)
 	assertSafeNode(t, node)
+	assertExternalConditions()
 	if node.UID != uid {
 		t.Fatal("restart replaced the Node")
 	}
