@@ -13,9 +13,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/ameukam/brie/internal/runtime/internal/firecracker"
 	"github.com/ameukam/brie/internal/runtime/internal/owner"
 )
 
@@ -32,6 +34,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	flags := flag.NewFlagSet("brie-owner", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var config owner.ServiceConfig
+	guestCID := flags.Uint64("guest-cid", 0, "Optional guest vsock CID (3-4294967294; 0 disables vsock)")
 	flags.StringVar(&config.Owner.SandboxUID, "sandbox-uid", "", "Sandbox execution identity")
 	flags.StringVar(&config.Owner.PodUID, "pod-uid", "", "Pod execution identity")
 	flags.DurationVar(&config.Owner.OperationTimeout, "timeout", 10*time.Second, "Positive lifecycle operation timeout")
@@ -51,6 +54,15 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	if flags.NArg() != 0 {
 		return errors.New("owner accepts no positional arguments")
+	}
+	if *guestCID != 0 {
+		if *guestCID < 3 || *guestCID >= 1<<32-1 {
+			return errors.New("guest CID must be between 3 and 4294967294")
+		}
+		config.Boot.Vsock = &firecracker.VsockConfig{
+			GuestCID: uint32(*guestCID),
+			UDSPath:  filepath.Join(config.Directory, "vmm", "vsock.sock"),
+		}
 	}
 	return owner.Serve(ctx, config, log.New(stderr, "brie-owner: ", 0))
 }

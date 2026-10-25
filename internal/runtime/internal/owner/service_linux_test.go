@@ -179,6 +179,9 @@ func TestOwnerServiceValidation(t *testing.T) {
 		{name: "relative directory", change: func(c *ServiceConfig) { c.Directory = "relative" }},
 		{name: "journal override", change: func(c *ServiceConfig) { c.Owner.JournalDir = "/journal" }},
 		{name: "invalid boot", change: func(c *ServiceConfig) { c.Boot.Machine.VCPUCount = 0 }},
+		{name: "external vsock", change: func(c *ServiceConfig) {
+			c.Boot.Vsock = &firecracker.VsockConfig{GuestCID: 3, UDSPath: "/another/vsock.sock"}
+		}},
 		{name: "long socket", change: func(c *ServiceConfig) { c.Directory = "/" + strings.Repeat("a", 110) }},
 		{name: "missing executable", change: func(c *ServiceConfig) { c.Binary = "/missing-firecracker" }},
 		{name: "missing identity", change: func(c *ServiceConfig) { c.Owner.PodUID = "" }},
@@ -221,6 +224,9 @@ func TestOwnerServiceChild(t *testing.T) {
 
 func TestOwnerServiceSurvivesClients(t *testing.T) {
 	config := serviceConfig(t, "normal")
+	config.Boot.Vsock = &firecracker.VsockConfig{
+		GuestCID: 3, UDSPath: filepath.Join(config.Directory, "vmm", "vsock.sock"),
+	}
 	data, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)

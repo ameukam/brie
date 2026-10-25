@@ -17,6 +17,7 @@ type BootConfig struct {
 	Machine    firecracker.MachineConfig
 	BootSource firecracker.BootSource
 	RootDrive  firecracker.RootDrive
+	Vsock      *firecracker.VsockConfig
 }
 
 // Validate checks the entire profile before the owner sends any mutation.
@@ -29,6 +30,11 @@ func (config BootConfig) Validate() error {
 	}
 	if err := config.RootDrive.Validate(); err != nil {
 		return err
+	}
+	if config.Vsock != nil {
+		if err := config.Vsock.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -45,6 +51,8 @@ const (
 	BootConfiguringSource BootState = "ConfiguringBootSource"
 	// BootConfiguringDrive means the root-drive PUT may be in flight.
 	BootConfiguringDrive BootState = "ConfiguringRootDrive"
+	// BootConfiguringVsock means the optional guest-control device PUT may be in flight.
+	BootConfiguringVsock BootState = "ConfiguringVsock"
 	// BootStarting means InstanceStart may be in flight.
 	BootStarting BootState = "Starting"
 	// BootStartAcknowledged means Firecracker acknowledged InstanceStart.
@@ -95,7 +103,17 @@ func (o *Owner) Boot(ctx context.Context, client *firecracker.Client, config Boo
 	if err := client.ConfigureRootDrive(ctx, config.RootDrive); err != nil {
 		return o.failBoot("configure root drive", err)
 	}
-	if err := o.advanceBoot(BootConfiguringDrive, BootStarting); err != nil {
+	last := BootConfiguringDrive
+	if config.Vsock != nil {
+		if err := o.advanceBoot(last, BootConfiguringVsock); err != nil {
+			return err
+		}
+		if err := client.ConfigureVsock(ctx, *config.Vsock); err != nil {
+			return o.failBoot("configure vsock", err)
+		}
+		last = BootConfiguringVsock
+	}
+	if err := o.advanceBoot(last, BootStarting); err != nil {
 		return err
 	}
 	if err := client.Start(ctx); err != nil {
