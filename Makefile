@@ -4,6 +4,7 @@ GO ?= go
 
 build:
 	$(GO) build -trimpath -o bin/brie-node ./cmd/brie-node
+	$(GO) build -trimpath -o bin/brie-owner ./internal/runtime/cmd/brie-owner
 
 fmt:
 	$(GO) fmt ./...

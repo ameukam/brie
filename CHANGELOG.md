@@ -7,6 +7,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- An experimental standalone runtime owner with a private Unix-socket API.
 - A Linux Firecracker launcher for disposable experiments, with startup checks
   and process cleanup on failure.
 - The runtime owner now journals lifecycle state and prevents concurrent owners

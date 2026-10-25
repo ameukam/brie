@@ -32,8 +32,55 @@ graceful guest shutdown. Runtime directories and logs are retained.
 
 This launcher is for disposable host experiments, not tenant workloads: there
 is no jailer, privilege separation, resource isolation, CLI wiring, or owner
-crash recovery. Tests run fake VMM subprocesses without KVM. Survival across
-node-agent restart is not implemented.
+crash recovery. Tests run fake VMM subprocesses without KVM. Recovery after an
+owner crash is not implemented.
+
+## Separate experimental owner process
+
+`make build` also builds `bin/brie-owner`. It is intentionally not included in
+release archives yet. Run it independently of the node agent; the node agent
+does not launch or connect to it in this increment.
+
+```sh
+bin/brie-owner --sandbox-uid=experiment --pod-uid=attempt-1 \
+  --directory=/private/experiment/owner \
+  --firecracker=/absolute/firecracker --kernel=/absolute/vmlinux \
+  --rootfs=/absolute/rootfs.ext4 \
+  --boot-args='console=ttyS0 root=/dev/vda ro init=/sbin/init'
+```
+
+The operator must prepare and verify the artifacts and trusted parent directory.
+The owner creates a fresh mode-0700 directory, a mode-0600 `control.sock`, and
+private journal and VMM subdirectories. Any existing owner directory is refused;
+no sockets, journals, or runtime artifacts are adopted or deleted.
+
+The version-1 HTTP API accepts no request bodies or query parameters:
+
+| Method | Path | Effect |
+| --- | --- | --- |
+| GET | `/v1/status` | Observe identity, process state, boot state, and errors. |
+| POST | `/v1/start` | Launch the VMM once; do not boot a guest. |
+| POST | `/v1/boot` | Apply the fixed boot profile and request instance start once. |
+| POST | `/v1/stop` | Request termination and wait for observed exit. |
+
+POST requests require `X-Brie-Sandbox-UID` and `X-Brie-Pod-UID` matching the
+configured attempt. These prevent accidental identity mixups, not malicious
+access by the same host user or root. Filesystem permissions are the local
+access boundary; there is no remote endpoint.
+
+At most 16 connections and one mutation are accepted at a time; a busy mutation
+returns 503. Invalid
+operations or identity mismatches return 409 with an observation and error.
+Client disconnects do not cancel accepted operations. After an uncertain reply,
+read status instead of blindly repeating mutations. Process `Running` and boot
+`StartAcknowledged` are not guest/container readiness.
+
+SIGINT/SIGTERM to the owner closes the API, waits for bounded in-flight work,
+and explicitly stops/reaps the VMM. Client exit does not. Do not configure a
+supervisor to kill owners alongside the node agent. Owner crashes, host failure,
+automatic recovery, durable operation-ID replay, and CRI integration remain
+unsupported. The subprocess test uses a fake VMM without KVM and proves only
+client independence, duplicate-launch rejection, and explicit shutdown cleanup.
 
 After an injected process is owned, `Boot` sends the complete machine, kernel,
 and root-drive profile in order, followed by one `InstanceStart` request.
