@@ -20,6 +20,10 @@ func TestRun(t *testing.T) {
 		{name: "positional", args: []string{"unexpected"}, want: "no positional"},
 		{name: "missing configuration", want: "absolute fresh directory"},
 		{name: "invalid duration", args: []string{"--timeout=bad"}, want: "parse owner flags"},
+		{name: "reserved CID", args: []string{"--guest-cid=2"}, want: "guest CID"},
+		{name: "any CID", args: []string{"--guest-cid=4294967295"}, want: "guest CID"},
+		{name: "CID overflow", args: []string{"--guest-cid=4294967296"}, want: "guest CID"},
+		{name: "enabled CID", args: []string{"--guest-cid=3"}, want: "absolute fresh directory"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer

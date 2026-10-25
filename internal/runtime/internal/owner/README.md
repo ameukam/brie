@@ -54,6 +54,16 @@ The owner creates a fresh mode-0700 directory, a mode-0600 `control.sock`, and
 private journal and VMM subdirectories. Any existing owner directory is refused;
 no sockets, journals, or runtime artifacts are adopted or deleted.
 
+`--guest-cid=3` optionally configures a guest-control vsock device at
+`<directory>/vmm/vsock.sock`; the default, 0, leaves the device absent. Reserved
+CIDs are rejected. Socket paths are limited to 96 bytes to leave room for
+Firecracker's guest-initiated `_<port>` suffix. The owner journals the device
+configuration before its API mutation. Failure or a lost reply prevents boot
+replay and instance start. Existing boot profiles without vsock are unchanged.
+This configures only the device: there is no guest listener, handshake,
+authenticated execution protocol, or container execution in this increment.
+Vsock does not provide Pod networking.
+
 The version-1 HTTP API accepts no request bodies or query parameters:
 
 | Method | Path | Effect |
@@ -83,7 +93,8 @@ unsupported. The subprocess test uses a fake VMM without KVM and proves only
 client independence, duplicate-launch rejection, and explicit shutdown cleanup.
 
 After an injected process is owned, `Boot` sends the complete machine, kernel,
-and root-drive profile in order, followed by one `InstanceStart` request.
+and root-drive profile in order, then an optional vsock device, followed by one
+`InstanceStart` request.
 Validation of the whole profile happens before the first PUT. An API error or
 lost reply stops the sequence and leaves boot state unknown; that owner will
 not retry it. `StartAcknowledged` records only the API response, not VMM health,

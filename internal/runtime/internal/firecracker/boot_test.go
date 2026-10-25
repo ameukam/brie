@@ -140,6 +140,9 @@ func TestInvalidBootConfiguration(t *testing.T) {
 
 func bootOperations() map[string]func(context.Context, *Client) error {
 	return map[string]func(context.Context, *Client) error{
+		"vsock": func(ctx context.Context, c *Client) error {
+			return c.ConfigureVsock(ctx, VsockConfig{GuestCID: 3, UDSPath: "/vsock.sock"})
+		},
 		"boot source": func(ctx context.Context, c *Client) error {
 			return c.ConfigureBootSource(ctx, BootSource{KernelImagePath: "/kernel"})
 		},

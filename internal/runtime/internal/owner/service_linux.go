@@ -54,6 +54,10 @@ func Serve(ctx context.Context, config ServiceConfig, logger *log.Logger) (resul
 	if err := config.Boot.Validate(); err != nil {
 		return fmt.Errorf("validate owner service boot profile: %w", err)
 	}
+	if config.Boot.Vsock != nil &&
+		config.Boot.Vsock.UDSPath != filepath.Join(config.Directory, "vmm", "vsock.sock") {
+		return errors.New("owner service vsock path must be its private vmm/vsock.sock")
+	}
 	socket := filepath.Join(config.Directory, "control.sock")
 	if len(socket) > 107 {
 		return errors.New("owner control socket path exceeds the Linux Unix-socket limit")

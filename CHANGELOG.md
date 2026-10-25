@@ -7,6 +7,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Optional owner-managed vsock configuration for guest control.
 - An experimental standalone runtime owner with a private Unix-socket API.
 - A Linux Firecracker launcher for disposable experiments, with startup checks
   and process cleanup on failure.
