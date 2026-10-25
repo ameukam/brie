@@ -1,152 +1,128 @@
 // Copyright 2026 The Brie Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package guestcontrol defines the bounded control stream shared by Brie runtime
+// Package guestcontrol defines the gRPC control stream shared by Brie runtime
 // owners and the guest supervisor. It does not execute workloads.
 package guestcontrol
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	guestcontrolpb "github.com/ameukam/brie/internal/runtime/internal/guestcontrol/guestcontrolpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
-// ProtocolVersion is the current guest-control wire protocol version.
-const ProtocolVersion = 1
+// ProtocolVersion is the current guest-control API version.
+const ProtocolVersion uint32 = 1
 
-// MaxMessageBytes bounds the JSON payload in one protocol frame.
+// MaxMessageBytes bounds gRPC messages on the guest-control stream.
 const MaxMessageBytes = 4096
 
 // MaxIdentityBytes bounds each execution identity component.
 const MaxIdentityBytes = 256
 
-// Identity binds a guest-control message to one execution attempt.
+// Identity binds a guest-control request to one execution attempt.
 type Identity struct {
-	SandboxUID        string `json:"sandbox_uid"`
-	PodUID            string `json:"pod_uid"`
-	RuntimeGeneration string `json:"runtime_generation"`
+	SandboxUID        string
+	PodUID            string
+	RuntimeGeneration string
 }
 
-// Request is one versioned guest-control operation.
-type Request struct {
-	Version   int      `json:"version"`
-	RequestID string   `json:"request_id"`
-	Operation string   `json:"operation"`
-	Identity  Identity `json:"identity"`
-}
-
-// Response reports the result of a single guest-control operation.
-type Response struct {
-	Version   int      `json:"version"`
-	RequestID string   `json:"request_id"`
-	Operation string   `json:"operation"`
-	Identity  Identity `json:"identity"`
-	Status    string   `json:"status"`
-	ErrorCode string   `json:"error_code,omitempty"`
-}
-
-// NewRequest creates the initial, non-secret protocol probe for an execution.
-func NewRequest(identity Identity) (Request, error) {
+// NewGRPCServer registers the read-only guest supervisor API with bounded
+// messages. Vsock connectivity associates a peer with a VM but does not
+// authenticate that peer.
+func NewGRPCServer(identity Identity) (*grpc.Server, error) {
 	if err := identity.validate(); err != nil {
-		return Request{}, err
+		return nil, fmt.Errorf("validate guest-control identity: %w", err)
 	}
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return Request{}, fmt.Errorf("generate guest-control request ID: %w", err)
-	}
-	return Request{
-		Version: ProtocolVersion, RequestID: hex.EncodeToString(id[:]),
-		Operation: "ping", Identity: identity,
-	}, nil
+	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(MaxMessageBytes),
+		grpc.MaxSendMsgSize(MaxMessageBytes),
+	)
+	guestcontrolpb.RegisterGuestSupervisorServer(server, &guestSupervisor{identity: identity})
+	return server, nil
 }
 
-// Ping sends one bounded health probe on an already-connected guest control stream.
-func Ping(ctx context.Context, conn net.Conn, identity Identity) (Response, error) {
-	if conn == nil {
-		return Response{}, errors.New("guest-control connection is nil")
+// Dial establishes a bounded, plaintext gRPC connection over Firecracker's
+// host vsock socket. Callers must close the returned connection.
+func Dial(ctx context.Context, socketPath string, guestPort uint32) (*grpc.ClientConn, error) {
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		return DialFirecrackerVsock(ctx, socketPath, guestPort)
 	}
-	request, err := NewRequest(identity)
+	conn, err := grpc.NewClient(
+		"passthrough:///guest-control",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(dialer),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(MaxMessageBytes),
+			grpc.MaxCallSendMsgSize(MaxMessageBytes),
+		),
+	)
 	if err != nil {
-		return Response{}, err
+		return nil, fmt.Errorf("dial guest-control gRPC service: %w", err)
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return Response{}, fmt.Errorf("set guest-control deadline: %w", err)
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return conn, nil
+		}
+		if state == connectivity.Shutdown {
+			return nil, errors.Join(errors.New("guest-control gRPC connection shut down"), conn.Close())
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return nil, fmt.Errorf(
+				"dial guest-control gRPC service: %w",
+				errors.Join(ctx.Err(), conn.Close()),
+			)
 		}
 	}
-	if err := writeFrame(conn, request); err != nil {
-		return Response{}, fmt.Errorf("write guest-control request: %w", errors.Join(err, ctx.Err()))
-	}
-	var response Response
-	if err := readFrame(conn, &response); err != nil {
-		return Response{}, fmt.Errorf("read guest-control response: %w", errors.Join(err, ctx.Err()))
-	}
-	if response.Version != ProtocolVersion || response.RequestID != request.RequestID ||
-		response.Operation != request.Operation || response.Identity != identity {
-		return Response{}, errors.New("guest-control response does not match request")
-	}
-	if response.Status != "ok" || response.ErrorCode != "" {
-		return Response{}, fmt.Errorf("guest-control ping rejected: %s", response.ErrorCode)
-	}
-	if err := ctx.Err(); err != nil {
-		return Response{}, fmt.Errorf("guest-control ping: %w", err)
-	}
-	return response, nil
 }
 
-// ServeConn handles exactly one bounded protocol request on a guest supervisor
-// stream. The caller must authenticate/authorize the stream before invoking it.
-func ServeConn(ctx context.Context, conn net.Conn, expected Identity) (result error) {
+// GetInfo asks the guest supervisor to verify the execution identity and
+// validates the returned identity and protocol version.
+func GetInfo(ctx context.Context, conn grpc.ClientConnInterface, identity Identity) (Identity, error) {
 	if conn == nil {
-		return errors.New("guest-control connection is nil")
+		return Identity{}, errors.New("guest-control gRPC connection is nil")
 	}
-	defer func() { result = errors.Join(result, conn.Close()) }()
-	if err := expected.validate(); err != nil {
-		return fmt.Errorf("validate guest-control identity: %w", err)
+	if err := identity.validate(); err != nil {
+		return Identity{}, err
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return fmt.Errorf("set guest-control deadline: %w", err)
-		}
+	response, err := guestcontrolpb.NewGuestSupervisorClient(conn).GetInfo(ctx, &guestcontrolpb.GetInfoRequest{
+		ProtocolVersion: ProtocolVersion,
+		Identity: &guestcontrolpb.ExecutionIdentity{
+			SandboxUid:        identity.SandboxUID,
+			PodUid:            identity.PodUID,
+			RuntimeGeneration: identity.RuntimeGeneration,
+		},
+	})
+	if err != nil {
+		return Identity{}, fmt.Errorf("request guest-control info: %w", err)
 	}
-	var request Request
-	if err := readFrame(conn, &request); err != nil {
-		return fmt.Errorf("read guest-control request: %w", err)
+	if response.GetProtocolVersion() != ProtocolVersion || response.GetIdentity() == nil {
+		return Identity{}, errors.New("guest-control response has an invalid version or missing identity")
 	}
-	response := Response{
-		Version: ProtocolVersion, RequestID: request.RequestID,
-		Operation: request.Operation, Identity: expected,
+	responseIdentity := Identity{
+		SandboxUID:        response.GetIdentity().GetSandboxUid(),
+		PodUID:            response.GetIdentity().GetPodUid(),
+		RuntimeGeneration: response.GetIdentity().GetRuntimeGeneration(),
 	}
-	switch {
-	case request.Version != ProtocolVersion:
-		response.Status, response.ErrorCode = "error", "unsupported_version"
-	case !validRequestID(request.RequestID):
-		return errors.New("invalid guest-control request ID")
-	case request.Identity != expected:
-		response.Status, response.ErrorCode = "error", "execution_identity_mismatch"
-	case request.Operation != "ping":
-		response.Status, response.ErrorCode = "error", "unsupported_operation"
-	default:
-		response.Status = "ok"
+	if responseIdentity != identity {
+		return Identity{}, errors.New("guest-control response identity does not match request")
 	}
-	if err := writeFrame(conn, response); err != nil {
-		return fmt.Errorf("write guest-control response: %w", err)
-	}
-	return nil
+	return responseIdentity, nil
 }
 
 // DialFirecrackerVsock connects to Firecracker's host Unix socket and performs
@@ -181,7 +157,7 @@ func DialFirecrackerVsock(ctx context.Context, socketPath string, guestPort uint
 	}
 	line, err := readBoundedLine(conn, 32)
 	if err != nil {
-		return nil, fmt.Errorf("read Firecracker vsock acknowledgement: %w", err)
+		return nil, fmt.Errorf("read Firecracker vsock acknowledgement: %w", errors.Join(err, ctx.Err()))
 	}
 	fields := strings.Split(strings.TrimSuffix(line, "\n"), " ")
 	if len(fields) != 2 || fields[0] != "OK" {
@@ -193,6 +169,9 @@ func DialFirecrackerVsock(ctx context.Context, socketPath string, guestPort uint
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("connect to guest vsock: %w", err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear Firecracker vsock handshake deadline: %w", err)
 	}
 	ok = true
 	return conn, nil
@@ -214,65 +193,40 @@ func readBoundedLine(reader io.Reader, limit int) (string, error) {
 	return "", errors.New("vsock acknowledgement exceeds limit")
 }
 
-func writeFrame(w io.Writer, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("encode guest-control message: %w", err)
-	}
-	if len(data) == 0 || len(data) > MaxMessageBytes {
-		return fmt.Errorf("guest-control message size %d is outside 1..%d", len(data), MaxMessageBytes)
-	}
-	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
-	if err := writeAll(w, header[:]); err != nil {
-		return err
-	}
-	return writeAll(w, data)
+type guestSupervisor struct {
+	guestcontrolpb.UnimplementedGuestSupervisorServer
+	identity Identity
 }
 
-func readFrame(r io.Reader, target any) error {
-	var header [4]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return fmt.Errorf("read frame header: %w", err)
+func (s *guestSupervisor) GetInfo(ctx context.Context, request *guestcontrolpb.GetInfoRequest) (*guestcontrolpb.GetInfoResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
-	size := binary.BigEndian.Uint32(header[:])
-	if size == 0 || size > MaxMessageBytes {
-		return fmt.Errorf("guest-control frame size %d is outside 1..%d", size, MaxMessageBytes)
+	if request == nil || request.GetIdentity() == nil {
+		return nil, status.Error(codes.InvalidArgument, "execution identity is required")
 	}
-	data := make([]byte, size)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return fmt.Errorf("read frame body: %w", err)
+	if request.GetProtocolVersion() != ProtocolVersion {
+		return nil, status.Errorf(codes.FailedPrecondition, "unsupported guest-control protocol version %d", request.GetProtocolVersion())
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("decode guest-control frame: %w", err)
+	requestIdentity := Identity{
+		SandboxUID:        request.GetIdentity().GetSandboxUid(),
+		PodUID:            request.GetIdentity().GetPodUid(),
+		RuntimeGeneration: request.GetIdentity().GetRuntimeGeneration(),
 	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("guest-control frame contains multiple JSON values")
-		}
-		return fmt.Errorf("check guest-control frame trailer: %w", err)
+	if err := requestIdentity.validate(); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid execution identity: %v", err)
 	}
-	return nil
-}
-
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if n < 0 || n > len(data) {
-			return errors.New("writer returned an invalid byte count")
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
+	if requestIdentity != s.identity {
+		return nil, status.Error(codes.FailedPrecondition, "execution identity does not match guest")
 	}
-	return nil
+	return &guestcontrolpb.GetInfoResponse{
+		ProtocolVersion: ProtocolVersion,
+		Identity: &guestcontrolpb.ExecutionIdentity{
+			SandboxUid:        s.identity.SandboxUID,
+			PodUid:            s.identity.PodUID,
+			RuntimeGeneration: s.identity.RuntimeGeneration,
+		},
+	}, nil
 }
 
 func (identity Identity) validate() error {
@@ -292,12 +246,4 @@ func (identity Identity) validate() error {
 		}
 	}
 	return nil
-}
-
-func validRequestID(id string) bool {
-	if len(id) != 32 {
-		return false
-	}
-	_, err := hex.DecodeString(id)
-	return err == nil
 }

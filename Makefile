@@ -31,7 +31,7 @@ fuzz:
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzDecodeInfo$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzArtifactPath$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzVsockConfig$$' -fuzztime=10s -parallel=2
-	$(GO) test ./internal/runtime/internal/guestcontrol -run='^$$' -fuzz='^FuzzReadFrame$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/runtime/internal/guestcontrol -run='^$$' -fuzz='^FuzzIdentityValidation$$' -fuzztime=10s -parallel=2
 
 e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e

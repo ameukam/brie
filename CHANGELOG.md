@@ -7,7 +7,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
-- A bounded version-1 guest-control ping protocol over Firecracker vsock streams.
+- A bounded version-1 gRPC/Protobuf guest-control API over Firecracker vsock
+  streams. It verifies execution identity and API version; it does not run
+  workloads.
 - Optional owner-managed vsock configuration for guest control.
 - An experimental standalone runtime owner with a private Unix-socket API.
 - A Linux Firecracker launcher for disposable experiments, with startup checks

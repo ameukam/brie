@@ -1,0 +1,30 @@
+// Copyright 2026 The Brie Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package brie.guestcontrol.v1;
+
+option go_package = "github.com/ameukam/brie/internal/runtime/internal/guestcontrol/guestcontrolpb;guestcontrolpb";
+
+message ExecutionIdentity {
+  string sandbox_uid = 1;
+  string pod_uid = 2;
+  string runtime_generation = 3;
+}
+
+message GetInfoRequest {
+  uint32 protocol_version = 1;
+  ExecutionIdentity identity = 2;
+}
+
+message GetInfoResponse {
+  uint32 protocol_version = 1;
+  ExecutionIdentity identity = 2;
+}
+
+service GuestSupervisor {
+  // GetInfo verifies that this supervisor is associated with the requested
+  // execution identity and speaks the requested guest-control API version.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+}
