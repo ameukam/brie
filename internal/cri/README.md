@@ -14,7 +14,8 @@ Neither method proves that Kata/Firecracker is configured or usable.
 Calls are serialized; their timeout includes queueing, connecting, and receiving
 the response. Caller cancellation and earlier deadlines take precedence.
 Messages are bounded to 64 KiB, configured RPC retries are disabled, and errors
-preserve gRPC codes and context cancellation/deadlines. Socket permissions must
+preserve gRPC codes and context cancellation/deadlines, including server-reported
+cancellation/deadlines before the local context expires. Socket permissions must
 protect the trusted endpoint: local plaintext gRPC is not peer authentication.
 No runtime/image mutations or raw connection are exposed.
 

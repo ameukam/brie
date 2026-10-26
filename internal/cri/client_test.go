@@ -217,7 +217,10 @@ func TestStatus(t *testing.T) {
 
 func TestErrors(t *testing.T) {
 	t.Parallel()
-	for _, code := range []codes.Code{codes.Unimplemented, codes.Unavailable, codes.PermissionDenied} {
+	for _, code := range []codes.Code{
+		codes.Unimplemented, codes.Unavailable, codes.PermissionDenied,
+		codes.DeadlineExceeded, codes.Canceled,
+	} {
 		t.Run(code.String(), func(t *testing.T) {
 			var calls atomic.Int32
 			failure := status.Error(code, "runtime refused request")
@@ -233,8 +236,26 @@ func TestErrors(t *testing.T) {
 			})
 			client := newClient(t, socket, time.Second)
 			for _, call := range callsFor(client) {
-				if err := call(t.Context()); status.Code(err) != code {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				err := call(ctx)
+				contextErr := ctx.Err()
+				cancel()
+				if status.Code(err) != code {
 					t.Fatalf("error = %v, want code %s", err, code)
+				}
+				if contextErr != nil {
+					t.Fatalf("caller context expired before server response: %v", contextErr)
+				}
+				for _, want := range []struct {
+					code codes.Code
+					err  error
+				}{
+					{codes.DeadlineExceeded, context.DeadlineExceeded},
+					{codes.Canceled, context.Canceled},
+				} {
+					if errors.Is(err, want.err) != (code == want.code) {
+						t.Fatalf("error = %v, want errors.Is(%v)=%t", err, want.err, code == want.code)
+					}
 				}
 			}
 			if calls.Load() != 2 {

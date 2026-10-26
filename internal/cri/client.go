@@ -16,7 +16,9 @@ import (
 	"unicode/utf8"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -83,7 +85,7 @@ func (c *Client) Version(ctx context.Context) (*runtimeapi.VersionResponse, erro
 	defer release()
 	response, err := c.runtime.Version(ctx, &runtimeapi.VersionRequest{Version: "0.1.0"})
 	if err != nil {
-		return nil, fmt.Errorf("CRI Version: %w", errors.Join(err, ctx.Err()))
+		return nil, fmt.Errorf("CRI Version: %w", rpcError(ctx, err))
 	}
 	if response.GetVersion() == "" || response.GetRuntimeName() == "" ||
 		response.GetRuntimeVersion() == "" || response.GetRuntimeApiVersion() != "v1" {
@@ -103,7 +105,7 @@ func (c *Client) Status(ctx context.Context) (*runtimeapi.RuntimeStatus, error) 
 	defer release()
 	response, err := c.runtime.Status(ctx, &runtimeapi.StatusRequest{Verbose: false})
 	if err != nil {
-		return nil, fmt.Errorf("CRI Status: %w", errors.Join(err, ctx.Err()))
+		return nil, fmt.Errorf("CRI Status: %w", rpcError(ctx, err))
 	}
 	observed := response.GetStatus()
 	seen := make(map[string]bool)
@@ -118,6 +120,17 @@ func (c *Client) Status(ctx context.Context) (*runtimeapi.RuntimeStatus, error) 
 		return nil, errors.New("CRI Status: missing RuntimeReady or NetworkReady condition")
 	}
 	return observed, nil
+}
+
+func rpcError(ctx context.Context, err error) error {
+	// The server can observe its deadline before the local context timer fires.
+	switch status.Code(err) {
+	case codes.DeadlineExceeded:
+		err = errors.Join(err, context.DeadlineExceeded)
+	case codes.Canceled:
+		err = errors.Join(err, context.Canceled)
+	}
+	return errors.Join(err, ctx.Err())
 }
 
 func (c *Client) begin(ctx context.Context) (context.Context, func(), error) {
