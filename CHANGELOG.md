@@ -9,9 +9,6 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 - A read-only local CRI v1 client for runtime version and health, with bounded
   calls and fake-socket tests; it is not yet wired into the node agent.
-- A bounded version-1 gRPC/Protobuf guest-control API over Firecracker vsock
-  streams. It verifies execution identity and API version; it does not run
-  workloads.
 - Optional owner-managed vsock configuration for guest control.
 - An experimental standalone runtime owner with a private Unix-socket API.
 - A Linux Firecracker launcher for disposable experiments, with startup checks

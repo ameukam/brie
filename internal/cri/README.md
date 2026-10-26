@@ -4,6 +4,9 @@ This is the first containerd integration increment for the selected Brie ->
 containerd CRI -> Kata -> Firecracker stack. It is not wired into the node agent
 and does not execute Pods or change Node readiness/capacity.
 
+Kata owns guest control through its native agent protocol. Brie consumes CRI;
+it does not implement a separate guest-control service or mutate Kata-owned VMs.
+
 `New` takes an explicit local Unix-socket path and a positive per-call timeout.
 It opens no connection until a call is made. Callers must `Close` the client.
 `Version` requires complete runtime metadata and CRI v1. `Status` requests
