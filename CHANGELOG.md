@@ -7,6 +7,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Optional `--runtime-socket` startup version and health observation over CRI.
+  This does not enable workloads or change Node readiness.
 - A read-only local CRI v1 client for runtime version and health, with bounded
   calls and fake-socket tests; it is not yet wired into the node agent.
 - Optional owner-managed vsock configuration for guest control.
