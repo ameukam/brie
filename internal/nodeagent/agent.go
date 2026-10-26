@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package nodeagent provides explicit host registration and a shutdown boundary.
-// It does not reconcile Pods or invoke the runtime.
+// It can observe CRI health but does not reconcile Pods or mutate the runtime.
 package nodeagent
 
 import (
@@ -15,7 +15,8 @@ import (
 
 // Config identifies the host explicitly; there is no inferred hostname.
 type Config struct {
-	NodeName string
+	NodeName      string
+	RuntimeSocket string
 }
 
 // Validate requires a lowercase DNS name with at most 253 bytes and labels of
@@ -37,7 +38,7 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// Run waits for shutdown without contacting Kubernetes or the runtime.
+// Run optionally observes CRI at startup, then waits without contacting Kubernetes.
 // Cancellation is a clean shutdown; deadline expiry is an error.
 func Run(ctx context.Context, config Config, stderr io.Writer) error {
 	if err := config.Validate(); err != nil {
@@ -45,6 +46,12 @@ func Run(ctx context.Context, config Config, stderr io.Writer) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return shutdownError(err)
+	}
+	if err := observeRuntime(ctx, config.RuntimeSocket, stderr); err != nil {
+		if ctx.Err() != nil {
+			return shutdownError(ctx.Err())
+		}
+		return err
 	}
 	if _, err := fmt.Fprintf(stderr,
 		"brie-node: agent scaffold for %s; node registration and workload execution are not implemented\n",

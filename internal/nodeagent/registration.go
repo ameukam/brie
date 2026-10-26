@@ -70,6 +70,12 @@ func Register(ctx context.Context, config Config, kubeconfig string, stderr io.W
 }
 
 func register(ctx context.Context, config Config, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, stderr io.Writer) error {
+	if err := observeRuntime(ctx, config.RuntimeSocket, stderr); err != nil {
+		if ctx.Err() != nil {
+			return shutdownError(ctx.Err())
+		}
+		return err
+	}
 	node, err := nodes.Get(ctx, config.NodeName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		node, err = nodes.Create(ctx, &corev1.Node{

@@ -82,6 +82,10 @@ func TestRun(t *testing.T) {
 		{name: "empty kubeconfig", args: []string{"--run", "--node-name=node-1", "--kubeconfig="}, wantErr: "must not be empty"},
 		{name: "kubeconfig without run", args: []string{"--kubeconfig=/unused"}, wantErr: "requires --run"},
 		{name: "relative kubeconfig", args: []string{"--run", "--node-name=node-1", "--kubeconfig=relative"}, wantErr: "absolute kubeconfig"},
+		{name: "runtime without run", args: []string{"--runtime-socket=/unused"}, wantErr: "require --run"},
+		{name: "runtime with version", args: []string{"--version", "--runtime-socket=/unused"}, wantErr: "require --run"},
+		{name: "empty runtime", args: []string{"--run", "--node-name=node-1", "--runtime-socket="}, wantErr: "must not be empty"},
+		{name: "cancelled runtime", args: []string{"--run", "--node-name=node-1", "--runtime-socket=/unused"}},
 	}
 
 	for _, tt := range tests {
@@ -134,6 +138,7 @@ func FuzzRun(f *testing.F) {
 		"--unknown", "--version extra", "--version=invalid", "-- --version",
 		"--run", "--run --node-name=node-1", "--run --version", "--node-name=",
 		"--run --node-name=node-1 --kubeconfig=/unused", "--run --kubeconfig=",
+		"--runtime-socket=", "--run --node-name=node-1 --runtime-socket=/unused",
 	} {
 		f.Add(seed)
 	}

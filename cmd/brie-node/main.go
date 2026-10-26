@@ -38,6 +38,7 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	runAgent := flags.Bool("run", false, "Run until SIGINT or SIGTERM (registration only when --kubeconfig is set)")
 	nodeName := flags.String("node-name", "", "Explicit lowercase DNS node name (required with --run)")
 	kubeconfig := flags.String("kubeconfig", "", "Explicit kubeconfig for registration only (requires --run; never accepts workloads)")
+	runtimeSocket := flags.String("runtime-socket", "", "Absolute CRI Unix socket for a read-only startup check (requires --run)")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -54,12 +55,12 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	if !*runAgent {
 		var hasAgentConfig bool
 		flags.Visit(func(f *flag.Flag) {
-			if f.Name == "node-name" || f.Name == "kubeconfig" {
+			if f.Name == "node-name" || f.Name == "kubeconfig" || f.Name == "runtime-socket" {
 				hasAgentConfig = true
 			}
 		})
 		if hasAgentConfig {
-			return errors.New("--node-name requires --run; --kubeconfig also requires --run")
+			return errors.New("--node-name requires --run; --kubeconfig and --runtime-socket also require --run")
 		}
 	}
 	var emptyKubeconfig bool
@@ -71,11 +72,21 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	if emptyKubeconfig {
 		return errors.New("--kubeconfig must not be empty when supplied")
 	}
-	if *runAgent {
-		if *kubeconfig != "" {
-			return nodeagent.Register(ctx, nodeagent.Config{NodeName: *nodeName}, *kubeconfig, stderr)
+	var emptyRuntimeSocket bool
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "runtime-socket" && *runtimeSocket == "" {
+			emptyRuntimeSocket = true
 		}
-		return nodeagent.Run(ctx, nodeagent.Config{NodeName: *nodeName}, stderr)
+	})
+	if emptyRuntimeSocket {
+		return errors.New("--runtime-socket must not be empty when supplied")
+	}
+	if *runAgent {
+		config := nodeagent.Config{NodeName: *nodeName, RuntimeSocket: *runtimeSocket}
+		if *kubeconfig != "" {
+			return nodeagent.Register(ctx, config, *kubeconfig, stderr)
+		}
+		return nodeagent.Run(ctx, config, stderr)
 	}
 	if !*showVersion {
 		return errors.New("node execution is not implemented yet; use --help or --version")

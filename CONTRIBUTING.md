@@ -28,6 +28,14 @@ Update [CHANGELOG.md](CHANGELOG.md) for user-visible changes. Commit `go.sum`
 when adding dependencies, but do not commit binaries, coverage output,
 credentials, or release artifacts.
 
+## Runtime observation
+
+`brie-node --run --node-name=worker-1 --runtime-socket=/run/containerd/containerd.sock`
+reads CRI version and health once at startup. Each call has a ten-second timeout.
+Omit the socket to skip CRI. Errors stop startup; unhealthy conditions are logged.
+With `--kubeconfig`, registration still advertises zero capacity and stays
+cordoned and NotReady. This does not check the Kata handler or run Pods.
+
 ## Kubernetes baseline
 
 The [baseline workflow](.github/workflows/e2e.yml) runs Sonobuoy's `quick` Pod

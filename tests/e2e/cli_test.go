@@ -66,6 +66,10 @@ func TestCLI(t *testing.T) {
 				{name: "empty kubeconfig", args: []string{"--run", "--node-name=worker-1", "--kubeconfig="}, stderr: "must not be empty", code: 1},
 				{name: "missing kubeconfig file", args: []string{"--run", "--node-name=worker-1", "--kubeconfig=" + filepath.Join(t.TempDir(), "missing")}, stderr: "load registration kubeconfig", code: 1},
 				{name: "kubeconfig without run", args: []string{"--kubeconfig=/unused"}, stderr: "requires --run", code: 1},
+				{name: "runtime without run", args: []string{"--runtime-socket=/unused"}, stderr: "require --run", code: 1},
+				{name: "empty runtime", args: []string{"--run", "--node-name=worker-1", "--runtime-socket="}, stderr: "must not be empty", code: 1},
+				{name: "relative runtime", args: []string{"--run", "--node-name=worker-1", "--runtime-socket=relative"}, stderr: "configure CRI observation", code: 1},
+				{name: "missing runtime", args: []string{"--run", "--node-name=worker-1", "--runtime-socket=" + filepath.Join(t.TempDir(), "missing.sock")}, stderr: "observe runtime: CRI Version", code: 1},
 			} {
 				t.Run(tt.name, func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
