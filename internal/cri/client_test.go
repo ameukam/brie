@@ -22,8 +22,12 @@ import (
 
 type fakeRuntime struct {
 	runtimeapi.UnimplementedRuntimeServiceServer
-	version func(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error)
-	status  func(context.Context, *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error)
+	version         func(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error)
+	status          func(context.Context, *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error)
+	sandboxes       func(context.Context, *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error)
+	containers      func(context.Context, *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error)
+	sandboxStatus   func(context.Context, *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error)
+	containerStatus func(context.Context, *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error)
 }
 
 func (s *fakeRuntime) Version(ctx context.Context, request *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -32,6 +36,22 @@ func (s *fakeRuntime) Version(ctx context.Context, request *runtimeapi.VersionRe
 
 func (s *fakeRuntime) Status(ctx context.Context, request *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
 	return s.status(ctx, request)
+}
+
+func (s *fakeRuntime) ListPodSandbox(ctx context.Context, request *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+	return s.sandboxes(ctx, request)
+}
+
+func (s *fakeRuntime) ListContainers(ctx context.Context, request *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+	return s.containers(ctx, request)
+}
+
+func (s *fakeRuntime) PodSandboxStatus(ctx context.Context, request *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+	return s.sandboxStatus(ctx, request)
+}
+
+func (s *fakeRuntime) ContainerStatus(ctx context.Context, request *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+	return s.containerStatus(ctx, request)
 }
 
 func startRuntime(t *testing.T, fake *fakeRuntime) string {
@@ -219,7 +239,7 @@ func TestErrors(t *testing.T) {
 	t.Parallel()
 	for _, code := range []codes.Code{
 		codes.Unimplemented, codes.Unavailable, codes.PermissionDenied,
-		codes.DeadlineExceeded, codes.Canceled,
+		codes.DeadlineExceeded, codes.Canceled, codes.NotFound,
 	} {
 		t.Run(code.String(), func(t *testing.T) {
 			var calls atomic.Int32
@@ -230,6 +250,22 @@ func TestErrors(t *testing.T) {
 					return nil, failure
 				},
 				status: func(context.Context, *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
+					calls.Add(1)
+					return nil, failure
+				},
+				sandboxes: func(context.Context, *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+					calls.Add(1)
+					return nil, failure
+				},
+				containers: func(context.Context, *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+					calls.Add(1)
+					return nil, failure
+				},
+				sandboxStatus: func(context.Context, *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+					calls.Add(1)
+					return nil, failure
+				},
+				containerStatus: func(context.Context, *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
 					calls.Add(1)
 					return nil, failure
 				},
@@ -258,8 +294,8 @@ func TestErrors(t *testing.T) {
 					}
 				}
 			}
-			if calls.Load() != 2 {
-				t.Errorf("runtime calls = %d, want 2 without retries", calls.Load())
+			if got, want := calls.Load(), int32(len(callsFor(client))); got != want {
+				t.Errorf("runtime calls = %d, want %d without retries", got, want)
 			}
 		})
 	}
@@ -269,6 +305,10 @@ func callsFor(c *Client) []func(context.Context) error {
 	return []func(context.Context) error{
 		func(ctx context.Context) error { _, err := c.Version(ctx); return err },
 		func(ctx context.Context) error { _, err := c.Status(ctx); return err },
+		func(ctx context.Context) error { _, err := c.ListPodSandbox(ctx); return err },
+		func(ctx context.Context) error { _, err := c.ListContainers(ctx); return err },
+		func(ctx context.Context) error { _, err := c.PodSandboxStatus(ctx, "sandbox"); return err },
+		func(ctx context.Context) error { _, err := c.ContainerStatus(ctx, "container"); return err },
 	}
 }
 
@@ -283,6 +323,26 @@ func TestBounds(t *testing.T) {
 		status: func(context.Context, *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
 			return &runtimeapi.StatusResponse{
 				Status: goodStatus(), Info: map[string]string{"oversized": strings.Repeat("x", maxMessageBytes)},
+			}, nil
+		},
+		sandboxes: func(context.Context, *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+			sandbox := goodSandbox()
+			sandbox.Annotations = map[string]string{"oversized": strings.Repeat("x", maxMessageBytes)}
+			return &runtimeapi.ListPodSandboxResponse{Items: []*runtimeapi.PodSandbox{sandbox}}, nil
+		},
+		containers: func(context.Context, *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+			container := goodContainer()
+			container.Annotations = map[string]string{"oversized": strings.Repeat("x", maxMessageBytes)}
+			return &runtimeapi.ListContainersResponse{Containers: []*runtimeapi.Container{container}}, nil
+		},
+		sandboxStatus: func(context.Context, *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+			return &runtimeapi.PodSandboxStatusResponse{
+				Status: goodSandboxStatus(), Info: map[string]string{"oversized": strings.Repeat("x", maxMessageBytes)},
+			}, nil
+		},
+		containerStatus: func(context.Context, *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+			return &runtimeapi.ContainerStatusResponse{
+				Status: goodContainerStatus(), Info: map[string]string{"oversized": strings.Repeat("x", maxMessageBytes)},
 			}, nil
 		},
 	})
@@ -329,6 +389,22 @@ func TestDeadlines(t *testing.T) {
 			<-ctx.Done()
 			return nil, status.FromContextError(ctx.Err()).Err()
 		},
+		sandboxes: func(ctx context.Context, _ *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+			<-ctx.Done()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		},
+		containers: func(ctx context.Context, _ *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+			<-ctx.Done()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		},
+		sandboxStatus: func(ctx context.Context, _ *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+			<-ctx.Done()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		},
+		containerStatus: func(ctx context.Context, _ *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+			<-ctx.Done()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		},
 	})
 	for _, tt := range []struct {
 		name    string
@@ -360,7 +436,7 @@ func TestDeadlines(t *testing.T) {
 
 func TestCancel(t *testing.T) {
 	t.Parallel()
-	for _, method := range []string{"Version", "Status"} {
+	for i, method := range []string{"Version", "Status", "ListPodSandbox", "ListContainers", "PodSandboxStatus", "ContainerStatus"} {
 		t.Run(method, func(t *testing.T) {
 			entered := make(chan struct{})
 			wait := func(ctx context.Context) error {
@@ -375,12 +451,21 @@ func TestCancel(t *testing.T) {
 				status: func(ctx context.Context, _ *runtimeapi.StatusRequest) (*runtimeapi.StatusResponse, error) {
 					return nil, wait(ctx)
 				},
+				sandboxes: func(ctx context.Context, _ *runtimeapi.ListPodSandboxRequest) (*runtimeapi.ListPodSandboxResponse, error) {
+					return nil, wait(ctx)
+				},
+				containers: func(ctx context.Context, _ *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+					return nil, wait(ctx)
+				},
+				sandboxStatus: func(ctx context.Context, _ *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+					return nil, wait(ctx)
+				},
+				containerStatus: func(ctx context.Context, _ *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+					return nil, wait(ctx)
+				},
 			})
 			client := newClient(t, socket, 3*time.Second)
-			call := callsFor(client)[0]
-			if method == "Status" {
-				call = callsFor(client)[1]
-			}
+			call := callsFor(client)[i]
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			done := make(chan error, 1)

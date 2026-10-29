@@ -7,6 +7,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A fail-closed initial one-container Linux Pod profile validator and bounded
+  read-only CRI sandbox/container list and status calls. These do not enable
+  Pod execution, cleanup, scheduling, or readiness.
 - Optional `--runtime-socket` startup version and health observation over CRI.
   This does not enable workloads or change Node readiness.
 - A read-only local CRI v1 client for runtime version and health, with bounded
