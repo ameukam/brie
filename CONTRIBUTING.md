@@ -36,6 +36,10 @@ Omit the socket to skip CRI. Errors stop startup; unhealthy conditions are logge
 With `--kubeconfig`, registration still advertises zero capacity and stays
 cordoned and NotReady. This does not check the Kata handler or run Pods.
 
+The [initial Pod profile](docs/pod-profile.md) defines a fail-closed validator
+and read-only sandbox/container inventory APIs for future reconciliation.
+Neither is an enabled Pod execution or cleanup path.
+
 ## Kubernetes baseline
 
 The [baseline workflow](.github/workflows/e2e.yml) runs Sonobuoy's `quick` Pod
