@@ -6,7 +6,7 @@ require (
 	golang.org/x/net v0.62.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.37.0-rc.1
-	k8s.io/api v0.37.1
+	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
 	k8s.io/client-go v0.37.1
 	k8s.io/cri-api v0.37.2
