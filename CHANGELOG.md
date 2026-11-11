@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- With `--enable-workloads`, an execution whose Pod is absent from a complete,
+  quorum-consistent node-scoped Pod list is now stopped with zero grace and
+  removed, and its reservation released. The list resource version is journaled
+  first and authorizes cleanup across restarts. Failed or partial lists, Pod
+  read errors, foreign or ambiguous runtime objects, and unresolved sandbox
+  creation still preserve the execution and block admission.
 - Explicit `--enable-workloads` mode for multiple restricted Pods through the
   upstream scheduler and containerd CRI, with configured capacity, RuntimeClass
   overhead, DNS, status, deletion, and durable restart reconstruction. Defaults
