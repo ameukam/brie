@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Explicit `--enable-workloads` mode for multiple restricted Pods through the
+  upstream scheduler and containerd CRI, with configured capacity, RuntimeClass
+  overhead, DNS, status, deletion, and durable restart reconstruction. Defaults
+  remain registration-only; a limited C4A scheduler-to-Firecracker smoke run is
+  documented with a terminal-deletion cleanup limitation, not production or
+  conformance qualification.
 - A fail-closed initial one-container Linux Pod profile validator and bounded
   read-only CRI sandbox/container list and status calls. These do not enable
   Pod execution, cleanup, scheduling, or readiness.
@@ -50,6 +56,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Changed
 
+- Execution readiness uses status-only updates and gated allocatable resources
+  instead of modifying startup taints forbidden by NodeRestriction.
 - Registration heartbeats preserve externally managed Node conditions and status.
 - Retry bounded Node/Lease resource-version conflicts during registration
   heartbeats, revalidating Node identity and scheduling guards on each attempt.

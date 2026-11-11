@@ -43,12 +43,12 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:    "no command",
-			wantErr: "node execution is not implemented",
+			wantErr: "no mode selected",
 		},
 		{
 			name:    "disabled version",
 			args:    []string{"--version=false"},
-			wantErr: "node execution is not implemented",
+			wantErr: "no mode selected",
 		},
 		{
 			name:    "unknown flag",
@@ -76,7 +76,7 @@ func TestRun(t *testing.T) {
 		{name: "name without run", args: []string{"--node-name=node-1"}, wantErr: "requires --run"},
 		{name: "empty name without run", args: []string{"--node-name="}, wantErr: "requires --run"},
 		{name: "name with version", args: []string{"--version", "--node-name=node-1"}, wantErr: "requires --run"},
-		{name: "disabled run", args: []string{"--run=false"}, wantErr: "node execution is not implemented"},
+		{name: "disabled run", args: []string{"--run=false"}, wantErr: "no mode selected"},
 		{name: "cancelled agent", args: []string{"--run", "--node-name=node-1"}},
 		{name: "cancelled registration", args: []string{"--run", "--node-name=node-1", "--kubeconfig=/unused"}},
 		{name: "empty kubeconfig", args: []string{"--run", "--node-name=node-1", "--kubeconfig="}, wantErr: "must not be empty"},
@@ -86,6 +86,15 @@ func TestRun(t *testing.T) {
 		{name: "runtime with version", args: []string{"--version", "--runtime-socket=/unused"}, wantErr: "require --run"},
 		{name: "empty runtime", args: []string{"--run", "--node-name=node-1", "--runtime-socket="}, wantErr: "must not be empty"},
 		{name: "cancelled runtime", args: []string{"--run", "--node-name=node-1", "--runtime-socket=/unused"}},
+		{name: "workloads without run", args: []string{"--enable-workloads"}, wantErr: "require --run"},
+		{name: "execution configuration without opt-in", args: []string{"--run", "--node-name=node-1", "--max-pods=5"}, wantErr: "requires --enable-workloads"},
+		{name: "missing execution configuration", args: []string{"--run", "--node-name=node-1", "--enable-workloads"}, wantErr: "validate execution configuration"},
+		{name: "cancelled execution", args: []string{
+			"--run", "--node-name=node-1", "--enable-workloads", "--kubeconfig=/unused", "--runtime-socket=/unused",
+			"--runtime-class=kata-fc", "--runtime-handler=kata-fc", "--allocatable-cpu=4", "--allocatable-memory=8Gi",
+			"--max-pods=10", "--node-ip=192.0.2.10", "--cluster-dns=10.96.0.10", "--cluster-domain=cluster.local",
+			"--state-dir=/unused/state", "--pod-log-dir=/unused/logs",
+		}},
 	}
 
 	for _, tt := range tests {
