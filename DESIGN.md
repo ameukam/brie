@@ -31,8 +31,10 @@ Audience: engineers implementing and reviewing the node agent, runtime integrati
   It fixed a NodeRestriction readiness bug and exposed the terminal-deletion
   cleanup gap in section 6.3. This is smoke evidence, not M1 completion,
   capacity qualification, or Node Conformance.
-- Next: implement and test the deletion-evidence rule in section 6.3, review
-  and land draft #40, then add probes and exec/log streaming within the profile
+- The list form of the deletion-evidence rule in section 6.3 is implemented
+  on a local `deletion-evidence` branch stacked on draft #40, with fake-runtime
+  regression tests. It is unreviewed, unmerged, and not rerun on hardware.
+- Next: review and land draft #40 and the deletion-evidence change, then add probes and exec/log streaming within the profile
   and the reproducible M1 harness. Do not bypass Kata ownership or reintroduce a
   custom guest-control service.
 - Cooperative VM pause, durable checkpoints, and restore remain unimplemented.
@@ -165,7 +167,7 @@ Sections 6 through 12 specify the node agent by component. A component is a resp
 
 | Component | Brie owns | Must not assume | Today |
 | --- | --- | --- | --- |
-| Reconciliation (section 6) | Converging assigned Pods, the journal, and CRI inventory; the startup barrier; terminal cleanup | Missing or unknown state is absence; an inventory difference authorizes deletion. | Serial two-second poll. No watch, and no deletion-evidence or creation-evidence rule. |
+| Reconciliation (section 6) | Converging assigned Pods, the journal, and CRI inventory; the startup barrier; terminal cleanup | Missing or unknown state is absence; an inventory difference authorizes deletion. | Serial two-second poll. No watch. List-based deletion evidence on an unmerged branch; no creation-evidence rule. |
 | Admission management (section 7) | Deciding whether a Pod, wake, checkpoint, or resize may consume node resources; durable reservations; explicit refusal | Scheduler binding reserves local capacity; the configured budget is measured capacity. | Profile, overhead, and budget checks for new Pods. No wake, checkpoint, resize, pressure, or preemption admission. |
 | Hypervisor (section 8) | The pinned VMM profile it requires and the checks it can make through RuntimeClass and CRI | A handler name proves the VMM, its version, or its privilege; any Firecracker call from Brie is safe. | Handler-name checks only. |
 | Snapshot (section 9) | Lifecycle intent, admission, and status for pause, snapshot, and restore requested through the Kata-owned extension | Container pause, a successful return, or a file on disk is a VM snapshot. | Not implemented. The tested Kata backend has no snapshot path. |
@@ -356,7 +358,7 @@ Destructive work is authorized by current intent, not by inventory divergence. B
 
 **Known gap, 2026-10-30:** the API server deletes a Pod in a terminal phase immediately, with no grace period. When a user deleted a Failed Pod right after Brie published its exit status, the Pod object disappeared between two polls. The per-step re-read then failed with Forbidden from the Node authorizer, which grants a node access only to Pods currently bound to it. Brie correctly refused to treat that error as deletion evidence, preserved the exited sandbox and its journal reservation, and blocked admission until an operator removed the sandbox through CRI. The behavior satisfied invariant 5 but has no liveness path.
 
-Deletion-evidence rule, to be implemented and tested before `--enable-workloads` is recommended beyond disposable labs:
+Deletion-evidence rule, required before `--enable-workloads` is recommended beyond disposable labs. The list form (items 1 to 5) is implemented on an unmerged branch stacked on draft #40, recording the list resource version as `DeletionObserved` and requiring identical resource versions across list pages; `TestExecutionDeletionEvidence` and related tests cover it against the fake runtime only. Watch `DELETED` events are unused until watch-based assignment exists:
 
 1. Evidence of deletion is positive, authenticated, and complete: a successful, complete, most-recent (quorum-consistent) node-scoped list that does not contain the Pod UID, or a watch `DELETED` event for that UID. `spec.nodeName` is immutable once bound, so a Pod absent from such a list no longer exists. A `NotFound` or `Forbidden` response to an exact `GET`, a failed or truncated list, a stale cache read, or any transport error is not evidence.
 2. The rule applies only to executions this agent created: the journal record, the sandbox metadata UID, and the owner labels must agree. Foreign and unlabeled sandboxes remain untouched and continue to block admission.
@@ -364,7 +366,7 @@ Deletion-evidence rule, to be implemented and tested before `--enable-workloads`
 4. A running execution whose Pod was force-deleted follows the same rule with a zero grace period, matching kubelet semantics. This case is a G2 race test, not an assumed-safe path. API unavailability, authorization failures, and partial lists still block cleanup and admission.
 5. Control-plane terminated-Pod garbage collection and `kubectl delete --force` produce the same evidence and need no special path.
 
-Until then, operators remove orphaned lab sandboxes through CRI with explicit ID checks; the journal is never edited by hand. The gap is recorded in the execution guide (`docs/pod-profile.md`, extended by draft #40) and is the next release blocker for execution mode.
+Until that change is reviewed and merged, operators remove orphaned lab sandboxes through CRI with explicit ID checks; the journal is never edited by hand. The gap is recorded in the execution guide (`docs/pod-profile.md`, extended by draft #40) and is the next release blocker for execution mode.
 
 ### 6.4 Loop model and current limits
 
@@ -809,8 +811,8 @@ probes, exec, or volumes; host-side VMM privilege was observed but is unqualifie
 section 6.3 was the one incomplete cleanup. Lab storage was a loopback-backed
 devmapper thin pool; nothing in the run is a capacity or conformance result.
 
-Next increments, each a separate reviewable PR: the deletion-evidence rule and
-its G2 races; watch-based assignment with bookmarks replacing the poll; probes
+Next increments, each a separate reviewable PR: review of the deletion-evidence
+change and hardware evidence for its G2 races; watch-based assignment with bookmarks replacing the poll; probes
 and exec/log streaming within the profile; then the reproducible M1 harness.
 Node readiness and nonzero allocatable resources remain gated behind runtime
 health, RuntimeClass verification, and inventory reconstruction. The
