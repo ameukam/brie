@@ -15,10 +15,11 @@ Audience: engineers implementing and reviewing the node agent, runtime integrati
   Kubernetes client libraries are pinned to v0.37.2. Without
   `--enable-workloads`, `--kubeconfig` registration remains cordoned, tainted,
   NotReady, and zero-capacity regardless of runtime health.
-- Draft [#29](https://github.com/ameukam/brie/pull/29) adds the fail-closed
-  restricted Pod profile validator (section 4.4) and bounded read-only CRI
-  sandbox/container inventory (section 6.3). It enables no execution.
-- An uncommitted increment on top of #29 implements explicit
+- [#29](https://github.com/ameukam/brie/pull/29), merged on 2026-11-10, adds
+  the fail-closed restricted Pod profile validator (section 4.4) and bounded
+  read-only CRI sandbox/container inventory (section 6.3). Nothing in `main`
+  calls either yet; it enables no execution.
+- Draft [#40](https://github.com/ameukam/brie/pull/40) implements explicit
   `--enable-workloads` mode: multiple scheduler-assigned restricted Pods per
   node, CRI image/sandbox/container lifecycle, local admission with RuntimeClass
   overhead, truthful PodStatus, deletion, and journal-based restart
@@ -30,10 +31,10 @@ Audience: engineers implementing and reviewing the node agent, runtime integrati
   It fixed a NodeRestriction readiness bug and exposed the terminal-deletion
   cleanup gap in section 6.3. This is smoke evidence, not M1 completion,
   capacity qualification, or Node Conformance.
-- Next: implement and test the deletion-evidence rule in section 6.3, land #29
-  and the execution increment as separate reviewable PRs, then add probes and
-  exec/log streaming within the profile and the reproducible M1 harness. Do not
-  bypass Kata ownership or reintroduce a custom guest-control service.
+- Next: implement and test the deletion-evidence rule in section 6.3, review
+  and land draft #40, then add probes and exec/log streaming within the profile
+  and the reproducible M1 harness. Do not bypass Kata ownership or reintroduce a
+  custom guest-control service.
 - Cooperative VM pause, durable checkpoints, and restore remain unimplemented.
   They require a separate Kata-owned extension, not container freezing.
 - Document revision, 2026-11-10: adds node-agent component sections for
@@ -160,7 +161,7 @@ Use an extension of the existing sandbox reconciliation owner. Do not introduce 
 
 ### 2.4 Node-agent components
 
-Sections 6 through 12 specify the node agent by component. A component is a responsibility inside Brie or a boundary Brie holds toward containerd and Kata. It is not a separate process and never a second owner of a VM. "Today" describes the unmerged execution increment unless stated otherwise.
+Sections 6 through 12 specify the node agent by component. A component is a responsibility inside Brie or a boundary Brie holds toward containerd and Kata. It is not a separate process and never a second owner of a VM. "Today" describes the unmerged execution increment (draft #40) unless stated otherwise.
 
 | Component | Brie owns | Must not assume | Today |
 | --- | --- | --- | --- |
@@ -242,7 +243,7 @@ No remote `process_madvise(MADV_DONTNEED)` operation is used. `MADV_PAGEOUT` is 
 
 ### 4.4 Restricted execution profile
 
-The first executable profile restricts each Pod, not the number of Pods or nodes. Brie admits a scheduler-assigned Pod only when it understands the whole specification; any other nonzero field fails closed with a published reason, and fields added by API upgrades must be reviewed before acceptance. The [profile reference](docs/pod-profile.md) in #29 lists exact fields. The contract:
+The first executable profile restricts each Pod, not the number of Pods or nodes. Brie admits a scheduler-assigned Pod only when it understands the whole specification; any other nonzero field fails closed with a published reason, and fields added by API upgrades must be reviewed before acceptance. The [profile reference](docs/pod-profile.md) lists exact fields. The contract:
 
 - Linux, exactly one ordinary container, `restartPolicy: Never`, and no init, sidecar, or ephemeral containers. Brie never restarts an exited container; a terminal Pod is not a candidate for new execution.
 - A digest-pinned image with `IfNotPresent` pull policy and no pull Secrets. Pinning does not establish availability, authenticity, or guest compatibility.
@@ -363,7 +364,7 @@ Deletion-evidence rule, to be implemented and tested before `--enable-workloads`
 4. A running execution whose Pod was force-deleted follows the same rule with a zero grace period, matching kubelet semantics. This case is a G2 race test, not an assumed-safe path. API unavailability, authorization failures, and partial lists still block cleanup and admission.
 5. Control-plane terminated-Pod garbage collection and `kubectl delete --force` produce the same evidence and need no special path.
 
-Until then, operators remove orphaned lab sandboxes through CRI with explicit ID checks; the journal is never edited by hand. The gap is recorded in the execution guide (`docs/pod-profile.md`, extended by the uncommitted increment) and is the next release blocker for execution mode.
+Until then, operators remove orphaned lab sandboxes through CRI with explicit ID checks; the journal is never edited by hand. The gap is recorded in the execution guide (`docs/pod-profile.md`, extended by draft #40) and is the next release blocker for execution mode.
 
 ### 6.4 Loop model and current limits
 
@@ -779,11 +780,12 @@ response validation. `internal/nodeagent/runtime.go` uses it for the optional
 `--runtime-socket` startup observation and closes the client afterwards. It
 neither verifies the Kata runtime handler nor monitors later runtime failures.
 
-Draft #29 adds unfiltered `ListPodSandbox`/`ListContainers` and exact-ID
-`PodSandboxStatus`/`ContainerStatus` on the same client. Inventory retains
+Since #29, the same client also has unfiltered `ListPodSandbox`/`ListContainers`
+and exact-ID `PodSandboxStatus`/`ContainerStatus`, and `internal/nodeagent` has
+the profile validator; nothing in `main` calls them yet. Inventory retains
 foreign and non-running objects and fails without partial results on malformed,
 duplicate, mismatched, or oversized responses; a successful empty list is
-distinct from every error. The uncommitted execution increment adds the image,
+distinct from every error. Draft #40 adds the image,
 runtime-config, sandbox, and container lifecycle calls, each without automatic
 retries, and the `--enable-workloads` executor described in sections 4.4 and
 6.3. Every VM, container, and network mutation stays with containerd and Kata;
