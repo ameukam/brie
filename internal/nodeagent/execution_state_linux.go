@@ -17,10 +17,18 @@ import (
 	"syscall"
 )
 
+// maxResourceVersion bounds the opaque list resource version kept as deletion
+// evidence.
+const maxResourceVersion = 128
+
 type executionRecord struct {
 	UID, Namespace, Name, Hash, Stage string
 	SandboxID, ContainerID            string
 	CPU, Memory                       int64
+	// DeletionObserved is the resource version of the complete assigned-Pod
+	// list that proved the Pod deleted. Once set, it authorizes cleanup
+	// without a live Pod read. Older journals omit it.
+	DeletionObserved string `json:",omitempty"`
 }
 
 type executionJournal struct {
@@ -107,7 +115,8 @@ func openExecutionJournal(dir, node string, config ExecutionConfig) (_ *executio
 	}
 	for uid, record := range journal.Records {
 		if record == nil || uid == "" || uid != record.UID || record.Namespace == "" || record.Name == "" ||
-			len(record.Hash) != 64 || record.CPU <= 0 || record.Memory <= 0 {
+			len(record.Hash) != 64 || record.CPU <= 0 || record.Memory <= 0 ||
+			len(record.DeletionObserved) > maxResourceVersion {
 			return nil, errors.New("invalid execution journal record")
 		}
 		switch record.Stage {

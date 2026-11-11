@@ -49,6 +49,8 @@ type executionRuntime struct {
 	unhealthy  bool
 	listError  bool
 	onPull     func()
+	failStop   bool
+	stopGrace  []int64
 }
 
 func (s *executionRuntime) Version(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -181,6 +183,7 @@ func (s *executionRuntime) StopContainer(_ context.Context, request *runtimeapi.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "StopContainer")
+	s.stopGrace = append(s.stopGrace, request.Timeout)
 	if container := s.containers[request.ContainerId]; container != nil {
 		container.State = runtimeapi.ContainerState_CONTAINER_EXITED
 	}
@@ -191,6 +194,10 @@ func (s *executionRuntime) StopPodSandbox(context.Context, *runtimeapi.StopPodSa
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "StopPodSandbox")
+	if s.failStop {
+		s.failStop = false
+		return nil, status.Error(codes.Unavailable, "sandbox stop interrupted")
+	}
 	return &runtimeapi.StopPodSandboxResponse{}, nil
 }
 
@@ -725,14 +732,327 @@ func TestExecutionDeletionDuringPull(t *testing.T) {
 func TestExecutionReplacementUIDDoesNotCleanUp(t *testing.T) {
 	t.Parallel()
 	e, service := newExecutor(t, executionPod("app"))
-	reconcilePasses(t, e, 3)
-	before := len(service.calls)
+	reconcilePasses(t, e, 5)
+	old := e.journal.Records["app-uid"]
 	_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
 	replacement := executionPod("app")
 	replacement.UID = "replacement-uid"
 	_, _ = e.api.CoreV1().Pods("default").Create(t.Context(), replacement, metav1.CreateOptions{})
+	gets := denyPodReads(e)
+	service.mu.Lock()
+	before := len(service.calls)
+	service.mu.Unlock()
 	reconcilePasses(t, e, 1)
-	if len(service.calls) != before || !e.recovery.Load() {
-		t.Fatal("replacement UID authorized old cleanup or new execution")
+	// The old execution is removed on list evidence, never on a name-based
+	// read that would resolve to the replacement, and no replacement starts
+	// in the same pass.
+	if *gets != 0 || old.Stage != "finished" || old.DeletionObserved == "" ||
+		e.journal.Records["replacement-uid"] != nil || !e.recovery.Load() {
+		t.Fatalf("old execution not cleaned up by list evidence: reads=%d record=%+v", *gets, old)
+	}
+	service.mu.Lock()
+	removed := service.calls[before:]
+	service.mu.Unlock()
+	if strings.Join(removed, ",") != "StopContainer,StopPodSandbox,RemoveContainer,RemovePodSandbox" {
+		t.Fatalf("unexpected cleanup calls: %v", removed)
+	}
+}
+
+// denyPodReads makes exact Pod reads fail as the Node authorizer does for a Pod
+// no longer bound to the node, and counts them.
+func denyPodReads(e *executor) *int {
+	var count int
+	e.api.(*fake.Clientset).PrependReactor("get", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+		count++
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"},
+			action.(ktesting.GetAction).GetName(), errors.New("no relationship found between node and this object"))
+	})
+	return &count
+}
+
+func TestExecutionDeletionEvidence(t *testing.T) {
+	t.Parallel()
+	podsResource := corev1.SchemeGroupVersion.WithResource("pods")
+	podsKind := corev1.SchemeGroupVersion.WithKind("Pod")
+	for _, tc := range []struct {
+		name string
+		// prepare runs after the Pod is running and returns whether its
+		// execution must be cleaned up.
+		prepare func(*testing.T, *executor, *executionRuntime) bool
+		calls   string
+	}{
+		{
+			name: "terminal Pod deleted between polls",
+			prepare: func(t *testing.T, e *executor, service *executionRuntime) bool {
+				service.mu.Lock()
+				for _, container := range service.containers {
+					container.State = runtimeapi.ContainerState_CONTAINER_EXITED
+				}
+				service.mu.Unlock()
+				// Publish the exit, then delete the terminal Pod before cleanup.
+				pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
+				sandbox, _ := e.runtime.PodSandboxStatus(t.Context(), e.journal.Records["app-uid"].SandboxID)
+				container, _ := e.runtime.ContainerStatus(t.Context(), e.journal.Records["app-uid"].ContainerID)
+				if err := e.publishPodStatus(t.Context(), pod, sandbox, container, "", ""); err != nil {
+					t.Fatal(err)
+				}
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				return true
+			},
+			calls: "StopContainer,StopPodSandbox,RemoveContainer,RemovePodSandbox",
+		},
+		{
+			name: "running Pod force-deleted",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				return true
+			},
+			calls: "StopContainer,StopPodSandbox,RemoveContainer,RemovePodSandbox",
+		},
+		{
+			name: "sandbox already removed by operator",
+			prepare: func(t *testing.T, e *executor, service *executionRuntime) bool {
+				service.mu.Lock()
+				clear(service.sandboxes)
+				clear(service.containers)
+				service.mu.Unlock()
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				return true
+			},
+		},
+		{
+			name: "list unavailable",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewServiceUnavailable("etcd unavailable")
+				})
+				return false
+			},
+		},
+		{
+			name: "list forbidden",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(podsResource.GroupResource(), "", errors.New("denied"))
+				})
+				return false
+			},
+		},
+		{
+			name: "list without resource version",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				tracker := e.api.(*fake.Clientset).Tracker()
+				e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+					list, err := tracker.List(podsResource, podsKind, "")
+					if err == nil {
+						list.(*corev1.PodList).ResourceVersion = ""
+					}
+					return true, list, err
+				})
+				return false
+			},
+		},
+		{
+			name: "truncated list",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				tracker := e.api.(*fake.Clientset).Tracker()
+				pages := 0
+				e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+					if pages++; pages%2 == 0 {
+						return true, nil, apierrors.NewResourceExpired("continue token expired")
+					}
+					list, err := tracker.List(podsResource, podsKind, "")
+					if err == nil {
+						list.(*corev1.PodList).Continue = "next"
+					}
+					return true, list, err
+				})
+				return false
+			},
+		},
+		{
+			name: "pages from different snapshots",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				tracker := e.api.(*fake.Clientset).Tracker()
+				pages := 0
+				e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+					list, err := tracker.List(podsResource, podsKind, "")
+					if pages++; err == nil && pages%2 == 1 {
+						list.(*corev1.PodList).Continue, list.(*corev1.PodList).ResourceVersion = "next", "1"
+					}
+					return true, list, err
+				})
+				return false
+			},
+		},
+		{
+			name: "foreign owner label",
+			prepare: func(t *testing.T, e *executor, service *executionRuntime) bool {
+				service.mu.Lock()
+				service.sandboxes[e.journal.Records["app-uid"].SandboxID].Labels[executionMarker] = "another-owner"
+				service.mu.Unlock()
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				return false
+			},
+		},
+		{
+			name: "container in another sandbox claims the Pod",
+			prepare: func(t *testing.T, e *executor, service *executionRuntime) bool {
+				service.mu.Lock()
+				service.containers["stray"] = &runtimeapi.Container{Id: "stray", PodSandboxId: "foreign", CreatedAt: 1,
+					Metadata: &runtimeapi.ContainerMetadata{Name: "app"}, Labels: map[string]string{podUIDLabel: "app-uid"},
+					Image: &runtimeapi.ImageSpec{Image: "image"}, ImageRef: "image"}
+				service.mu.Unlock()
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+				return false
+			},
+		},
+		{
+			name: "recorded deletion contradicted by a listed Pod",
+			prepare: func(t *testing.T, e *executor, _ *executionRuntime) bool {
+				e.journal.Records["app-uid"].DeletionObserved = "1"
+				if err := e.journal.save(); err != nil {
+					t.Fatal(err)
+				}
+				return false
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			reconcilePasses(t, e, 5)
+			record := e.journal.Records["app-uid"]
+			if record.Stage != "running" {
+				t.Fatalf("execution not running: %+v", record)
+			}
+			removes := tc.prepare(t, e, service)
+			observed := record.DeletionObserved
+			gets := denyPodReads(e)
+			service.mu.Lock()
+			before := len(service.calls)
+			service.mu.Unlock()
+			for range 2 {
+				err := e.reconcile(t.Context())
+				if !removes && err == nil && tc.name != "foreign owner label" {
+					t.Fatal("unproven deletion was not reported")
+				}
+			}
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			calls := strings.Join(service.calls[before:], ",")
+			if !removes {
+				if calls != "" || record.Stage != "running" || record.DeletionObserved != observed ||
+					!e.recovery.Load() && e.synced.Load() || len(service.sandboxes) != 1 {
+					t.Fatalf("unproven deletion mutated execution: calls=%q record=%+v", calls, record)
+				}
+				return
+			}
+			if calls != tc.calls || *gets != 0 || record.Stage != "finished" || record.DeletionObserved == "" ||
+				len(service.sandboxes) != 0 || len(service.containers) != 0 {
+				t.Fatalf("deleted execution not removed on list evidence: calls=%q reads=%d record=%+v", calls, *gets, record)
+			}
+			for _, grace := range service.stopGrace[len(service.stopGrace)-min(len(service.stopGrace), 1):] {
+				if tc.calls != "" && grace != 0 {
+					t.Fatalf("deleted Pod stopped with grace %d", grace)
+				}
+			}
+			if !e.budgetFits(0, 0) || e.recovery.Load() {
+				t.Fatal("reservation or admission barrier not released after cleanup")
+			}
+		})
+	}
+}
+
+func TestExecutionDeletionEvidenceSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	e, service := newExecutor(t, executionPod("app"))
+	reconcilePasses(t, e, 5)
+	_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+	gets := denyPodReads(e)
+	service.mu.Lock()
+	service.failStop = true
+	service.mu.Unlock()
+	if err := e.reconcile(t.Context()); status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected interrupted cleanup: %v", err)
+	}
+	if err := e.journal.close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openExecutionJournal(e.config.StateDir, e.node.NodeName, e.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.close() })
+	e.journal = reopened
+	e.synced.Store(false)
+	record := reopened.Records["app-uid"]
+	if record.DeletionObserved == "" || record.Stage != "running" {
+		t.Fatalf("deletion evidence not durable before cleanup: %+v", record)
+	}
+	reconcilePasses(t, e, 2)
+	if *gets != 0 || record.Stage != "finished" || len(service.sandboxes) != 0 {
+		t.Fatalf("restart did not resume evidenced cleanup: reads=%d record=%+v", *gets, record)
+	}
+}
+
+func TestExecutionDeletionEvidenceReleasesUnstartedReservation(t *testing.T) {
+	t.Parallel()
+	for _, lost := range []string{"", "RunPodSandbox"} {
+		t.Run("lost-"+lost, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			service.loseReply = lost
+			if lost == "" {
+				// Delete the Pod during its image pull, before any sandbox exists.
+				service.onPull = func() {
+					_ = e.api.CoreV1().Pods("default").Delete(context.Background(), "app", metav1.DeleteOptions{})
+				}
+			}
+			reconcilePasses(t, e, 1)
+			_ = e.reconcile(t.Context())
+			if lost != "" {
+				// The sandbox creation outcome is unknown and its object is gone.
+				service.mu.Lock()
+				clear(service.sandboxes)
+				service.mu.Unlock()
+				_ = e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{})
+			}
+			service.mu.Lock()
+			before := len(service.calls)
+			service.mu.Unlock()
+			err := e.reconcile(t.Context())
+			record := e.journal.Records["app-uid"]
+			if len(service.calls) != before || record.DeletionObserved == "" {
+				t.Fatalf("deleted Pod not evidenced or runtime mutated: %v %+v", service.calls, record)
+			}
+			if lost == "" && (err != nil || record.Stage != "finished") {
+				t.Fatalf("unstarted reservation not released: %v %+v", err, record)
+			}
+			if lost != "" && (err == nil || record.Stage != "sandbox-pending" || !e.recovery.Load()) {
+				t.Fatalf("unresolved creation released on deletion evidence: %v %+v", err, record)
+			}
+		})
+	}
+}
+
+func TestExecutionJournalRejectsOversizedDeletionEvidence(t *testing.T) {
+	t.Parallel()
+	e, _ := newExecutor(t, executionPod("app"))
+	reconcilePasses(t, e, 5)
+	e.journal.Records["app-uid"].DeletionObserved = strings.Repeat("9", maxResourceVersion+1)
+	if err := e.journal.save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.journal.close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openExecutionJournal(e.config.StateDir, e.node.NodeName, e.config); err == nil {
+		t.Fatal("oversized deletion evidence accepted")
 	}
 }

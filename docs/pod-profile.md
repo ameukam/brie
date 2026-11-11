@@ -173,10 +173,26 @@ stop/remove, after rechecking UID and current API intent. Graceful deletion uses
 the current deletion deadline. The agent releases reservations after cleanup,
 and finalizes deletion with UID/resource-version preconditions.
 
-API/runtime outages, foreign or orphan executions, ambiguous associations,
-missing known IDs, and over-budget reconstructed reservations preserve workloads
-and block admission. Shutdown closes agent connections without killing VMs.
-There is no destructive orphan GC, cross-host recovery, probes, streaming,
+A Pod that disappears before cleanup finishes, including a terminal Pod deleted
+right after its exit is reported, a force-deleted running Pod, and terminated-Pod
+garbage collection, is cleaned up only on positive deletion evidence: a
+successful, complete, quorum-consistent node-scoped Pod list with a resource
+version that omits the Pod UID. The execution must be this agent's own: its
+journal record, sandbox metadata UID, and owner labels agree. The agent journals
+that list resource version as `DeletionObserved` before the first destructive
+step; the durable record then authorizes the idempotent stop/remove steps across
+restarts without a Pod read, which the Node authorizer rejects once the Pod is
+gone. The container is stopped with zero grace. A failed, forbidden, truncated,
+or version-less list, a `NotFound` or `Forbidden` Pod read, a foreign or
+ambiguous runtime object, an unresolved sandbox creation, and a recorded deletion
+contradicted by a listed Pod are not evidence; they preserve the execution and
+block admission. There is no watch yet, so watch `DELETED` events are not used.
+
+API/runtime outages, foreign or orphan executions without deletion evidence,
+ambiguous associations, missing known IDs, and over-budget reconstructed
+reservations preserve workloads and block admission. Shutdown closes agent
+connections without killing VMs. There is no age- or inventory-based orphan GC,
+cross-host recovery, probes, streaming,
 hibernation, or conformance claim. Terminal journal records are retained; the
 journal is bounded to 10,000 records and 4 MiB and requires reviewed operator
 maintenance before those limits are reached. Polling, startup latency, host/guest
@@ -220,7 +236,10 @@ container's sandbox and journal reservation and blocked admission, rather than
 performing destructive orphan GC. Scoped operator cleanup through CRI removed the
 remaining lab sandbox; the journal was not manually modified. All API test Pods,
 runtime containers/sandboxes, VMM processes, and cloud experiment resources were
-removed, but automatic terminal cleanup did not complete in this case.
+removed, but automatic terminal cleanup did not complete in this case. The
+deletion-evidence rule above addresses this case and is covered by fake-runtime
+regression tests (`TestExecutionDeletionEvidence`); it has not been rerun on
+hardware.
 
 Credential-free evidence was retained outside Git. This smoke run does not
 establish production isolation, load/capacity qualification, hibernation, or
