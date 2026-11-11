@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	coordinationclient "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 )
@@ -43,21 +44,10 @@ func Register(ctx context.Context, config Config, kubeconfig string, stderr io.W
 	if err := ctx.Err(); err != nil {
 		return shutdownError(err)
 	}
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	cfg, err := registrationConfig(kubeconfig)
 	if err != nil {
-		return fmt.Errorf("load registration kubeconfig: %w", err)
+		return err
 	}
-	endpoint, err := url.Parse(cfg.Host)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
-		return errors.New("registration requires an HTTPS API endpoint without embedded credentials")
-	}
-	if cfg.Insecure || cfg.ExecProvider != nil || cfg.AuthProvider != nil ||
-		cfg.Impersonate.UserName != "" || cfg.Impersonate.UID != "" || len(cfg.Impersonate.Groups) != 0 ||
-		len(cfg.Impersonate.Extra) != 0 {
-		return errors.New("registration requires verified TLS and static credentials without impersonation or credential plugins")
-	}
-	cfg.Timeout = 10 * time.Second
-	cfg.UserAgent = "brie-node/registration-only"
 	nodes, err := coreclient.NewForConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("create Node client: %w", err)
@@ -67,6 +57,28 @@ func Register(ctx context.Context, config Config, kubeconfig string, stderr io.W
 		return fmt.Errorf("create Lease client: %w", err)
 	}
 	return register(ctx, config, nodes.Nodes(), leases.Leases(leaseNamespace), stderr)
+}
+
+func registrationConfig(kubeconfig string) (*rest.Config, error) {
+	if !filepath.IsAbs(kubeconfig) {
+		return nil, errors.New("registration requires an explicit absolute kubeconfig path")
+	}
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("load registration kubeconfig: %w", err)
+	}
+	endpoint, err := url.Parse(cfg.Host)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
+		return nil, errors.New("registration requires an HTTPS API endpoint without embedded credentials")
+	}
+	if cfg.Insecure || cfg.ExecProvider != nil || cfg.AuthProvider != nil ||
+		cfg.Impersonate.UserName != "" || cfg.Impersonate.UID != "" || len(cfg.Impersonate.Groups) != 0 ||
+		len(cfg.Impersonate.Extra) != 0 {
+		return nil, errors.New("registration requires verified TLS and static credentials without impersonation or credential plugins")
+	}
+	cfg.Timeout = 10 * time.Second
+	cfg.UserAgent = "brie-node/registration-only"
+	return cfg, nil
 }
 
 func register(ctx context.Context, config Config, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, stderr io.Writer) error {
@@ -189,6 +201,10 @@ func heartbeatOnce(ctx context.Context, nodes coreclient.NodeInterface, leases c
 	if _, err := nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("update Node status: %w", err)
 	}
+	return renewLease(ctx, leases, name, uid)
+}
+
+func renewLease(ctx context.Context, leases coordinationclient.LeaseInterface, name string, uid types.UID) error {
 	lease, err := leases.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		lease = &coordinationv1.Lease{

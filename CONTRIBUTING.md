@@ -1,6 +1,7 @@
 # Contributing to Brie
 
-Brie currently provides a version CLI, not a working Kubernetes node agent.
+Brie includes an opt-in restricted CRI execution path. Fake-runtime tests do not
+establish real Kata/Firecracker execution or Kubernetes conformance.
 Keep changes focused and discuss new dependencies or runtime interfaces before
 implementing them.
 
@@ -36,9 +37,12 @@ Omit the socket to skip CRI. Errors stop startup; unhealthy conditions are logge
 With `--kubeconfig`, registration still advertises zero capacity and stays
 cordoned and NotReady. This does not check the Kata handler or run Pods.
 
-The [initial Pod profile](docs/pod-profile.md) defines a fail-closed validator
-and read-only sandbox/container inventory APIs for future reconciliation.
-Neither is an enabled Pod execution or cleanup path.
+The [restricted Pod profile and execution guide](docs/pod-profile.md) describes
+explicit `--enable-workloads` mode: multiple assigned Pods, CRI image/container
+lifecycle, local resource admission, status, deletion, and restart reconstruction.
+Registration-only defaults do not change. The guide records a limited real C4A
+smoke run and its terminal-deletion limitation. Deployment-specific runtime
+qualification is still required; enabling the flag is not conformance evidence.
 
 ## Kubernetes baseline
 

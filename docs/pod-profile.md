@@ -1,10 +1,13 @@
-# Initial Pod profile
+# Restricted Pod execution
 
-This is the restricted contract for a future one-Pod, one-node experiment,
-not an enabled execution path or a Node Conformance claim.
-`nodeagent.ValidatePodProfile` is a side-effect-free check; there is no assigned-Pod
-watch, admission loop, image pull, sandbox/container mutation, or PodStatus writer.
-Registration stays cordoned, tainted, NotReady, and zero-capacity.
+The profile limits each Pod to one ordinary container, not the number of Pods or
+nodes. Explicit `--enable-workloads` mode reconciles multiple assigned Pods using
+containerd CRI and the upstream Kubernetes scheduler. Without that flag,
+registration-only behavior remains cordoned, tainted, NotReady, and zero-capacity.
+Fake-runtime and API transport tests cover the code path. A limited C4A hardware
+smoke run exercised scheduler-to-Firecracker execution and exposed a terminal
+deletion limitation, described below. Deployment qualification and Node
+Conformance remain outstanding.
 
 The caller supplies a trusted node name and RuntimeClass name. The Pod must have
 a name, namespace, UID, and matching node assignment and RuntimeClass. Class-name
@@ -20,8 +23,9 @@ are not runtime configuration or proof of ownership.
   `imagePullPolicy: IfNotPresent`. Pinning does not verify image availability,
   authenticity, guest compatibility, or support for the requested UID.
 - Positive, equal CPU and memory requests/limits; no additional resources,
-  claims, Pod-level resources, or RuntimeClass overhead. Capacity accounting,
-  VM overhead, and host/guest enforcement must be implemented before execution.
+  claims or Pod-level resources. Execution requires measured positive CPU/memory
+  overhead in the approved RuntimeClass and the identical API-injected Pod
+  overhead. Admission reserves both container requests and overhead.
 - Pod-level `runAsNonRoot: true`, positive explicit `runAsUser` and `runAsGroup`,
   and `seccompProfile.type: RuntimeDefault`. The container must explicitly disable
   privilege escalation, drop `ALL` capabilities, and add none. Privileged mode,
@@ -32,9 +36,10 @@ are not runtime configuration or proof of ownership.
   container inputs. `automountServiceAccountToken` and `enableServiceLinks` must
   explicitly be false. ServiceAccount names may be API-defaulted but authorize no
   token or Secret delivery. No image-pull Secrets or environment references.
-- Standard Pod networking and `dnsPolicy: ClusterFirst` are the intended future
-  path through CRI/CNI/Kata, not a networkless/vsock substitute. Networking and DNS
-  are not implemented or qualified by this validator. Port declarations, custom
+- Standard Pod networking and `dnsPolicy: ClusterFirst` use the CRI/CNI/Kata
+  path, not a networkless/vsock substitute. The agent supplies
+  Pod CIDR configuration and cluster DNS; the administrator must qualify CNI,
+  guest routing, Service reachability, and DNS. Port declarations, custom
   DNS settings, host aliases, and hostname overrides remain unsupported.
 - Nonnegative termination grace periods and API-defaulted termination-message
   fields are recognized; custom termination-message settings, active deadlines,
@@ -72,6 +77,153 @@ including `NotFound`, unavailable transport, cancellation, or oversized messages
 
 Separate lists/status calls are not an atomic snapshot. A disappearing object,
 an inconsistent association, or unavailable API/runtime data requires resync,
-not orphan deletion or evidence of absence. This increment adds no cleanup,
-ownership reconstruction, runtime health loop, or startup inventory scan.
-The existing opt-in CLI still reads only Version and Status once at startup.
+not orphan deletion or evidence of absence.
+
+## Enabling scheduling and execution
+
+Use a dedicated containerd CRI endpoint configured for Kata's Firecracker
+handler and a qualified block-backed image/snapshotter path. Create a
+`node.k8s.io/v1` RuntimeClass with the approved `handler`, measured CPU/memory
+`overhead.podFixed`, and these scheduling settings:
+
+```yaml
+scheduling:
+  nodeSelector:
+    brie.dev/runtime: kata-fc
+  tolerations:
+    - key: brie.dev/runtime
+      operator: Equal
+      value: kata-fc
+      effect: NoSchedule
+```
+
+Replace `kata-fc` with the approved handler name. The API server injects
+RuntimeClass overhead and scheduling constraints into submitted Pods.
+Set the Pod's `runtimeClassName`; do not bind it with `spec.nodeName`.
+Pods still need the explicit OS/security/resource/token settings above.
+Pin an immutable application image that supports the selected non-root UID/GID.
+
+Run on each Linux workload host with explicitly reserved, measured budgets:
+
+```sh
+brie-node --run --enable-workloads \
+  --node-name=worker-exec-1 --node-ip=192.0.2.10 \
+  --kubeconfig=/etc/brie/kubeconfig \
+  --runtime-socket=/run/containerd/containerd.sock \
+  --runtime-class=kata-fc --runtime-handler=kata-fc \
+  --allocatable-cpu=4 --allocatable-memory=8Gi --max-pods=10 \
+  --cluster-dns=10.96.0.10 --cluster-domain=cluster.local \
+  --state-dir=/var/lib/brie/execution --pod-log-dir=/var/log/brie/pods
+```
+
+Addresses and budgets are illustrative, not host discovery or sizing guidance.
+Reserve host services before selecting budgets; per-Pod VM overhead must come
+from measurement. Never share the state directory between hosts. It must be
+private, owned by the agent user, durable, and retained across restarts. State
+pins node/runtime-class identity, DNS, node IP, and log location. Corrupt,
+incompatible, or missing state cannot be replaced to adopt running VMs.
+
+Execution creates a new Node or reconnects its original execution-owned Node;
+it never takes over an existing registration-only or unrelated Node. Use a new
+node name for migration, or arrange a separate reviewed migration. An existing
+administrator cordon, unrelated taints, and externally managed conditions remain
+intact. The permanent runtime `NoSchedule` taint is not removed.
+
+The control plane must assign one Pod CIDR. The agent sets CRI network
+configuration, continuously checks runtime/network health and the pinned
+RuntimeClass, and reconstructs complete assigned-Pod and CRI inventories before
+reporting Ready or advertising nonzero allocatable resources. Until then,
+allocatable CPU, memory, and Pods remain zero. NodeRestriction remains enabled:
+the agent updates Node status, not existing taints or administrator cordons.
+The upstream node controller owns the standard readiness taints. Configured
+budgets become schedulable only through that gated path. Kubernetes remains the
+only scheduler; the agent performs local resource admission.
+
+The explicit kubeconfig needs node-scoped Node get/create/update/status access,
+Lease get/create/update, assigned-Pod list/get/status update/delete, and get access
+to the approved RuntimeClass. Field selection is not authorization: use appropriate
+Node authorization/RBAC and NodeRestriction, not broad administrator credentials.
+Credential plugins, impersonation, insecure TLS, and ambient kubeconfigs remain
+unsupported.
+
+## Lifecycle and failure behavior
+
+Assigned Pods are listed with a node field selector and bounded pagination, then
+reconciled serially on a two-second poll. Lease renewal runs independently of the
+five-second health/status loop and the workload RPC queue. Workload RPCs have a
+two-minute timeout; health RPCs retain ten-second deadlines.
+
+The agent observes/pulls immutable public images, runs a sandbox with the explicit
+handler, creates the container, then starts it. Security settings, CPU/memory
+limits, Pod overhead, DNS, and logs are translated into native CRI fields;
+arbitrary Pod annotations are never forwarded as Kata configuration.
+All VM/container/network mutations remain with containerd and Kata.
+
+Namespace/name/UID, container identity, owner labels, execution-config hashes, and
+durable intent records guard reconstruction. The private journal has a schema,
+checksum, exclusive lock, and write/fsync/rename/directory-fsync commit sequence.
+Each create/start intent is committed before the RPC. Lost replies are recovered
+only from matching observations, including across restart. An uncertain absent
+result blocks admission rather than triggering another create or start.
+
+Pod status reports observed pending/running/unknown/exited state, IP, readiness,
+exit code, and runtime identity; restartPolicy Never never restarts an exit.
+Explicit deletion or an acknowledged terminal Pod authorizes idempotent CRI
+stop/remove, after rechecking UID and current API intent. Graceful deletion uses
+the current deletion deadline. The agent releases reservations after cleanup,
+and finalizes deletion with UID/resource-version preconditions.
+
+API/runtime outages, foreign or orphan executions, ambiguous associations,
+missing known IDs, and over-budget reconstructed reservations preserve workloads
+and block admission. Shutdown closes agent connections without killing VMs.
+There is no destructive orphan GC, cross-host recovery, probes, streaming,
+hibernation, or conformance claim. Terminal journal records are retained; the
+journal is bounded to 10,000 records and 4 MiB and requires reviewed operator
+maintenance before those limits are reached. Polling, startup latency, host/guest
+resource enforcement, and real scheduler-to-Kata execution still require runtime
+qualification before deploying this mode.
+
+## C4A hardware smoke (2026-10-30)
+
+A disposable `c4a-highmem-96-metal` Arm64 host in `us-east4-c`, with `/dev/kvm`
+and no worker kubelet, ran containerd 2.4.2, Kata Go 4.3.1, and its Firecracker
+handler. A separate upstream Kubernetes 1.37.0 control plane retained the Node
+authorizer and NodeRestriction. The tested agent SHA-256 was
+`b7031afd5bbe721a870c5a533c85c42d07d1cdd6e604598fc6e9bc340159940e`.
+The lab used synthetic data and a disposable loopback-backed devmapper thin pool,
+not production storage.
+
+The upstream scheduler bound two restricted Pods submitted without `spec.nodeName`.
+Both ran concurrently through Brie -> containerd -> Kata -> Firecracker. The
+configured budget was 8 CPU, 8 GiB, and four Pods; each application requested one
+CPU and 128 MiB, with an additional RuntimeClass reservation of one CPU and
+768 MiB. This was not a host-capacity or performance test.
+
+Cross-host Pod HTTP, ClusterIP Service HTTP, and in-guest cluster DNS succeeded.
+Guest observations confirmed UID/GID 65534, no effective capabilities,
+`NoNewPrivs=1`, seccomp filtering, and the requested CPU/memory cgroup limits.
+Across an agent restart, 40 direct-Pod HTTP samples succeeded; VM PIDs, container
+IDs, and guest boot IDs stayed unchanged and application counters increased.
+Service continuity across that restart was not measured. An oversized Pod stayed
+unscheduled, a naturally exiting container reported exit code 17 with no restart,
+and deleting one running Pod preserved the other.
+
+The run found a NodeRestriction incompatibility in startup-taint updates.
+Readiness now uses status-only updates and zero allocatable resources until the
+health/reconstruction gates pass, leaving readiness taints to the node controller.
+Regression tests cover initializing, ready, unhealthy, and recovering states.
+
+**Known terminal-deletion limitation:** deleting the Failed Pod immediately after
+exit reporting removed its API relationship before the agent finished cleanup.
+The node authorizer then rejected the exact Pod GET. Brie preserved the exited
+container's sandbox and journal reservation and blocked admission, rather than
+performing destructive orphan GC. Scoped operator cleanup through CRI removed the
+remaining lab sandbox; the journal was not manually modified. All API test Pods,
+runtime containers/sandboxes, VMM processes, and cloud experiment resources were
+removed, but automatic terminal cleanup did not complete in this case.
+
+Credential-free evidence was retained outside Git. This smoke run does not
+establish production isolation, load/capacity qualification, hibernation, or
+Kubernetes conformance. In particular, the stock Kata VMM retained host root
+identity and broad capabilities despite jail/mount isolation and host seccomp;
+guest restrictions are not production least-privilege qualification.
