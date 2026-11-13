@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ameukam/brie/internal/cri"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // maxForwardedPorts bounds the ports of one port-forward request.
@@ -25,13 +26,14 @@ type ExecRequest struct {
 	Options cri.ExecOptions
 }
 
-// ParseExecQuery parses kubelet's stdin, stdout, stderr, tty, and repeated
-// command parameters. Attach takes no command.
+// ParseExecQuery parses kubelet's input, output, error, tty, and repeated
+// command parameters, the wire names the API server sends. Attach takes no
+// command.
 func ParseExecQuery(query url.Values, needCommand bool) (ExecRequest, error) {
 	var request ExecRequest
 	for name, target := range map[string]*bool{
-		"stdin": &request.Options.Stdin, "stdout": &request.Options.Stdout,
-		"stderr": &request.Options.Stderr, "tty": &request.Options.TTY,
+		corev1.ExecStdinParam: &request.Options.Stdin, corev1.ExecStdoutParam: &request.Options.Stdout,
+		corev1.ExecStderrParam: &request.Options.Stderr, corev1.ExecTTYParam: &request.Options.TTY,
 	} {
 		value := query.Get(name)
 		if value == "" {
@@ -44,12 +46,12 @@ func ParseExecQuery(query url.Values, needCommand bool) (ExecRequest, error) {
 		*target = parsed
 	}
 	if !request.Options.Stdin && !request.Options.Stdout && !request.Options.Stderr {
-		return ExecRequest{}, errors.New("at least one of stdin, stdout, and stderr is required")
+		return ExecRequest{}, errors.New("at least one of input, output, and error is required")
 	}
 	if request.Options.TTY && request.Options.Stderr {
-		return ExecRequest{}, errors.New("stderr cannot be separate from a TTY")
+		return ExecRequest{}, errors.New("error cannot be separate from a TTY")
 	}
-	request.Command = query["command"]
+	request.Command = query[corev1.ExecCommandParam]
 	if needCommand && len(request.Command) == 0 {
 		return ExecRequest{}, errors.New("command is required")
 	}
