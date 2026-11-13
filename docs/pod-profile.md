@@ -192,10 +192,20 @@ deadline, cancellation, `Unknown`, and other codes remain unresolved.
 Faults confined to one Pod's inputs do not change Node readiness or other
 admissions. A spec change to an admitted Pod sets the Pod condition
 `brie.dev/ExecutionBlocked` with reason `ExecutionConfigChanged` and leaves the
-execution untouched until the Pod is deleted. A failed image observation or pull
-sets the same condition with reason `ImagePullFailed`, keeps the Pod `Pending`
-with its reservation, and retries with exponential backoff and jitter from ten
-seconds up to five minutes.
+execution untouched until the Pod is deleted.
+
+Image pulls run outside Pod reconciliation on two pull workers with their own CRI
+client and a ten-minute deadline per pull. The deadline is fixed, not sized to
+the image. Pods that need the same image reference share one pull. An admitted
+Pod whose image the runtime reports absent stays `Pending` with its reservation,
+and its container status reports why it is waiting: `ContainerCreating` while
+the pull is queued or running, `ErrImagePull` with the bounded runtime error once
+after a failure, and `ImagePullBackOff` while the next attempt waits. Failed
+pulls retry per image reference with exponential backoff and jitter from ten
+seconds up to five minutes. A failed or slow pull never holds a creation worker,
+changes Node readiness, or blocks other admissions. Pod intent is read again
+after the image wait and before the sandbox is created, so a Pod deleted during
+its pull never reaches the runtime. Pull Secrets remain unsupported.
 
 Pod status reports observed pending/running/unknown/exited state, IP, readiness,
 exit code, and runtime identity; restartPolicy Never never restarts an exit.

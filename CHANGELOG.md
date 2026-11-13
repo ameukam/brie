@@ -23,10 +23,16 @@ versioning. Dated nightly prereleases are development builds, not stable release
   nothing, now fails its Pod with `SandboxCreateRejected` or
   `ContainerCreateRejected` and releases the reservation instead of blocking
   admission. Lost or interrupted replies still block admission.
-- With `--enable-workloads`, a spec change to an admitted Pod or a failed image
-  pull is published on that Pod as the `brie.dev/ExecutionBlocked` condition
-  (`ExecutionConfigChanged` or `ImagePullFailed`) and no longer withholds Node
-  readiness or other admissions. Failed pulls retry with backoff.
+- With `--enable-workloads`, image pulls run on two bounded pull workers,
+  shared by every Pod that needs the same image reference, with a ten-minute
+  deadline and per-image backoff with jitter. A waiting Pod reports
+  `ContainerCreating`, `ErrImagePull`, or `ImagePullBackOff` in its container
+  status, and a failed pull no longer withholds Node readiness or other
+  admissions.
+- With `--enable-workloads`, a spec change to an admitted Pod is published on
+  that Pod as the `brie.dev/ExecutionBlocked` condition
+  (`ExecutionConfigChanged`) and no longer withholds Node readiness or other
+  admissions.
 - With `--enable-workloads`, Pods are reconciled by bounded workers with at most
   one operation per Pod, and deletion, cleanup, and status work has its own
   workers and CRI client, so a slow create or pull no longer delays other Pods.
