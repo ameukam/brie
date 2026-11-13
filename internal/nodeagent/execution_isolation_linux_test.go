@@ -284,6 +284,49 @@ func TestExecutionCreationEvidenceJournalFailure(t *testing.T) {
 	}
 }
 
+// TestExecutionFaultScanDuringCleanupRetry is a regression test for the
+// final fault scan of a pass that does not wait: it reads the journal stage of
+// a faulted execution while the retried cleanup of that execution commits a
+// new stage. Run it with the race detector.
+func TestExecutionFaultScanDuringCleanupRetry(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		passes int
+	}{
+		{name: "retry-on-next-pass", passes: 1},
+		{name: "retry-after-repeated-scans", passes: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			reconcilePasses(t, e, 5)
+			service.mu.Lock()
+			service.failStop = true
+			service.mu.Unlock()
+			if err := e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.reconcile(t.Context()); err == nil {
+				t.Fatal("interrupted cleanup not reported")
+			}
+			for range test.passes {
+				if err := e.reconcilePass(t.Context(), false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.workers.running.Wait()
+			if !e.unfinished("app-uid") && countCalls(service, "RemovePodSandbox") != 1 {
+				t.Fatal("cleanup finished without removing the sandbox")
+			}
+			reconcilePasses(t, e, 2)
+			if e.unfinished("app-uid") || e.recovery.Load() {
+				t.Fatal("retried cleanup did not finish")
+			}
+		})
+	}
+}
+
 // TestExecutionAdmissionJournalFailure is a regression test: a reservation
 // whose journal save failed is dropped, and admission retries it later.
 func TestExecutionAdmissionJournalFailure(t *testing.T) {
