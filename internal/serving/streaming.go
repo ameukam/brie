@@ -101,12 +101,16 @@ func (s *Server) streamContainer(w http.ResponseWriter, r *http.Request, exec bo
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	operation := "attach"
+	if exec {
+		operation = "exec"
+	}
 	t, err := s.locate(r.Context(), namespace, pod, container)
 	if err == nil {
 		err = requireRunningContainer(t)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, operation+" locate", err)
 		return
 	}
 	var target *url.URL
@@ -116,7 +120,7 @@ func (s *Server) streamContainer(w http.ResponseWriter, r *http.Request, exec bo
 		target, err = s.runtime.Attach(r.Context(), t.container.GetId(), request.Options)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, operation, err)
 		return
 	}
 	s.proxyStream(w, r, target)
@@ -138,12 +142,12 @@ func (s *Server) portForward(w http.ResponseWriter, r *http.Request) {
 		err = requireReadySandbox(t)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "port forward locate", err)
 		return
 	}
 	target, err := s.runtime.PortForward(r.Context(), t.sandbox.GetId(), ports)
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "port forward", err)
 		return
 	}
 	s.proxyStream(w, r, target)
@@ -157,7 +161,7 @@ func (s *Server) proxyStream(w http.ResponseWriter, r *http.Request, target *url
 	host := target.Hostname()
 	address, err := netip.ParseAddr(host)
 	if err != nil || !address.IsLoopback() {
-		s.fail(w, r, errors.New("runtime streaming URL is not a loopback address"))
+		s.fail(w, r, "streaming URL check", errors.New("runtime streaming URL is not a loopback address"))
 		return
 	}
 	proxy := &httputil.ReverseProxy{
@@ -178,7 +182,8 @@ func (s *Server) proxyStream(w http.ResponseWriter, r *http.Request, target *url
 		},
 		Transport: s.streamTransport, FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			s.logger.WarnContext(r.Context(), "runtime streaming proxy failed", "error", err.Error())
+			s.logger.WarnContext(r.Context(), "runtime streaming proxy failed",
+				"operation", "streaming proxy", "code", errorCode(err))
 			http.Error(w, "runtime streaming failed", http.StatusBadGateway)
 		},
 	}

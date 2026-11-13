@@ -126,21 +126,22 @@ func (s *Server) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	file, err := s.openContainerLog(r.Context(), namespace, pod, container)
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "container log open", err)
 		return
 	}
 	defer func() { _ = file.Close() }()
 	// Every failure that can precede output is reported before the status is
 	// committed, so a failed tail is never sent as an empty success.
 	if err := seekLogStart(file, options.TailLines); err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "container log seek", err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	if err := s.copyLogs(r.Context(), w, file, options); err != nil && r.Context().Err() == nil {
-		s.logger.WarnContext(r.Context(), "container log stream ended", "error", err.Error())
+		s.logger.WarnContext(r.Context(), "container log stream ended",
+			"operation", "container log stream", "code", errorCode(err))
 	}
 }
 
@@ -313,10 +314,12 @@ func writeRecord(w io.Writer, line podlog.Line, timestamps bool) error {
 	return err
 }
 
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+// fail answers a refused or failed request. Unexpected failures are logged by
+// operation name and bounded error code only.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, operation string, err error) {
 	status, message := errorStatus(err)
 	if status == http.StatusInternalServerError {
-		s.logger.WarnContext(r.Context(), "serving request failed", "error", err.Error())
+		s.logger.WarnContext(r.Context(), "serving request failed", "operation", operation, "code", errorCode(err))
 	}
 	http.Error(w, message, status)
 }
