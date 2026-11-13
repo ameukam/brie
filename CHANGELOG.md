@@ -7,6 +7,15 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
+  1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
+  authorization using kubelet's node subresource mapping, `/healthz`,
+  `/metrics`, bounded `/containerLogs`, and `/exec`, `/attach`, and
+  `/portForward` proxied to CRI streaming URLs. Review errors refuse requests,
+  and a sandbox in a lifecycle-extension state other than running is refused
+  without being resumed. CRI `Exec`, `Attach`, `PortForward`, `ExecSync`, and
+  `ReopenContainerLog` client calls support it. Not yet wired into the agent;
+  tested only against fakes. See [docs/observability.md](docs/observability.md).
 - A structured JSON agent logger (`internal/agentlog`) with Pod UID, operation
   ID, and journal stage fields, key-based redaction of environment values,
   commands, arguments, request bodies, and credentials, and rate limiting of
