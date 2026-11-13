@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +19,9 @@ import (
 // The node and RuntimeClass names must come from trusted configuration, not the
 // Pod. A match does not verify the Kata/Firecracker handler or admit execution.
 // This validator is not yet wired to a Pod watch or runtime mutation path.
-func ValidatePodProfile(pod *corev1.Pod, nodeName, runtimeClassName string) error {
+// Optional features accept reviewed increments, such as ProfileProbes; a
+// caller passes one only once it enforces that increment at runtime.
+func ValidatePodProfile(pod *corev1.Pod, nodeName, runtimeClassName string, features ...ProfileFeature) error {
 	if err := (Config{NodeName: nodeName}).Validate(); err != nil {
 		return fmt.Errorf("pod profile node: %w", err)
 	}
@@ -86,7 +89,7 @@ func ValidatePodProfile(pod *corev1.Pod, nodeName, runtimeClassName string) erro
 	if err := validatePodSecurity(spec.SecurityContext); err != nil {
 		return err
 	}
-	return validateProfileContainer(spec.Containers[0])
+	return validateProfileContainer(spec.Containers[0], slices.Contains(features, ProfileProbes))
 }
 
 func validatePodSecurity(security *corev1.PodSecurityContext) error {
@@ -104,7 +107,7 @@ func validatePodSecurity(security *corev1.PodSecurityContext) error {
 	})
 }
 
-func validateProfileContainer(container corev1.Container) error {
+func validateProfileContainer(container corev1.Container, probes bool) error {
 	if container.Name == "" || !digestPinnedImage(container.Image) {
 		return errors.New("container requires a name and an image pinned with @sha256:<64 lowercase hex digits>")
 	}
@@ -115,13 +118,22 @@ func validateProfileContainer(container corev1.Container) error {
 		container.TerminationMessagePolicy != "" && container.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		return errors.New("only default container termination-message settings are supported")
 	}
-	if err := onlyProfileFields("container", container, corev1.Container{
+	allowed := corev1.Container{
 		Name: container.Name, Image: container.Image, Command: container.Command, Args: container.Args,
 		WorkingDir: container.WorkingDir, Env: container.Env, Resources: container.Resources,
 		ImagePullPolicy: container.ImagePullPolicy, SecurityContext: container.SecurityContext,
 		TerminationMessagePath: container.TerminationMessagePath, TerminationMessagePolicy: container.TerminationMessagePolicy,
-	}); err != nil {
+	}
+	if probes {
+		allowed.Ports, allowed.ReadinessProbe, allowed.LivenessProbe = container.Ports, container.ReadinessProbe, container.LivenessProbe
+	}
+	if err := onlyProfileFields("container", container, allowed); err != nil {
 		return err
+	}
+	if probes {
+		if err := validateProfileProbes(container); err != nil {
+			return err
+		}
 	}
 	for _, env := range container.Env {
 		if env.ValueFrom != nil {

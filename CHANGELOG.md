@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A probe manager (`internal/probe`) for readiness and liveness probes: exec
+  through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
+  Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
+  accepts bounded probes and declared TCP ports only with the new
+  `ProfileProbes` feature, which execution mode does not pass yet, so Pods with
+  probes are still refused there.
 - A bounded Kubernetes Events recorder (`internal/events`) for admission
   refusals, image pull failures, barrier entry and exit, blocked cleanup, and
   probe failures, with local deduplication, an agent-wide rate limit, and

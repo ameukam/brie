@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 )
 
@@ -210,12 +211,15 @@ func FuzzPodProfile(f *testing.F) {
 		"example.test/app@sha256:" + strings.Repeat("a", 64),
 		"example.test/app:latest", "@sha256:", "app\x00", "app\xff",
 	} {
-		f.Add(image, int64(1000), uint8(0))
+		f.Add(image, int64(1000), uint8(0), "/healthz", "X-Check", int32(8080))
 	}
-	f.Fuzz(func(t *testing.T, image string, uid int64, feature uint8) {
+	f.Add("example.test/app@sha256:"+strings.Repeat("a", 64), int64(1000), uint8(4), "/ready", "Authorization", int32(8080))
+	f.Add("example.test/app@sha256:"+strings.Repeat("a", 64), int64(1000), uint8(4), "relative", "Host", int32(9))
+	f.Fuzz(func(t *testing.T, image string, uid int64, feature uint8, path, header string, port int32) {
 		pod := profilePod()
 		pod.Spec.Containers[0].Image = image
 		pod.Spec.SecurityContext.RunAsUser = ptr.To(uid)
+		withProbe := feature&4 != 0
 		switch feature % 4 {
 		case 1:
 			pod.Spec.HostNetwork = true
@@ -224,9 +228,24 @@ func FuzzPodProfile(f *testing.F) {
 		case 3:
 			pod.Spec.Containers[0].SecurityContext.RunAsUser = ptr.To(int64(0))
 		}
+		if withProbe {
+			pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP}}
+			pod.Spec.Containers[0].ReadinessProbe = probeOf(corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+				Path: path, Port: intstr.FromInt32(port), Scheme: corev1.URISchemeHTTP,
+				HTTPHeaders: []corev1.HTTPHeader{{Name: header, Value: "1"}},
+			}})
+		}
 		before := pod.DeepCopy()
-		if err := ValidatePodProfile(pod, "worker-1", "kata-fc"); err == nil && (uid <= 0 || feature%4 != 0) {
-			t.Fatal("accepted root execution or an unsupported feature")
+		if err := ValidatePodProfile(pod, "worker-1", "kata-fc"); err == nil && (uid <= 0 || feature%4 != 0 || withProbe) {
+			t.Fatal("accepted root execution, an unsupported feature, or a probe without the probe feature")
+		}
+		err := ValidatePodProfile(pod, "worker-1", "kata-fc", ProfileProbes)
+		if err == nil && (uid <= 0 || feature%4 != 0) {
+			t.Fatal("probe feature accepted root execution or an unsupported feature")
+		}
+		if err == nil && withProbe && (port != 8080 || strings.EqualFold(header, "host") || sensitiveHeader(header) ||
+			(path != "" && path[0] != '/') || strings.ContainsAny(path, " \x00")) {
+			t.Fatalf("accepted unsafe probe path %q header %q port %d", path, header, port)
 		}
 		if !equality.Semantic.DeepEqual(pod, before) {
 			t.Fatal("profile validation mutated the Pod")
