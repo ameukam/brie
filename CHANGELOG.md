@@ -11,9 +11,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `[NodeConformance]` tests against a lab cluster without skip filters and
   writes every failure to `failures.txt`. It refuses to run unless the
   complete node list shows every other node with a blocking (`NoSchedule` or
-  `NoExecute`) control-plane taint, and reports a run as incomplete (exit 2)
-  if any selected test was skipped. Only its input checks, node-inventory
-  check, and report summary are tested.
+  `NoExecute`) control-plane taint, fails if any test Pod was bound to
+  another node, and reports a run as incomplete (exit 2) if any selected test
+  was skipped. Only its input checks, node-inventory check, placement check,
+  and report summary are tested.
 - `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
   Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
   and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
