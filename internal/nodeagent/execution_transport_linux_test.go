@@ -71,11 +71,24 @@ func TestExecuteAPITransportAndShutdown(t *testing.T) {
 				object, err = e.api.CoreV1().Nodes().UpdateStatus(r.Context(), &node, metav1.UpdateOptions{})
 				notify("status")
 			}
+		case r.URL.Path == "/api/v1/pods" && r.URL.Query().Get("watch") == "true":
+			query := r.URL.Query()
+			if query.Get("fieldSelector") != "spec.nodeName=worker-1" || query.Get("allowWatchBookmarks") != "true" ||
+				query.Get("resourceVersion") != "10" {
+				t.Errorf("Pod watch was not scoped with bookmarks from the list version: %v", query)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"type": "BOOKMARK", "object": map[string]any{
+				"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"resourceVersion": "11"}}})
+			w.(http.Flusher).Flush()
+			notify("watch")
+			<-r.Context().Done()
+			return
 		case r.URL.Path == "/api/v1/pods":
 			if r.URL.Query().Get("fieldSelector") != "spec.nodeName=worker-1" || r.URL.Query().Get("limit") != "100" {
 				t.Error("Pod inventory was not scoped and paginated")
 			}
-			object = &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}}
+			object = &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"},
+				ListMeta: metav1.ListMeta{ResourceVersion: "10"}}
 			notify("pods")
 		case r.URL.Path == "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/worker-1":
 			object, err = e.api.CoordinationV1().Leases(leaseNamespace).Get(r.Context(), "worker-1", metav1.GetOptions{})
@@ -123,7 +136,7 @@ func TestExecuteAPITransportAndShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Execute(ctx, e.node, e.config, kubeconfig, io.Discard) }()
 	seen := make(map[string]bool)
-	for len(seen) < 3 {
+	for len(seen) < 4 {
 		select {
 		case event := <-events:
 			seen[event] = true

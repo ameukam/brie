@@ -66,13 +66,20 @@ func (e *executor) assignedPods(ctx context.Context) ([]corev1.Pod, string, erro
 		}
 		options.Continue = page.Continue
 	}
-	sort.SliceStable(pods, func(i, j int) bool {
-		if (pods[i].DeletionTimestamp != nil) != (pods[j].DeletionTimestamp != nil) {
-			return pods[i].DeletionTimestamp != nil
-		}
-		return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp)
-	})
+	sortAssignedPods(pods)
 	return pods, version, nil
+}
+
+// assignedView returns the assigned Pods for one pass, the resource version
+// at which the view is complete, and the resource versions of watch DELETED
+// events since the last list. With a watch, the view comes from it and no API
+// request is made; without one, the pass lists the Pods itself.
+func (e *executor) assignedView(ctx context.Context) ([]corev1.Pod, string, map[string]string, error) {
+	if e.watch != nil {
+		return e.watch.snapshot()
+	}
+	pods, version, err := e.assignedPods(ctx)
+	return pods, version, nil, err
 }
 
 // reconcile runs one pass and waits for the operations it starts.
@@ -99,7 +106,7 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 	e.mu.Unlock()
 	// The journal snapshot precedes the lists, so a create rejection journaled
 	// by a finished operation is always older than the inventory read below.
-	pods, listVersion, err := e.assignedPods(ctx)
+	pods, listVersion, deletions, err := e.assignedView(ctx)
 	if err != nil {
 		e.synced.Store(false)
 		return err
@@ -270,8 +277,14 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 			continue
 		}
 		inventory := inventories[uid]
+		// A watch DELETED event is the most specific evidence; otherwise
+		// the view's own resource version proves the absence.
+		evidence := listVersion
+		if version := deletions[uid]; version != "" {
+			evidence = version
+		}
 		start(uid, false, describe, func(ctx context.Context, client *cri.Client) error {
-			return e.cleanupDeleted(ctx, client, e.record(uid), inventory, listVersion)
+			return e.cleanupDeleted(ctx, client, e.record(uid), inventory, evidence)
 		})
 	}
 	for i := range pods {
@@ -705,21 +718,22 @@ func (e *executor) cleanupPod(ctx context.Context, runtime *cri.Client, pod *cor
 }
 
 // cleanupDeleted removes an execution whose Pod is absent from a complete,
-// quorum-consistent node-scoped list. Because spec.nodeName is immutable once
-// bound, that absence is positive evidence of deletion. The evidence is
+// quorum-consistent node-scoped list or from the watched view that a watch
+// DELETED event updated. Because spec.nodeName is immutable once bound, that
+// absence is positive evidence of deletion. The evidence is
 // journaled before the first destructive step, and then authorizes the
 // remaining steps across restarts without a live Pod read, which the Node
 // authorizer rejects once the Pod is gone. A deleted Pod has no remaining
 // grace period, so the container is stopped immediately, as for force deletion.
-func (e *executor) cleanupDeleted(ctx context.Context, runtime *cri.Client, record *executionRecord, inventory *podInventory, listVersion string) error {
+func (e *executor) cleanupDeleted(ctx context.Context, runtime *cri.Client, record *executionRecord, inventory *podInventory, evidence string) error {
 	if err := e.resolveCreateRejection(record, inventory); err != nil {
 		return err
 	}
 	if record.DeletionObserved == "" {
-		if listVersion == "" || len(listVersion) > maxResourceVersion {
+		if evidence == "" || len(evidence) > maxResourceVersion {
 			return errors.New("assigned-Pod list has no usable resource version; deletion is unproven")
 		}
-		if err := e.commit(func() { record.DeletionObserved = listVersion }); err != nil {
+		if err := e.commit(func() { record.DeletionObserved = evidence }); err != nil {
 			return err
 		}
 	}
