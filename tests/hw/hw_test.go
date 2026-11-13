@@ -243,7 +243,7 @@ func ownedLab() []mockResource {
 	}
 }
 
-var scripts = []string{"verify-empty.sh", "teardown.sh"}
+var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh"}
 
 func TestRequiredInputs(t *testing.T) {
 	for _, script := range scripts {
@@ -521,5 +521,217 @@ func TestShellcheck(t *testing.T) {
 	cmd := exec.CommandContext(ctx, shellcheck, append([]string{"--external-sources", "--source-path=SCRIPTDIR"}, files...)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("shellcheck: %v\n%s", err, out)
+	}
+}
+
+const testPrices = `# key usd-per-unit-hour (test values, not real prices)
+c4a-highmem-96-metal 10
+c4a-standard-8 0.5
+hyperdisk-balanced-gib 0.0001
+cloud-nat-gateway 0.05
+fixed-overhead 0.2
+`
+
+// provisionLab returns a lab configured for provision.sh with test prices.
+func provisionLab(t *testing.T, state mockState) *lab {
+	t.Helper()
+	l := newLab(t, state)
+	prices := filepath.Join(l.dir, "prices.txt")
+	if err := os.WriteFile(prices, []byte(testPrices), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l.env["PRICE_TABLE"] = prices
+	l.env["PLANNED_HOURS"] = "4"
+	l.env["METAL_COUNT"] = "2"
+	l.env["STANDARD_COUNT"] = "1"
+	return l
+}
+
+func (s mockState) get(kind, name string) (mockResource, bool) {
+	for _, r := range s.Resources {
+		if r.Kind == kind && r.Name == name {
+			return r, true
+		}
+	}
+	return mockResource{}, false
+}
+
+func TestProvisionInputs(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		env    map[string]string
+		prices string
+		stderr string
+	}{
+		{name: "missing price table", env: map[string]string{"PRICE_TABLE": ""}, stderr: "required input PRICE_TABLE"},
+		{name: "absent price table", env: map[string]string{"PRICE_TABLE": "/nonexistent/prices"}, stderr: "missing or unreadable"},
+		{name: "placeholder price", prices: strings.Replace(testPrices, "c4a-standard-8 0.5", "c4a-standard-8 <USD>", 1), stderr: "not a USD amount"},
+		{name: "missing price key", prices: strings.Replace(testPrices, "cloud-nat-gateway 0.05\n", "", 1), stderr: "define cloud-nat-gateway exactly once"},
+		{name: "duplicate price key", prices: testPrices + "fixed-overhead 0\n", stderr: "define fixed-overhead exactly once"},
+		{name: "missing hours", env: map[string]string{"PLANNED_HOURS": ""}, stderr: "required input PLANNED_HOURS"},
+		{name: "zero hours", env: map[string]string{"PLANNED_HOURS": "0"}, stderr: "PLANNED_HOURS must be a positive number"},
+		{name: "missing metal count", env: map[string]string{"METAL_COUNT": ""}, stderr: "required input METAL_COUNT"},
+		{name: "five metal hosts", env: map[string]string{"METAL_COUNT": "5"}, stderr: "between 1 and 4"},
+		{name: "no metal hosts", env: map[string]string{"METAL_COUNT": "0"}, stderr: "between 1 and 4"},
+		{name: "three standard hosts", env: map[string]string{"STANDARD_COUNT": "3"}, stderr: "at most 2"},
+		{name: "over ceiling", env: map[string]string{"SPEND_CEILING_USD": "50"}, stderr: "exceeds ceiling 50 USD"},
+		{name: "over ceiling by hours", env: map[string]string{"PLANNED_HOURS": "48"}, stderr: "exceeds ceiling 500 USD"},
+		{name: "over ceiling by disks", env: map[string]string{"DATA_DISK_GB": "99999", "SPEND_CEILING_USD": "90"}, stderr: "exceeds ceiling"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := provisionLab(t, mockState{})
+			if tt.prices != "" {
+				if err := os.WriteFile(l.env["PRICE_TABLE"], []byte(tt.prices), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for k, v := range tt.env {
+				l.env[k] = v
+			}
+			r := l.run("provision.sh")
+			if r.code == 0 || !strings.Contains(r.stderr, tt.stderr) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if c := l.commands(); len(c) != 0 {
+				t.Fatalf("refused provision made gcloud calls: %q", c)
+			}
+		})
+	}
+}
+
+func TestProvision(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		stockout []string
+		zone     string
+	}{
+		{name: "primary zone", zone: testZone},
+		{name: "stockout falls back to second zone", stockout: []string{testZone}, zone: testZone2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := provisionLab(t, mockState{StockoutZones: tt.stockout})
+			r := l.run("provision.sh")
+			if r.code != 0 {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", r.code, r.stdout, r.stderr)
+			}
+			if !strings.Contains(r.stdout, "plan projects 83.28 USD over 4 h") {
+				t.Errorf("stdout=%q; want the projected spend", r.stdout)
+			}
+			state := l.state()
+			for _, name := range []string{"std-1", "metal-1", "metal-2"} {
+				inst, ok := state.get("instances", testPrefix+"-"+name)
+				if !ok {
+					t.Fatalf("instance %s missing", name)
+				}
+				if inst.Zone != tt.zone || inst.Labels["brie-hw-run"] != testRunID {
+					t.Errorf("instance %s: zone=%s labels=%v", name, inst.Zone, inst.Labels)
+				}
+				if !strings.Contains(inst.Flags["network-interface"], "no-address") ||
+					!hasFlag(inst.Flags, "no-service-account") {
+					t.Errorf("instance %s has an external address or credentials: %v", name, inst.Flags)
+				}
+				boot, _ := state.get("disks", inst.Name)
+				if boot.Labels["brie-hw-run"] != testRunID {
+					t.Errorf("boot disk %s is not labelled: %v", inst.Name, boot.Labels)
+				}
+			}
+			metal, _ := state.get("instances", testPrefix+"-metal-1")
+			if metal.Flags["machine-type"] != "c4a-highmem-96-metal" || !strings.Contains(metal.Flags["network-interface"], "nic-type=IDPF") {
+				t.Errorf("metal flags: %v", metal.Flags)
+			}
+			for _, name := range []string{"metal-1", "metal-2"} {
+				disk, ok := state.get("disks", testPrefix+"-"+name+"-data")
+				if !ok || disk.Zone != tt.zone || disk.Labels["brie-hw-run"] != testRunID || len(disk.Users) != 1 {
+					t.Errorf("data disk for %s: %+v", name, disk)
+				}
+			}
+			if _, ok := state.get("disks", testPrefix+"-std-1-data"); ok {
+				t.Error("standard host received a data disk")
+			}
+			bucket, ok := state.get("buckets", testPrefix+"-"+testProject)
+			if !ok || bucket.Labels["brie-hw-run"] != testRunID || !hasFlag(bucket.Flags, "uniform-bucket-level-access") ||
+				bucket.Flags["lifecycle-file"] == "" {
+				t.Fatalf("bucket: %+v", bucket)
+			}
+			lifecycle, err := os.ReadFile(bucket.Flags["lifecycle-file"])
+			if err != nil || !strings.Contains(string(lifecycle), `"action":{"type":"Delete"},"condition":{"age":7}`) {
+				t.Errorf("lifecycle=%q err=%v", lifecycle, err)
+			}
+			for _, kind := range []string{"networks", "subnets", "routers", "firewall-rules"} {
+				for _, res := range state.Resources {
+					if res.Kind == kind && res.Description != testMarker {
+						t.Errorf("%s %s lacks the run marker", kind, res.Name)
+					}
+				}
+			}
+			if _, ok := state.get("nats", testPrefix+"-nat"); !ok {
+				t.Error("NAT missing")
+			}
+			for _, res := range state.Resources {
+				if !strings.HasPrefix(res.Name, testPrefix+"-") {
+					t.Errorf("resource %s/%s lacks the run prefix", res.Kind, res.Name)
+				}
+			}
+			inventory, err := os.ReadFile(filepath.Join(l.env["HW_LOG_DIR"], "inventory.tsv"))
+			if err != nil || strings.Count(string(inventory), "\t"+tt.zone+"\n") != 3 {
+				t.Errorf("inventory=%q err=%v", inventory, err)
+			}
+
+			// A second run with the same RUN_ID refuses before creating anything.
+			before := len(l.commands())
+			if r := l.run("provision.sh"); r.code == 0 || !strings.Contains(r.stderr, "already exists") {
+				t.Errorf("rerun: exit=%d stderr=%q", r.code, r.stderr)
+			}
+			if after := len(l.commands()); after != before {
+				t.Errorf("rerun made %d gcloud calls", after-before)
+			}
+
+			// The provisioned lab tears down completely.
+			if r := l.run("teardown.sh"); r.code != 0 {
+				t.Fatalf("teardown: exit=%d stderr=%q", r.code, r.stderr)
+			}
+			if left := l.state().Resources; len(left) != 0 {
+				t.Fatalf("resources left after teardown: %+v", left)
+			}
+		})
+	}
+}
+
+func hasFlag(flags map[string]string, name string) bool {
+	_, ok := flags[name]
+	return ok
+}
+
+func TestProvisionStockoutAbort(t *testing.T) {
+	l := provisionLab(t, mockState{StockoutZones: []string{testZone, testZone2}})
+	r := l.run("provision.sh")
+	if r.code == 0 || !strings.Contains(r.stderr, "stockout cap reached") {
+		t.Fatalf("exit=%d stderr=%q; want stockout abort", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout+r.stderr, "teardown: all resources for run "+testRunID+" deleted and verified empty") {
+		t.Errorf("abort did not complete teardown: stdout=%q stderr=%q", r.stdout, r.stderr)
+	}
+	if left := l.state().Resources; len(left) != 0 {
+		t.Fatalf("resources left after abort: %+v", left)
+	}
+	clock, err := os.ReadFile(l.env[mockClockEnv])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var now int64
+	if _, err := fmt.Sscan(string(clock), &now); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := now - testClockStart; elapsed < 2700 || elapsed > 2700+60 {
+		t.Errorf("aborted after %d simulated seconds, want the 45-minute cap", elapsed)
+	}
+	commands := l.commands()
+	primary := indexOf(commands, `^compute instances create \S+ --zone=`+testZone)
+	fallback := indexOf(commands, `^compute instances create \S+ --zone=`+testZone2)
+	if primary < 0 || fallback < primary {
+		t.Errorf("zone order: primary=%d fallback=%d", primary, fallback)
+	}
+	if indexOf(commands, `^compute (disks|instances) create .*metal`) >= 0 {
+		t.Error("created a metal host or disk despite the stockout")
 	}
 }

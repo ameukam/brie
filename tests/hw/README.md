@@ -42,3 +42,37 @@ failed call, or remaining resource.
 APPROVE_COSTS=yes PROJECT=<project> ZONE=<zone> ZONE2=<zone> RUN_ID=<id> \
   SPEND_CEILING_USD=<usd> tests/hw/teardown.sh
 ```
+
+## Provisioning
+
+`provision.sh` also requires `PRICE_TABLE`, `PLANNED_HOURS`, `METAL_COUNT`
+(1 to 4 `c4a-highmem-96-metal` hosts), and `STANDARD_COUNT` (0 to 2
+`c4a-standard-8` hosts). The operator supplies the price table; there is no
+built-in price list. Each non-comment line is `<key> <USD per unit-hour>`, and
+every key below must appear exactly once:
+
+```text
+c4a-highmem-96-metal <USD per instance-hour>
+c4a-standard-8 <USD per instance-hour>
+hyperdisk-balanced-gib <USD per GiB-hour>
+cloud-nat-gateway <USD per gateway-hour>
+fixed-overhead <USD per hour for the bucket, NAT data, egress, and anything else>
+```
+
+The script refuses the whole plan before any create if the projected hourly
+rate times `PLANNED_HOURS` exceeds `SPEND_CEILING_USD`, and checks the running
+total again before each priced create. It creates a custom-mode VPC, one
+regional subnet with private Google access, internal and IAP-only SSH firewall
+rules, a Cloud Router with NAT, one bucket (uniform access, public access
+prevention, objects deleted after 7 days), and the hosts. Hosts use Ubuntu
+24.04 Arm64 (`ubuntu-2404-lts-arm64`), Hyperdisk Balanced boot disks, no
+external address, no service account, and IP forwarding for Pod routes. Each
+metal host gets a labelled persistent data disk attached as `brie-data`.
+Optional settings: `BOOT_DISK_GB` (100), `DATA_DISK_GB` (200), `SUBNET_RANGE`
+(`10.200.0.0/20`), `POD_RANGE` (`10.244.0.0/16`), `STOCKOUT_RETRY_SECONDS` (60).
+
+An instance create that fails with a stockout in `ZONE` is retried in `ZONE2`,
+then both are retried after the retry interval. After 45 minutes of total
+stockout, or on any other failure after the first create, provisioning aborts
+and runs `teardown.sh`. The inventory is written to
+`$HW_LOG_DIR/inventory.tsv`; a second run with the same log directory refuses.
