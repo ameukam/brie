@@ -7,8 +7,9 @@
 # workload hosts with a persistent data disk each, and up to two
 # c4a-standard-8 hosts. Every create is checked against the spend ceiling
 # first. Instance creates fall back from ZONE to ZONE2 on stockout; after 45
-# minutes of total stockout the run aborts and tears down. Any failure after
-# the first create also runs teardown.sh.
+# minutes of total stockout the run aborts and tears down. A run that already
+# has resources is refused before any create. Any failure after this
+# invocation created the run's network also runs teardown.sh.
 set -euo pipefail
 
 HW_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -53,25 +54,42 @@ BUCKET=$HW_PREFIX-$PROJECT
 INVENTORY=$HW_LOG_DIR/inventory.tsv
 LABELS=$HW_LABEL_KEY=$RUN_ID
 
+# The budget covers PLANNED_HOURS plus the longest provisioning can take
+# retrying stockouts, for every resource, from the moment provisioning starts.
+# Every instance is created with a GCE termination time at that deadline and
+# action DELETE, so the hosts and their data disks are removed by GCE even if
+# this script and teardown.sh never run again.
+PROVISION_START=$(hw_now_epoch)
+HW_BUDGET_HOURS=$(awk -v p="$PLANNED_HOURS" -v s="$((STOCKOUT_CAP_SECONDS + STOCKOUT_RETRY_SECONDS))" \
+	'BEGIN { printf "%.17g", p + s / 3600 }')
+DEADLINE_EPOCH=$(awk -v t="$PROVISION_START" -v h="$HW_BUDGET_HOURS" \
+	'BEGIN { s = h * 3600; i = int(s); if (i < s) i++; printf "%d", t + i }')
+DEADLINE=$(date -u -d "@$DEADLINE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+
 # Refuse the whole plan before creating anything if it cannot fit.
 plan_gib=$((METAL_COUNT * (BOOT_DISK_GB + DATA_DISK_GB) + STANDARD_COUNT * BOOT_DISK_GB))
 plan_rate=$(awk -v m="$METAL_COUNT" -v pm="$(hw_price "$METAL_TYPE")" \
 	-v s="$STANDARD_COUNT" -v ps="$(hw_price "$STANDARD_TYPE")" \
 	-v g="$plan_gib" -v pg="$(hw_price hyperdisk-balanced-gib)" \
 	-v n="$(hw_price cloud-nat-gateway)" -v f="$(hw_price fixed-overhead)" \
-	'BEGIN { printf "%.6f", m * pm + s * ps + g * pg + n + f }')
+	'BEGIN { printf "%.17g", m * pm + s * ps + g * pg + n + f }')
 plan_usd=$(hw_projected_usd "$plan_rate")
-hw_log plan "metal=$METAL_COUNT standard=$STANDARD_COUNT disk_gib=$plan_gib hours=$PLANNED_HOURS projected_usd=$plan_usd"
-if hw_greater "$plan_usd" "$SPEND_CEILING_USD"; then
-	hw_die "refusing plan: projected spend $plan_usd USD over $PLANNED_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
+hw_log plan "metal=$METAL_COUNT standard=$STANDARD_COUNT disk_gib=$plan_gib hours=$HW_BUDGET_HOURS deadline=$DEADLINE projected_usd=$plan_usd"
+if hw_over_ceiling "$plan_rate"; then
+	hw_die "refusing plan: projected spend $plan_usd USD over $HW_BUDGET_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
 fi
-printf 'provision: plan projects %s USD over %s h (ceiling %s USD)\n' "$plan_usd" "$PLANNED_HOURS" "$SPEND_CEILING_USD"
+printf 'provision: plan projects %s USD over %s h, PLANNED_HOURS plus the stockout allowance (ceiling %s USD); GCE deletes the hosts at %s\n' \
+	"$plan_usd" "$HW_BUDGET_HOURS" "$SPEND_CEILING_USD" "$DEADLINE"
 
-create_started=0
+# Teardown is armed only after this invocation has created the run's network,
+# its exclusive claim on the run: names are fixed per run, so a concurrent or
+# repeated provision.sh fails that create and exits without deleting
+# anything. Before the claim, a run that already has resources is refused.
+claimed=0
 finished=0
 on_exit() {
 	local status=$?
-	if ((create_started == 1 && finished == 0)); then
+	if ((claimed == 1 && finished == 0)); then
 		hw_log abort "provision failed with status $status; running teardown"
 		printf 'provision: failed; running teardown for run %s\n' "$RUN_ID" >&2
 		"$HW_DIR/teardown.sh" || printf 'provision: TEARDOWN INCOMPLETE; inspect run %s manually\n' "$RUN_ID" >&2
@@ -81,7 +99,6 @@ on_exit() {
 trap on_exit EXIT
 
 create() {
-	create_started=1
 	hw_gcloud "$@"
 }
 
@@ -112,9 +129,11 @@ check_stockout_cap() {
 created_zone=
 create_instance() {
 	local name=$1 role=$2 machine_type=$3 nic_type=$4 zone output status
-	create_started=1
 	while true; do
 		for zone in "$ZONE" "$ZONE2"; do
+			if (($(hw_now_epoch) >= DEADLINE_EPOCH)); then
+				hw_die "budget deadline $DEADLINE reached before instance $name was created; aborting"
+			fi
 			status=0
 			output=$(create compute instances create "$name" --zone="$zone" \
 				--machine-type="$machine_type" \
@@ -122,6 +141,7 @@ create_instance() {
 				--boot-disk-type=hyperdisk-balanced --boot-disk-size="${BOOT_DISK_GB}GB" \
 				--network-interface="subnet=$SUBNET,no-address,nic-type=$nic_type" \
 				--can-ip-forward --maintenance-policy=TERMINATE \
+				--termination-time="$DEADLINE" --instance-termination-action=DELETE \
 				--no-service-account --no-scopes \
 				--metadata=enable-oslogin=TRUE \
 				--labels="$LABELS,brie-hw-role=$role" 2>&1) || status=$?
@@ -161,14 +181,22 @@ add_host() {
 		create compute disks create "$name-data" --zone="$zone" --type=hyperdisk-balanced \
 			--size="${DATA_DISK_GB}GB" --labels="$LABELS,brie-hw-role=data"
 		create compute instances attach-disk "$name" --zone="$zone" --disk="$name-data" --device-name=brie-data
+		# Deleted with its instance at the deadline unless fence.sh detached it.
+		create compute instances set-disk-auto-delete "$name" --zone="$zone" --disk="$name-data" --auto-delete
 	fi
 	printf '%s\t%s\t%s\n' "$name" "$role" "$zone" >>"$INVENTORY"
 	hw_log inventory "$name role=$role zone=$zone"
 }
 
 [[ ! -e $INVENTORY ]] || hw_die "inventory $INVENTORY already exists; use a new RUN_ID or HW_LOG_DIR"
+if ! "$HW_DIR/verify-empty.sh" >/dev/null; then
+	hw_die "run $RUN_ID already has resources in $PROJECT, or they could not be listed; refusing to provision or clean up"
+fi
 hw_budget_reserve fixed-overhead 1 "fixed overhead"
-create compute networks create "$NETWORK" --subnet-mode=custom --description="$HW_MARKER"
+create compute networks create "$NETWORK" --subnet-mode=custom --description="$HW_MARKER" ||
+	hw_die "could not create network $NETWORK; another provision may own run $RUN_ID, so nothing is cleaned up"
+claimed=1
+hw_log claim "network $NETWORK"
 create compute networks subnets create "$SUBNET" --network="$NETWORK" --region="$HW_REGION" \
 	--range="$SUBNET_RANGE" --enable-private-ip-google-access --description="$HW_MARKER"
 create compute firewall-rules create "$HW_PREFIX-internal" --network="$NETWORK" --direction=INGRESS \

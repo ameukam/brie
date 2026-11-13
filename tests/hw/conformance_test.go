@@ -4,6 +4,7 @@
 package hw_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,9 @@ func TestNodeConformanceSummary(t *testing.T) {
 	}
 	errored := junitCase("[sig-node] errored [NodeConformance]", `<error message="setup error">x</error>`)
 	skipped := junitCase("[sig-node] skipped [NodeConformance]", `<skipped message="skip"/>`)
+	filtered := junitCase("[sig-storage] unrelated [Serial]", `<skipped message="skipped"/>`)
+	beforeSuite := junitCase("[SynchronizedBeforeSuite]", "")
+	beforeSuiteFailed := junitCase("[SynchronizedBeforeSuite]", `<failure message="cluster not ready">x</failure>`)
 	suite := func(cases ...string) string {
 		return `<?xml version="1.0"?><testsuites><testsuite name="Kubernetes e2e suite">` + strings.Join(cases, "") + `</testsuite></testsuites>`
 	}
@@ -30,17 +34,46 @@ func TestNodeConformanceSummary(t *testing.T) {
 		code     int
 		summary  string
 		failures []string
+		skipped  []string
 		stderr   string
 	}{
-		{name: "all pass", files: map[string]string{"junit_01.xml": suite(pass, skipped)}, summary: "total 2\npassed 1\nfailed 0\nskipped 1\n"},
+		{
+			name:    "all selected pass; filtered specs are not counted",
+			files:   map[string]string{"junit_01.xml": suite(beforeSuite, pass, filtered)},
+			summary: "selected 1\npassed 1\nfailed 0\nskipped 0\nunselected 2\n",
+		},
 		{
 			name:     "every failure is published",
 			files:    map[string]string{"junit_01.xml": suite(pass, fail("a"), fail("b")), "junit_02.xml": suite(fail("c"), errored)},
 			code:     1,
-			summary:  "total 5\npassed 1\nfailed 4\nskipped 0\n",
+			summary:  "selected 5\npassed 1\nfailed 4\nskipped 0\nunselected 0\n",
 			failures: []string{"case a [NodeConformance]\ttimed out waiting for pod a", "case b", "case c", "errored [NodeConformance]\tsetup error"},
 		},
-		{name: "no tests", files: map[string]string{"junit_01.xml": suite()}, code: 1, stderr: "contains no tests"},
+		{
+			name:    "all selected skipped is incomplete",
+			files:   map[string]string{"junit_01.xml": suite(skipped, filtered)},
+			code:    2,
+			summary: "selected 1\npassed 0\nfailed 0\nskipped 1\nunselected 1\n",
+			skipped: []string{"skipped [NodeConformance]"},
+			stderr:  "INCOMPLETE: 1 selected [NodeConformance] tests were skipped",
+		},
+		{
+			name:    "partially skipped selected suite is incomplete",
+			files:   map[string]string{"junit_01.xml": suite(pass, skipped)},
+			code:    2,
+			summary: "selected 2\npassed 1\nfailed 0\nskipped 1\nunselected 0\n",
+			skipped: []string{"skipped [NodeConformance]"},
+			stderr:  "INCOMPLETE",
+		},
+		{
+			name:     "suite node failure fails the run",
+			files:    map[string]string{"junit_01.xml": suite(beforeSuiteFailed, pass)},
+			code:     1,
+			summary:  "selected 1\npassed 1\nfailed 1\nskipped 0\nunselected 0\n",
+			failures: []string{"[SynchronizedBeforeSuite]\tcluster not ready"},
+		},
+		{name: "only filtered specs", files: map[string]string{"junit_01.xml": suite(filtered, beforeSuite)}, code: 1, stderr: "contains no selected [NodeConformance] tests"},
+		{name: "no tests", files: map[string]string{"junit_01.xml": suite()}, code: 1, stderr: "contains no selected"},
 		{name: "no report", files: map[string]string{"e2e.log": "x"}, code: 1, stderr: "no JUnit report"},
 		{name: "malformed report", files: map[string]string{"junit_01.xml": "<testsuites>"}, code: 1, stderr: "cannot parse"},
 	} {
@@ -74,6 +107,18 @@ func TestNodeConformanceSummary(t *testing.T) {
 			for _, want := range tt.failures {
 				if !strings.Contains(string(failures), want) || !strings.Contains(r.stdout, want) {
 					t.Errorf("failure %q not published: file=%q stdout=%q", want, failures, r.stdout)
+				}
+			}
+			skippedList, err := os.ReadFile(filepath.Join(dir, "skipped.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(skippedList), "SKIPPED\t"); got != len(tt.skipped) {
+				t.Errorf("skipped.txt lists %d cases, want %d:\n%s", got, len(tt.skipped), skippedList)
+			}
+			for _, want := range tt.skipped {
+				if !strings.Contains(string(skippedList), want) || !strings.Contains(r.stdout, "SKIPPED\t[sig-node] "+want) {
+					t.Errorf("skipped case %q not published: file=%q stdout=%q", want, skippedList, r.stdout)
 				}
 			}
 		})
@@ -118,6 +163,61 @@ func TestNodeConformanceInputs(t *testing.T) {
 	}
 }
 
+func TestNodeConformanceNodeIsolation(t *testing.T) {
+	type taint struct {
+		Key    string `json:"key"`
+		Effect string `json:"effect,omitempty"`
+	}
+	node := func(name string, taints ...taint) map[string]any {
+		return map[string]any{"metadata": map[string]any{"name": name}, "spec": map[string]any{"taints": taints}}
+	}
+	brie := node("brie-worker-1", taint{Key: "brie.dev/runtime", Effect: "NoSchedule"})
+	controlPlane := func(effect string) map[string]any {
+		return node("cp-1", taint{Key: "node-role.kubernetes.io/control-plane", Effect: effect})
+	}
+	inventory := func(nodes ...map[string]any) string {
+		data, err := json.Marshal(map[string]any{"kind": "List", "items": append([]map[string]any{}, nodes...)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	for _, tt := range []struct {
+		name    string
+		content string
+		missing bool
+		stderr  string
+	}{
+		{name: "NoSchedule control plane", content: inventory(controlPlane("NoSchedule"), brie)},
+		{name: "NoExecute control plane", content: inventory(controlPlane("NoExecute"), brie)},
+		{name: "PreferNoSchedule control plane", content: inventory(controlPlane("PreferNoSchedule"), brie), stderr: "node cp-1 has no NoSchedule or NoExecute"},
+		{name: "untainted second node", content: inventory(controlPlane("NoSchedule"), brie, node("worker-2")), stderr: "node worker-2 has no NoSchedule"},
+		{name: "Brie node without its taint", content: inventory(controlPlane("NoSchedule"), node("brie-worker-1")), stderr: "lacks the brie.dev/runtime taint"},
+		{name: "Brie node absent", content: inventory(controlPlane("NoSchedule")), stderr: "brie-worker-1 is not in the node inventory"},
+		{name: "empty inventory", content: inventory(), stderr: "inventory is empty"},
+		{name: "failed list leaves no inventory", missing: true, stderr: "cannot read the node inventory"},
+		{name: "truncated output", content: `{"items": [`, stderr: "cannot read the node inventory"},
+		{name: "paginated inventory", content: `{"metadata": {"continue": "abc"}, "items": [{"metadata": {"name": "brie-worker-1"}, "spec": {"taints": [{"key": "brie.dev/runtime"}]}}]}`, stderr: "incomplete"},
+		{name: "duplicate node", content: inventory(brie, brie), stderr: "duplicate"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newLab(t, mockState{})
+			l.env["NODE_NAME"] = "brie-worker-1"
+			path := filepath.Join(l.dir, "nodes.json")
+			if !tt.missing {
+				writeFile(t, l.dir, "nodes.json", tt.content)
+			}
+			r := l.run("node-conformance.sh", "--check-nodes", path)
+			if tt.stderr == "" && r.code != 0 {
+				t.Fatalf("exit=%d stderr=%q; want success", r.code, r.stderr)
+			}
+			if tt.stderr != "" && (r.code == 0 || !strings.Contains(r.stderr, tt.stderr)) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+		})
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -125,4 +225,40 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestNodeConformancePlacement(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		missing bool
+		stderr  string
+	}{
+		{name: "every test Pod on the Brie node", content: "pods-1 p1 <none>\npods-1 p1 brie-worker-1\nkube-system kube-proxy-x cp-1\n"},
+		{name: "test Pod on the control plane", content: "pods-1 p1 brie-worker-1\npods-2 p2 cp-1\n", stderr: "1 test Pods were bound to nodes other than brie-worker-1"},
+		{name: "no test Pod observed", content: "kube-system kube-proxy-x cp-1\npods-1 p1 <none>\n", stderr: "no test Pod was observed on brie-worker-1"},
+		{name: "empty record", content: "", stderr: "no test Pod was observed"},
+		{name: "malformed line", content: "pods-1 p1\n", stderr: "malformed Pod placement line"},
+		{name: "missing record", missing: true, stderr: "cannot read the Pod placement record"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newLab(t, mockState{})
+			l.env["NODE_NAME"] = "brie-worker-1"
+			path := filepath.Join(l.dir, "pod-placement.txt")
+			if !tt.missing {
+				writeFile(t, l.dir, "pod-placement.txt", tt.content)
+			}
+			r := l.run("node-conformance.sh", "--check-placement", path)
+			if tt.stderr == "" && r.code != 0 {
+				t.Fatalf("exit=%d stderr=%q; want success", r.code, r.stderr)
+			}
+			if tt.stderr != "" && (r.code == 0 || !strings.Contains(r.stderr, tt.stderr)) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if strings.Contains(tt.content, "cp-1\n") && strings.Contains(tt.content, "pods-2") &&
+				!strings.Contains(r.stdout, "MISPLACED\tpods-2/p2\tcp-1") {
+				t.Errorf("misplaced Pod not listed: stdout=%q", r.stdout)
+			}
+		})
+	}
 }

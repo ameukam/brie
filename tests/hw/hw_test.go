@@ -72,7 +72,7 @@ func newLab(t *testing.T, state mockState) *lab {
 	wrappers := map[string]string{
 		// A race-enabled test binary otherwise sleeps one second at exit.
 		"gcloud": "#!/bin/sh\nGORACE=atexit_sleep_ms=0 BRIE_HW_MOCK_TOOL=gcloud exec '" + self + "' \"$@\"\n",
-		"date": "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\nformat=\nfor arg; do case $arg in +*) format=$arg ;; esac; done\n" +
+		"date": "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\nformat=\nfor arg; do case $arg in +*) format=$arg ;; @*) now=${arg#@} ;; esac; done\n" +
 			"case $format in\n+%s) echo \"$now\" ;;\n+*) exec '" + realDate + "' -u -d \"@$now\" \"$format\" ;;\n" +
 			"*) echo \"mock date: unsupported $*\" >&2; exit 2 ;;\nesac\n",
 		"kubectl": "#!/bin/sh\nGORACE=atexit_sleep_ms=0 BRIE_HW_MOCK_TOOL=kubectl exec '" + self + "' \"$@\"\n",
@@ -377,6 +377,17 @@ func TestTeardown(t *testing.T) {
 			refused:  []string{"router " + testPrefix + "-router"},
 			retained: []string{"routers/" + testPrefix + "-router", "nats/" + testPrefix + "-nat"},
 		},
+		{
+			name: "owned router with a foreign NAT keeps every NAT and the router",
+			extra: []mockResource{
+				{Kind: "nats", Name: "brie-hw-r20261112-nat", Router: testPrefix + "-router", Region: testRegion},
+			},
+			code:    1,
+			refused: []string{"NAT brie-hw-r20261112-nat on router " + testPrefix + "-router"},
+			retained: []string{
+				"routers/" + testPrefix + "-router", "nats/" + testPrefix + "-nat", "nats/brie-hw-r20261112-nat",
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resources := ownedLab()
@@ -602,6 +613,13 @@ func TestProvisionInputs(t *testing.T) {
 		{name: "over ceiling", env: map[string]string{"SPEND_CEILING_USD": "50"}, stderr: "exceeds ceiling 50 USD"},
 		{name: "over ceiling by hours", env: map[string]string{"PLANNED_HOURS": "48"}, stderr: "exceeds ceiling 500 USD"},
 		{name: "over ceiling by disks", env: map[string]string{"DATA_DISK_GB": "99999", "SPEND_CEILING_USD": "90"}, stderr: "exceeds ceiling"},
+		// 20.82 USD/h over 4 h plus the 46-minute stockout allowance is 99.242 USD.
+		{name: "over ceiling by less than a cent", env: map[string]string{"SPEND_CEILING_USD": "99.24"}, stderr: "projected spend 99.25 USD over 4.76666"},
+		{
+			name:   "seconds-long plan still budgets the stockout window",
+			env:    map[string]string{"PLANNED_HOURS": "0.001", "SPEND_CEILING_USD": "5"},
+			stderr: "refusing plan: projected spend 15.99 USD",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			l := provisionLab(t, mockState{})
@@ -639,8 +657,9 @@ func TestProvision(t *testing.T) {
 			if r.code != 0 {
 				t.Fatalf("exit=%d stdout=%q stderr=%q", r.code, r.stdout, r.stderr)
 			}
-			if !strings.Contains(r.stdout, "plan projects 83.28 USD over 4 h") {
-				t.Errorf("stdout=%q; want the projected spend", r.stdout)
+			if !strings.Contains(r.stdout, "plan projects 99.25 USD over 4.76666") ||
+				!strings.Contains(r.stdout, "GCE deletes the hosts at 2026-11-13T16:46:00Z") {
+				t.Errorf("stdout=%q; want the projected spend over PLANNED_HOURS plus the stockout allowance", r.stdout)
 			}
 			state := l.state()
 			for _, name := range []string{"std-1", "metal-1", "metal-2"} {
@@ -655,6 +674,9 @@ func TestProvision(t *testing.T) {
 					!hasFlag(inst.Flags, "no-service-account") {
 					t.Errorf("instance %s has an external address or credentials: %v", name, inst.Flags)
 				}
+				if inst.Flags["termination-time"] != "2026-11-13T16:46:00Z" || inst.Flags["instance-termination-action"] != "DELETE" {
+					t.Errorf("instance %s has no enforced deletion deadline: %v", name, inst.Flags)
+				}
 				boot, _ := state.get("disks", inst.Name)
 				if boot.Labels["brie-hw-run"] != testRunID {
 					t.Errorf("boot disk %s is not labelled: %v", inst.Name, boot.Labels)
@@ -666,7 +688,8 @@ func TestProvision(t *testing.T) {
 			}
 			for _, name := range []string{"metal-1", "metal-2"} {
 				disk, ok := state.get("disks", testPrefix+"-"+name+"-data")
-				if !ok || disk.Zone != tt.zone || disk.Labels["brie-hw-run"] != testRunID || len(disk.Users) != 1 {
+				if !ok || disk.Zone != tt.zone || disk.Labels["brie-hw-run"] != testRunID || len(disk.Users) != 1 ||
+					disk.Flags["auto-delete"] != "true" {
 					t.Errorf("data disk for %s: %+v", name, disk)
 				}
 			}
@@ -912,6 +935,71 @@ func TestProvisionFailureTearsDown(t *testing.T) {
 			}
 			if strings.Join(left, ",") != strings.Join(tt.retained, ",") {
 				t.Fatalf("resources left after failed provision: %v, want %v", left, tt.retained)
+			}
+		})
+	}
+}
+
+// TestProvisionExistingRun covers attempts that must not create or clean up
+// anything because the run is, or may be, owned by another invocation.
+func TestProvisionExistingRun(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		resources []mockResource
+		fail      []string
+		stderr    string
+		creates   int
+	}{
+		{
+			name:      "existing lab with another log directory",
+			resources: ownedLab(),
+			stderr:    "already has resources",
+		},
+		{
+			name:      "a leftover router with the run prefix",
+			resources: []mockResource{{Kind: "routers", Name: testPrefix + "-router", Region: testRegion}},
+			stderr:    "already has resources",
+		},
+		{
+			name:   "inventory list fails",
+			fail:   []string{"compute instances list"},
+			stderr: "could not be listed",
+		},
+		{
+			name:    "concurrent provision owns the network",
+			fail:    []string{"compute networks create"},
+			stderr:  "another provision may own run " + testRunID,
+			creates: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := provisionLab(t, mockState{Resources: tt.resources, Fail: tt.fail})
+			before := l.state().Resources
+			r := l.run("provision.sh")
+			if r.code == 0 || !strings.Contains(r.stderr, tt.stderr) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if strings.Contains(r.stderr, "running teardown") {
+				t.Errorf("an unclaimed run ran teardown: %q", r.stderr)
+			}
+			commands := l.commands()
+			creates := 0
+			for _, c := range commands {
+				fields := strings.Fields(c)
+				for _, verb := range fields {
+					if verb == "delete" || verb == "rm" {
+						t.Errorf("unclaimed run deleted: %q", c)
+					}
+				}
+				if len(fields) > 2 && fields[2] == "create" {
+					creates++
+				}
+			}
+			if creates != tt.creates {
+				t.Errorf("%d create calls, want %d: %q", creates, tt.creates, commands)
+			}
+			if after := l.state().Resources; len(after) != len(before) {
+				t.Errorf("resources changed: before=%v after=%v", before, after)
 			}
 		})
 	}

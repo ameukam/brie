@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -185,6 +187,45 @@ func removeLine(text, prefix string) string {
 	return strings.Join(kept, "\n")
 }
 
+// TestControlPlaneTokenOutput guards the bootstrap credentials: the script's
+// output is forwarded by run-on-host.sh, so no kubeadm call may print a token.
+func TestControlPlaneTokenOutput(t *testing.T) {
+	script := string(mustRead(t, "install-control-plane.sh"))
+	var calls []string
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "kubeadm ") || strings.Contains(line, "$(kubeadm ") {
+			calls = append(calls, strings.TrimSpace(line))
+		}
+	}
+	for _, tt := range []struct {
+		name  string
+		match func(call string) bool
+		want  int
+	}{
+		{name: "init skips the token print", match: func(c string) bool {
+			return strings.HasPrefix(c, "kubeadm init ") && strings.HasSuffix(c, " --skip-token-print")
+		}, want: 1},
+		{name: "init without the skip flag", match: func(c string) bool {
+			return strings.HasPrefix(c, "kubeadm init ") && !strings.Contains(c, "--skip-token-print")
+		}},
+		{name: "token commands", match: func(c string) bool { return strings.Contains(c, "kubeadm token") }},
+		{name: "join command print", match: func(c string) bool { return strings.Contains(c, "print-join-command") }},
+		{name: "certificate key print", match: func(c string) bool { return strings.Contains(c, "upload-certs") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := 0
+			for _, c := range calls {
+				if tt.match(c) {
+					got++
+				}
+			}
+			if got != tt.want {
+				t.Errorf("%d kubeadm calls match, want %d: %q", got, tt.want, calls)
+			}
+		})
+	}
+}
+
 func TestInstallHostRefusals(t *testing.T) {
 	l := newLab(t, mockState{})
 	checksums := writeFile(t, l.dir, "checksums.txt", filledChecksums(t))
@@ -222,12 +263,41 @@ func TestDigestManifest(t *testing.T) {
 		{
 			name:   "malformed line",
 			modify: func(_ string, manifest *string) { *manifest += "not a digest line\n" },
-			stderr: "do not match digest manifest",
+			stderr: "malformed line",
 		},
 		{
 			name:   "empty manifest",
 			modify: func(_ string, manifest *string) { *manifest = "" },
 			stderr: "missing or empty",
+		},
+		{
+			name:   "truncated to one valid entry",
+			modify: func(_ string, manifest *string) { *manifest = strings.SplitAfter(*manifest, "\n")[0] },
+			stderr: "does not cover",
+		},
+		{
+			name: "missing kata-runtime entry",
+			modify: func(_ string, manifest *string) {
+				lines := strings.SplitAfter(*manifest, "\n")
+				*manifest = strings.Join(lines[:3], "")
+			},
+			stderr: "/kata-runtime",
+		},
+		{
+			name: "duplicate entry replaces a required one",
+			modify: func(_ string, manifest *string) {
+				lines := strings.SplitAfter(*manifest, "\n")
+				*manifest = strings.Join([]string{lines[0], lines[1], lines[2], lines[0]}, "")
+			},
+			stderr: "more than once",
+		},
+		{
+			name: "unexpected extra binary",
+			modify: func(dir string, manifest *string) {
+				sum := sha256.Sum256([]byte("extra"))
+				*manifest += hex.EncodeToString(sum[:]) + "  " + writeFile(t, dir, "extra", "extra") + "\n"
+			},
+			stderr: "unexpected binary",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -247,7 +317,13 @@ func TestDigestManifest(t *testing.T) {
 				tt.modify(bin, &manifest)
 			}
 			path := writeFile(t, l.dir, "hw-digests.sha256", manifest)
-			r := l.run("install-host.sh", "--verify-manifest", path)
+			lib, err := filepath.Abs("checksums.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The required list names /opt/kata/bin; point it at the fixture binaries.
+			r := l.runCommand("bash", "-c", `source "$1"; HW_MANIFEST_BINARIES=("$2"/firecracker "$2"/jailer "$2"/containerd-shim-kata-v2 "$2"/kata-runtime); hw_verify_manifest "$3"`,
+				"verify", lib, bin, path)
 			if tt.stderr == "" && r.code != 0 {
 				t.Fatalf("exit=%d stderr=%q; want success", r.code, r.stderr)
 			}
@@ -258,14 +334,18 @@ func TestDigestManifest(t *testing.T) {
 	}
 }
 
+const stagingDir = "/tmp/brie-hw-" + testRunID + ".Ab12Cd34Ef"
+
 func TestRunOnHost(t *testing.T) {
 	host := testPrefix + "-metal-1"
 	for _, tt := range []struct {
-		name   string
-		labels map[string]string
-		env    map[string]string
-		args   []string
-		stderr string
+		name    string
+		labels  map[string]string
+		env     map[string]string
+		args    []string
+		mktemp  *mockResponse
+		stderr  string
+		staging bool
 	}{
 		{name: "labelled host", labels: runLabels(), args: []string{"install-host.sh", "checksums.txt"}},
 		{
@@ -275,11 +355,28 @@ func TestRunOnHost(t *testing.T) {
 		{name: "unlabelled host", args: []string{"install-host.sh", "checksums.txt"}, stderr: "does not carry label " + testMarker},
 		{name: "unknown script", labels: runLabels(), args: []string{"teardown.sh"}, stderr: "not a host-side lab script"},
 		{name: "missing input", labels: runLabels(), args: []string{"install-host.sh", "absent.txt"}, stderr: "does not exist"},
+		{
+			name: "mktemp fails", labels: runLabels(), args: []string{"install-host.sh", "checksums.txt"},
+			mktemp: &mockResponse{Match: "mktemp", Exit: 1}, stderr: "could not create a private staging directory", staging: true,
+		},
+		{
+			name: "predictable staging path", labels: runLabels(), args: []string{"install-host.sh", "checksums.txt"},
+			mktemp: &mockResponse{Match: "mktemp", Output: "/tmp/brie-hw-" + testRunID + "\n"}, stderr: "unexpected staging path", staging: true,
+		},
+		{
+			name: "injected staging path", labels: runLabels(), args: []string{"install-host.sh", "checksums.txt"},
+			mktemp: &mockResponse{Match: "mktemp", Output: stagingDir + ";reboot\n"}, stderr: "unexpected staging path", staging: true,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			l := newLab(t, mockState{Resources: []mockResource{
-				{Kind: "instances", Name: host, Zone: testZone, Labels: tt.labels, Status: "RUNNING"},
-			}})
+			mktemp := mockResponse{Match: "mktemp -d /tmp/brie-hw-" + testRunID + ".XXXXXXXXXX", Output: stagingDir + "\r\n"}
+			if tt.mktemp != nil {
+				mktemp = *tt.mktemp
+			}
+			l := newLab(t, mockState{
+				Resources: []mockResource{{Kind: "instances", Name: host, Zone: testZone, Labels: tt.labels, Status: "RUNNING"}},
+				SSH:       []mockResponse{mktemp},
+			})
 			writeFile(t, l.dir, "checksums.txt", filledChecksums(t))
 			l.env["NODE_NAME"] = "brie-worker-1"
 			for k, v := range tt.env {
@@ -291,18 +388,107 @@ func TestRunOnHost(t *testing.T) {
 				if r.code == 0 || !strings.Contains(r.stderr, tt.stderr) {
 					t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
 				}
-				if indexOf(commands, `^compute (ssh|scp) `) >= 0 {
-					t.Fatalf("refused run reached the host: %q", commands)
+				if indexOf(commands, `^compute scp `) >= 0 || indexOf(commands, ` bash /tmp/`) >= 0 {
+					t.Fatalf("refused run staged or ran a script: %q", commands)
+				}
+				if (indexOf(commands, `^compute ssh .*--command=mktemp -d `) >= 0) != tt.staging {
+					t.Fatalf("staging directory creation=%v, want %v: %q", !tt.staging, tt.staging, commands)
 				}
 				return
 			}
 			if r.code != 0 {
 				t.Fatalf("exit=%d stderr=%q", r.code, r.stderr)
 			}
-			scp := indexOf(commands, `^compute scp .*install-host\.sh .*checksums\.sh .*checksums\.txt `+host+`:/tmp/brie-hw-`+testRunID+`/`)
-			run := indexOf(commands, `^compute ssh `+host+` .*--command=sudo env NODE_NAME=brie-worker-1 bash /tmp/brie-hw-`+testRunID+`/install-host\.sh /tmp/brie-hw-`+testRunID+`/checksums\.txt`)
-			if scp < 0 || run < scp || indexOf(commands, `^compute instances describe `+host) > scp {
+			mk := indexOf(commands, `^compute ssh `+host+` .*--command=mktemp -d /tmp/brie-hw-`+testRunID+`\.XXXXXXXXXX$`)
+			scp := indexOf(commands, `^compute scp .*install-host\.sh .*checksums\.sh .*checksums\.txt `+host+`:`+stagingDir+`/$`)
+			run := indexOf(commands, `^compute ssh `+host+` .*--command=test -d `+stagingDir+` && test ! -L `+stagingDir+
+				` && test "\$\(stat -c %u:%a `+stagingDir+`\)" = "\$\(id -u\):700" && sudo env NODE_NAME=brie-worker-1 bash `+
+				stagingDir+`/install-host\.sh `+stagingDir+`/checksums\.txt$`)
+			if mk < 0 || scp < mk || run < scp || indexOf(commands, `^compute instances describe `+host) > mk {
 				t.Fatalf("unexpected command sequence: %q", commands)
+			}
+		})
+	}
+}
+
+// TestRunOnHostStagingDirectory runs the remote staging commands that
+// run-on-host.sh sends, rooted in a test directory instead of /tmp, against
+// paths another local user could have prepared.
+func TestRunOnHostStagingDirectory(t *testing.T) {
+	host := testPrefix + "-metal-1"
+	l := newLab(t, mockState{
+		Resources: []mockResource{{Kind: "instances", Name: host, Zone: testZone, Labels: runLabels(), Status: "RUNNING"}},
+		SSH:       []mockResponse{{Match: "mktemp", Output: stagingDir + "\n"}},
+	})
+	writeFile(t, l.dir, "checksums.txt", filledChecksums(t))
+	if r := l.run("run-on-host.sh", host, testZone, "install-host.sh", "checksums.txt"); r.code != 0 {
+		t.Fatalf("exit=%d stderr=%q", r.code, r.stderr)
+	}
+	var mkdirCommand, checkCommand string
+	for _, c := range l.commands() {
+		_, after, ok := strings.Cut(c, "--command=")
+		switch {
+		case ok && strings.HasPrefix(after, "mktemp "):
+			mkdirCommand = after
+		case ok && strings.HasPrefix(after, "test -d "):
+			// Only the pre-run check; the privileged script run is not executed.
+			checkCommand, _, _ = strings.Cut(after, " && sudo ")
+		}
+	}
+	if mkdirCommand == "" || checkCommand == "" {
+		t.Fatalf("staging commands not found: %q", l.commands())
+	}
+	shell := func(t *testing.T, command string) (string, error) {
+		t.Helper()
+		out, err := exec.CommandContext(t.Context(), "sh", "-c", command).Output()
+		return strings.TrimSpace(string(out)), err
+	}
+	pattern := regexp.MustCompile(`^.*/brie-hw-` + testRunID + `\.[A-Za-z0-9]{10}$`)
+	for _, tt := range []struct {
+		name    string
+		prepare func(t *testing.T, root, predictable string)
+	}{
+		{name: "nothing prepared", prepare: func(*testing.T, string, string) {}},
+		{name: "world-writable directory at the predictable path", prepare: func(t *testing.T, _, predictable string) {
+			if err := os.Mkdir(predictable, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(predictable, 0o777); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "symlink at the predictable path", prepare: func(t *testing.T, root, predictable string) {
+			target := filepath.Join(root, "attacker")
+			if err := os.Mkdir(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, predictable); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			predictable := filepath.Join(root, "brie-hw-"+testRunID)
+			tt.prepare(t, root, predictable)
+			dir, err := shell(t, strings.Replace(mkdirCommand, "/tmp/", root+"/", 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !pattern.MatchString(dir) || dir == predictable || !info.IsDir() || info.Mode().Perm() != 0o700 {
+				t.Fatalf("staging directory %q mode %v; want a new private directory", dir, info.Mode())
+			}
+			if _, err := shell(t, strings.ReplaceAll(checkCommand, stagingDir, dir)); err != nil {
+				t.Errorf("pre-run check rejected the fresh staging directory: %v", err)
+			}
+			if _, err := os.Lstat(predictable); err == nil {
+				if _, err := shell(t, strings.ReplaceAll(checkCommand, stagingDir, predictable)); err == nil {
+					t.Errorf("pre-run check accepted the prepared path %s", predictable)
+				}
 			}
 		})
 	}

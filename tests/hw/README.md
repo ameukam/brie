@@ -50,7 +50,9 @@ Every script that calls `gcloud` sources `lib.sh`, which:
 (`gcloud storage rm --recursive`), firewall rules, the Cloud NAT and router, the
 subnet, and the VPC. It discovers candidates by run label or name prefix, then
 re-describes each one immediately before deletion. Candidates without the
-run's label or description marker are reported as `REFUSED` and kept. It then
+run's label or description marker are reported as `REFUSED` and kept. A NAT
+has neither, so under an owned router only `brie-hw-$RUN_ID-nat` is deleted;
+any other NAT is refused and the router is kept for it. It then
 runs `verify-empty.sh`, which lists every type by label and prefix and fails
 unless all lists succeed and are empty. Teardown exits nonzero on any refusal,
 failed call, or remaining resource.
@@ -77,8 +79,19 @@ fixed-overhead <USD per hour for the bucket, NAT data, egress, and anything else
 ```
 
 The script refuses the whole plan before any create if the projected hourly
-rate times `PLANNED_HOURS` exceeds `SPEND_CEILING_USD`, and checks the running
-total again before each priced create. It creates a custom-mode VPC, one
+rate, held for `PLANNED_HOURS` plus the 46-minute worst case of stockout
+retries (the 45-minute cap and one retry interval), exceeds
+`SPEND_CEILING_USD`, and checks the running total again before each priced
+create. Comparisons use unrounded amounts; displayed amounts are rounded up to
+the cent. That horizon, counted from the start of provisioning, is the run's
+deadline: every instance is created with `--termination-time` at the deadline
+and `--instance-termination-action=DELETE`, each metal data disk is set to
+auto-delete with its instance, and no instance is created after the deadline.
+GCE, not this script, enforces that deletion. The network, subnet, firewall
+rules, router, NAT, and bucket have no cloud-side expiry; only `teardown.sh`
+removes them, so their cost keeps accruing past the deadline until it runs.
+Neither the termination time on C4A metal hosts nor any price has been
+verified against Google Cloud. It creates a custom-mode VPC, one
 regional subnet with private Google access, internal and IAP-only SSH firewall
 rules, a Cloud Router with NAT, one bucket (uniform access, public access
 prevention, objects deleted after 7 days), and the hosts. Hosts use Ubuntu
@@ -88,10 +101,16 @@ metal host gets a labelled persistent data disk attached as `brie-data`.
 Optional settings: `BOOT_DISK_GB` (100), `DATA_DISK_GB` (200), `SUBNET_RANGE`
 (`10.200.0.0/20`), `POD_RANGE` (`10.244.0.0/16`), `STOCKOUT_RETRY_SECONDS` (60).
 
+Before any create, `provision.sh` runs `verify-empty.sh` and refuses the run if
+anything with its label or prefix already exists or a list fails, whatever the
+log directory. Creating the run's network is its exclusive claim: a
+concurrent or repeated invocation fails that create and exits without
+deleting anything.
+
 An instance create that fails with a stockout in `ZONE` is retried in `ZONE2`,
 then both are retried after the retry interval. After 45 minutes of total
-stockout, or on any other failure after the first create, provisioning aborts
-and runs `teardown.sh`. The inventory is written to
+stockout, or on any other failure after this invocation created the network,
+provisioning aborts and runs `teardown.sh`. The inventory is written to
 `$HW_LOG_DIR/inventory.tsv`; a second run with the same log directory refuses.
 
 The bucket and boot disks receive their labels in a second call after creation.
@@ -127,7 +146,9 @@ version, malformed digests, and duplicate records. Check a file locally with
 
 `run-on-host.sh INSTANCE ZONE SCRIPT [FILE...]` refuses instances without the
 run label, copies the script, `checksums.sh`, and the input files over IAP
-SSH, and runs the script as root. It forwards `NODE_NAME`, `POD_CIDR`,
+SSH into a fresh `mktemp -d /tmp/brie-hw-$RUN_ID.XXXXXXXXXX` directory, and
+runs the script as root only after checking that the directory is not a
+symlink and is owned by the SSH user with mode 0700. It forwards `NODE_NAME`, `POD_CIDR`,
 `SERVICE_CIDR`, and `ADVERTISE_ADDRESS` when set, and refuses values outside
 `[A-Za-z0-9./_-]`.
 
@@ -137,7 +158,8 @@ It installs containerd 2.4.2, Kata 4.3.1 (whose Firecracker must report
 `/etc/brie/hw-digests.sha256` from the operator's `binary` records; and verifies
 `firecracker`, `jailer`, `containerd-shim-kata-v2`, and `kata-runtime` against
 it before configuring containerd. Re-verify later with
-`install-host.sh --verify-manifest`. It configures a `kata-fc` runtime on a
+`install-host.sh --verify-manifest`, which first requires the manifest to list
+each of those four `/opt/kata/bin` paths exactly once and nothing else. It configures a `kata-fc` runtime on a
 loopback devmapper thin pool (16 GiB data, 256 MiB metadata, recreated at boot)
 and a bridge CNI template filled from the Pod CIDR Brie sends through CRI. It
 records the Kata Firecracker settings `jailer_path` and
@@ -148,7 +170,9 @@ records the Kata Firecracker settings `jailer_path` and
 kubelet, and kubectl 1.37.x from `dl.k8s.io`, runs `kubeadm init` with the Node
 authorizer, NodeRestriction, and kube-proxy in iptables mode, verifies those
 settings, and writes a bridge CNI configuration for the control-plane Pod CIDR.
-Its evidence records versions and settings, never a kubeconfig or token.
+It passes `--skip-token-print` so the bootstrap join token never reaches the
+output that `run-on-host.sh` forwards. Its evidence records versions and
+settings, never a kubeconfig or token.
 
 Not covered: Pod routes between hosts, kube-proxy on Brie workers, Brie node
 credentials, and installing `brie-node` itself.
@@ -179,22 +203,41 @@ Pod manifests and status, versions, and host observations, never the
 kubeconfig. The harness assumes `brie-node` already runs on the host as
 `AGENT_UNIT`.
 
+After preflight the harness creates the `brie-m1-$RUN_ID` namespace with
+`kubectl create` (never `apply`) and the `brie-hw-run=$RUN_ID` label, and
+records its UID. It refuses to run if the namespace already exists. On exit it
+removes the namespace only if the UID and label still match, through a raw
+API call with a UID precondition; a failed preflight touches no namespace.
+
 ## Node Conformance (G1)
 
 `node-conformance.sh CHECKSUMS` runs as root on the control-plane host with
 `NODE_NAME` set to the Brie node. It downloads the pinned
 `kubernetes-test-linux-arm64` 1.37 tarball, checks that the server version
-matches, that the Brie node carries its `brie.dev/runtime` taint, and that
-every other node keeps the kubeadm control-plane taint, so test Pods cannot
-silently run on a kubelet node. It then runs `e2e.test` with
+matches, and captures `kubectl get nodes -o json` as a whole; a failed, empty,
+or paginated list stops the run. The inventory must contain the Brie node with
+its `brie.dev/runtime` taint, and every other node must keep the kubeadm
+control-plane taint with a `NoSchedule` or `NoExecute` effect
+(`PreferNoSchedule` is refused), so test Pods cannot silently run on a kubelet
+node. `--check-nodes NODES_JSON` applies the same check to a saved inventory.
+During the run a `kubectl get pods --all-namespaces --watch` records every
+Pod binding in `pod-placement.txt`. Afterwards every Pod outside the `kube-*`
+namespaces must have been bound to the Brie node and at least one must have
+been; a misplaced Pod, no observed Pod, or a watch that ended before the suite
+fails the run (`placement.txt` holds the verdict, and
+`--check-placement FILE` rechecks a saved record). It then runs `e2e.test` with
 `--ginkgo.focus='\[NodeConformance\]'` and no skip filter.
 `--non-blocking-taints` includes the Brie taint only so the suite can start.
 
 Results go to `/var/lib/brie-hw/evidence/node-conformance-<timestamp>/`:
-JUnit reports, `e2e.log`, `summary.txt`, `failures.txt` listing every failed
-or errored test, and `SHA256SUMS`. Publish all of `failures.txt`. The script
-exits nonzero if any test failed or none ran. `--summarize DIR` regenerates the
-summary from existing JUnit files.
+JUnit reports, `e2e.log`, `nodes.json`, `summary.txt`, `failures.txt` listing
+every failed or errored case, `skipped.txt` listing every skipped selected
+case, and `SHA256SUMS`. Publish all of `failures.txt` and `skipped.txt`.
+Selected cases are those named `[NodeConformance]`; specs the focus filtered
+out and suite setup nodes are counted as `unselected`, but a failure in any
+case is a failure. The script exits 1 if any case failed or no selected case
+ran, and 2 (incomplete) if any selected case was skipped. `--summarize DIR`
+regenerates the summary from existing JUnit files.
 
 These are the `[NodeConformance]`-tagged tests of the cluster e2e suite, not
 the kubelet-local `e2e_node` runner, which assumes a kubelet. The restricted

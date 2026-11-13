@@ -121,20 +121,28 @@ versioning. Dated nightly prereleases are development builds, not stable release
   repeated warnings and errors. It is not yet the default agent log format.
 - `tests/hw/node-conformance.sh` runs the pinned upstream 1.37
   `[NodeConformance]` tests against a lab cluster without skip filters and
-  writes every failure to `failures.txt`. It refuses to run if another node
-  could accept test Pods. Only its input checks and report summary are tested.
+  writes every failure to `failures.txt`. It refuses to run unless the
+  complete node list shows every other node with a blocking (`NoSchedule` or
+  `NoExecute`) control-plane taint, fails if any test Pod was bound to
+  another node, and reports a run as incomplete (exit 2) if any selected test
+  was skipped. Only its input checks, node-inventory check, placement check,
+  and report summary are tested.
 - `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
   Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
   and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
-  sums. Steps needing features Brie lacks are reported as
-  `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock `gcloud` and
-  `kubectl`.
+  sums. It creates its namespace exclusively, refuses an existing one, and
+  removes only the incarnation it created. Steps needing features Brie lacks
+  are reported as `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock
+  `gcloud` and `kubectl`.
 - `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
   control plane with the Node authorizer, NodeRestriction, bridge CNI, and
-  kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
+  kube-proxy in iptables mode; `kubeadm init` withholds the bootstrap token
+  from its output. Downloads are pinned by URL and SHA-256 from an
   operator-filled checksums file that refuses placeholders, and the host
   install verifies Kata, Firecracker, and jailer binaries against a node-local
-  digest manifest (D9). Only the input validation is tested; neither script has
+  digest manifest (D9) that must list each required binary exactly once.
+  `run-on-host.sh` stages them in a fresh private `mktemp -d` directory, never
+  a predictable path, before running them as root. Only the input validation is tested; neither script has
   run on a host.
 - `tests/hw/fence.sh`, a provisional lab fence (D5) that stops only a host
   labelled for the run, waits for the same incarnation to report TERMINATED,
@@ -143,11 +151,17 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - `tests/hw/provision.sh` for a disposable C4A lab of at most four bare-metal
   and two standard hosts, with a dedicated VPC, NAT, and 7-day evidence bucket.
   It refuses plans that an operator-supplied price table projects over the
-  spend ceiling, falls back to a second zone on stockout, and tears down after
-  45 minutes of stockout or any failure. Tested only against a mock `gcloud`.
+  spend ceiling for `PLANNED_HOURS` plus the stockout retry allowance, using
+  unrounded comparisons, and creates every host with a GCE termination time
+  and DELETE action at that deadline; network, NAT, and bucket resources have
+  no cloud-side expiry. It falls back to a second zone on stockout, and tears
+  down after 45 minutes of stockout or any failure once it has claimed the run
+  by creating its network. It refuses a run that already has resources and never
+  cleans up after a create it lost. Tested only against a mock `gcloud`.
 - A label-guarded hardware lab teardown in `tests/hw`: it deletes only
-  resources carrying the run's label or description marker, refuses others,
-  and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
+  resources carrying the run's label or description marker, refuses others
+  (including any NAT other than the run's own under an owned router, whose
+  router is then kept), and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
   explicit project, zones, run id, and spend ceiling, and never reads gcloud
   configuration. Tested only against a mock `gcloud`; it has not run against
   Google Cloud.
