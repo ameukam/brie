@@ -19,7 +19,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `kubectl`.
 - `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
   control plane with the Node authorizer, NodeRestriction, bridge CNI, and
-  kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
+  kube-proxy in iptables mode; `kubeadm init` withholds the bootstrap token
+  from its output. Downloads are pinned by URL and SHA-256 from an
   operator-filled checksums file that refuses placeholders, and the host
   install verifies Kata, Firecracker, and jailer binaries against a node-local
   digest manifest (D9) that must list each required binary exactly once. Only the input validation is tested; neither script has
