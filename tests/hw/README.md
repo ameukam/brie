@@ -149,7 +149,9 @@ records the Kata Firecracker settings `jailer_path` and
 kubelet, and kubectl 1.37.x from `dl.k8s.io`, runs `kubeadm init` with the Node
 authorizer, NodeRestriction, and kube-proxy in iptables mode, verifies those
 settings, and writes a bridge CNI configuration for the control-plane Pod CIDR.
-Its evidence records versions and settings, never a kubeconfig or token.
+It passes `--skip-token-print` so the bootstrap join token never reaches the
+output that `run-on-host.sh` forwards. Its evidence records versions and
+settings, never a kubeconfig or token.
 
 Not covered: Pod routes between hosts, kube-proxy on Brie workers, Brie node
 credentials, and installing `brie-node` itself.
