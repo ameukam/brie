@@ -11,8 +11,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
   with prepare, resume, and abort messages, length-limited canonical JSON, and
   a `brie-guestctl` relay. The supervisor listens only on a Unix socket inside
   the workload container; the host reaches it through CRI ExecSync, so Kata
-  stays the only guest-control channel. Nothing in the node agent calls it,
-  and it is tested only against fakes and local sockets, not on Kata.
+  stays the only guest-control channel. Nothing in the node agent calls it, and
+  it is tested only against fakes and local sockets, not on Kata. After an
+  invalid safe point whose cleanup abort failed, the supervisor refuses other
+  requests until an abort of that operation succeeds.
 - A credential-free sample cooperative workload, `brie-counter`, with an
   unbuilt `scratch` image Dockerfile in `examples/counter`. It fsyncs every
   acknowledged increment to a state file, stops admitting work at prepare,
