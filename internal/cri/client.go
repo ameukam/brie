@@ -12,6 +12,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +33,8 @@ type Client struct {
 	images  runtimeapi.ImageServiceClient
 	timeout time.Duration
 	slot    chan struct{}
+	// observer receives per-call latency and errors; see SetObserver.
+	observer atomic.Pointer[Observer]
 }
 
 // New creates a client without contacting the runtime. The positive timeout
@@ -46,8 +49,10 @@ func New(socketPath string, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		return nil, errors.New("invalid CRI request timeout: must be positive")
 	}
+	client := &Client{timeout: timeout, slot: make(chan struct{}, 1)}
 	conn, err := grpc.NewClient(
 		"passthrough:///cri",
+		grpc.WithChainUnaryInterceptor(client.observeCall),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
@@ -62,11 +67,9 @@ func New(socketPath string, timeout time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create CRI connection: %w", err)
 	}
-	return &Client{
-		conn: conn, runtime: runtimeapi.NewRuntimeServiceClient(conn),
-		images:  runtimeapi.NewImageServiceClient(conn),
-		timeout: timeout, slot: make(chan struct{}, 1),
-	}, nil
+	client.conn, client.runtime = conn, runtimeapi.NewRuntimeServiceClient(conn)
+	client.images = runtimeapi.NewImageServiceClient(conn)
+	return client, nil
 }
 
 // Close releases the connection and interrupts in-flight RPCs.
