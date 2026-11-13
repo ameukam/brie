@@ -54,19 +54,32 @@ BUCKET=$HW_PREFIX-$PROJECT
 INVENTORY=$HW_LOG_DIR/inventory.tsv
 LABELS=$HW_LABEL_KEY=$RUN_ID
 
+# The budget covers PLANNED_HOURS plus the longest provisioning can take
+# retrying stockouts, for every resource, from the moment provisioning starts.
+# Every instance is created with a GCE termination time at that deadline and
+# action DELETE, so the hosts and their data disks are removed by GCE even if
+# this script and teardown.sh never run again.
+PROVISION_START=$(hw_now_epoch)
+HW_BUDGET_HOURS=$(awk -v p="$PLANNED_HOURS" -v s="$((STOCKOUT_CAP_SECONDS + STOCKOUT_RETRY_SECONDS))" \
+	'BEGIN { printf "%.17g", p + s / 3600 }')
+DEADLINE_EPOCH=$(awk -v t="$PROVISION_START" -v h="$HW_BUDGET_HOURS" \
+	'BEGIN { s = h * 3600; i = int(s); if (i < s) i++; printf "%d", t + i }')
+DEADLINE=$(date -u -d "@$DEADLINE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+
 # Refuse the whole plan before creating anything if it cannot fit.
 plan_gib=$((METAL_COUNT * (BOOT_DISK_GB + DATA_DISK_GB) + STANDARD_COUNT * BOOT_DISK_GB))
 plan_rate=$(awk -v m="$METAL_COUNT" -v pm="$(hw_price "$METAL_TYPE")" \
 	-v s="$STANDARD_COUNT" -v ps="$(hw_price "$STANDARD_TYPE")" \
 	-v g="$plan_gib" -v pg="$(hw_price hyperdisk-balanced-gib)" \
 	-v n="$(hw_price cloud-nat-gateway)" -v f="$(hw_price fixed-overhead)" \
-	'BEGIN { printf "%.6f", m * pm + s * ps + g * pg + n + f }')
+	'BEGIN { printf "%.17g", m * pm + s * ps + g * pg + n + f }')
 plan_usd=$(hw_projected_usd "$plan_rate")
-hw_log plan "metal=$METAL_COUNT standard=$STANDARD_COUNT disk_gib=$plan_gib hours=$PLANNED_HOURS projected_usd=$plan_usd"
-if hw_greater "$plan_usd" "$SPEND_CEILING_USD"; then
-	hw_die "refusing plan: projected spend $plan_usd USD over $PLANNED_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
+hw_log plan "metal=$METAL_COUNT standard=$STANDARD_COUNT disk_gib=$plan_gib hours=$HW_BUDGET_HOURS deadline=$DEADLINE projected_usd=$plan_usd"
+if hw_over_ceiling "$plan_rate"; then
+	hw_die "refusing plan: projected spend $plan_usd USD over $HW_BUDGET_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
 fi
-printf 'provision: plan projects %s USD over %s h (ceiling %s USD)\n' "$plan_usd" "$PLANNED_HOURS" "$SPEND_CEILING_USD"
+printf 'provision: plan projects %s USD over %s h, PLANNED_HOURS plus the stockout allowance (ceiling %s USD); GCE deletes the hosts at %s\n' \
+	"$plan_usd" "$HW_BUDGET_HOURS" "$SPEND_CEILING_USD" "$DEADLINE"
 
 # Teardown is armed only after this invocation has created the run's network,
 # its exclusive claim on the run: names are fixed per run, so a concurrent or
@@ -118,6 +131,9 @@ create_instance() {
 	local name=$1 role=$2 machine_type=$3 nic_type=$4 zone output status
 	while true; do
 		for zone in "$ZONE" "$ZONE2"; do
+			if (($(hw_now_epoch) >= DEADLINE_EPOCH)); then
+				hw_die "budget deadline $DEADLINE reached before instance $name was created; aborting"
+			fi
 			status=0
 			output=$(create compute instances create "$name" --zone="$zone" \
 				--machine-type="$machine_type" \
@@ -125,6 +141,7 @@ create_instance() {
 				--boot-disk-type=hyperdisk-balanced --boot-disk-size="${BOOT_DISK_GB}GB" \
 				--network-interface="subnet=$SUBNET,no-address,nic-type=$nic_type" \
 				--can-ip-forward --maintenance-policy=TERMINATE \
+				--termination-time="$DEADLINE" --instance-termination-action=DELETE \
 				--no-service-account --no-scopes \
 				--metadata=enable-oslogin=TRUE \
 				--labels="$LABELS,brie-hw-role=$role" 2>&1) || status=$?
@@ -164,6 +181,8 @@ add_host() {
 		create compute disks create "$name-data" --zone="$zone" --type=hyperdisk-balanced \
 			--size="${DATA_DISK_GB}GB" --labels="$LABELS,brie-hw-role=data"
 		create compute instances attach-disk "$name" --zone="$zone" --disk="$name-data" --device-name=brie-data
+		# Deleted with its instance at the deadline unless fence.sh detached it.
+		create compute instances set-disk-auto-delete "$name" --zone="$zone" --disk="$name-data" --auto-delete
 	fi
 	printf '%s\t%s\t%s\n' "$name" "$role" "$zone" >>"$INVENTORY"
 	hw_log inventory "$name role=$role zone=$zone"
