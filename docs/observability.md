@@ -106,15 +106,15 @@ Pod name, namespace, UID, image, or error text becomes a label.
 | Metric | Labels | Meaning |
 | --- | --- | --- |
 | `brie_node_admission_decisions_total` | `reason`: `Admitted`, `UnsupportedPod`, `RuntimeClassOverheadMismatch`, `UnsupportedResources`, `InsufficientResources`, `Other` | Admission decisions |
-| `brie_node_reserved_{cpu_cores,memory_bytes,executions}` | none | Reservations, including overhead |
-| `brie_node_budget_{cpu_cores,memory_bytes,executions}` | none | Configured envelope |
+| `brie_node_reserved_{cpu_cores,memory_bytes,executions}` | none | Reservations, including overhead; no samples until observed, and the executor does not report them yet (hook 5) |
+| `brie_node_budget_{cpu_cores,memory_bytes,executions}` | none | Configured envelope; no samples until set |
 | `brie_node_last_complete_reconcile_age_seconds` | none | Age of the last error-free pass; `NaN` before the first |
 | `brie_node_admission_barrier` | `cause`: `IncompletePass`, `UnresolvedExecution`, `RuntimeUnhealthy`, `RecoveryRequired`, `Other` | 1 for the active cause; no samples until first observed |
 | `brie_node_oldest_pending_stage_age_seconds` | `stage`: `reserved`, `sandbox-pending`, `container-pending`, `start-pending` | Oldest pending record per stage; no sample when none is pending |
 | `brie_node_cri_request_duration_seconds` | `method`: known CRI methods or `other` | CRI call latency |
 | `brie_node_cri_request_errors_total` | `method`, `code` (gRPC code) | CRI call errors |
 | `brie_node_image_pull_duration_seconds`, `brie_node_image_pull_failures_total` | none | `PullImage` duration and failures |
-| `brie_node_journal_{records,bytes}` and `_limit` | none | Journal size against its 10,000-record and 4 MiB bounds |
+| `brie_node_journal_{records,bytes}` and `_limit` | none | Journal size against its 10,000-record and 4 MiB bounds; no samples until observed, and the executor does not report them yet (hook 5) |
 | `brie_node_lease_renewal_failures_total` | none | Failed Lease renewals |
 | `brie_node_probe_results_total` | `probe`, `handler`, `result` | Probe outcomes |
 | `brie_node_container_log_rotations_total` | `result`: `rotated`, `reopen_failed`, `failed` | Log rotation attempts |
