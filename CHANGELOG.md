@@ -14,7 +14,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   stays the only guest-control channel. Nothing in the node agent calls it, and
   it is tested only against fakes and local sockets, not on Kata. After an
   invalid safe point whose cleanup abort failed, the supervisor refuses other
-  requests until an abort of that operation succeeds.
+  requests until an abort of that operation succeeds. A resume retry is refused
+  once a later epoch has been seen.
 - A credential-free sample cooperative workload, `brie-counter`, with an
   unbuilt `scratch` image Dockerfile in `examples/counter`. It fsyncs every
   acknowledged increment to a state file, stops admitting work at prepare,

@@ -150,6 +150,11 @@ func (s *Supervisor) resume(ctx context.Context, request ResumeRequest) Response
 	if s.phase == phaseAbortPending {
 		return refusal(request.OperationID, abortPendingReason)
 	}
+	// A replayed resume is checked against the current epoch too, so a later
+	// operation's epoch cannot be acknowledged by an older resume.
+	if request.Epoch < s.epoch {
+		return refusal(request.OperationID, "stale epoch")
+	}
 	if s.phase != phasePrepared {
 		if s.lastResume != nil && sameExecution(*s.lastResume, request) {
 			return Response{Version: ProtocolVersion, Outcome: OutcomeReady, OperationID: request.OperationID}
@@ -158,9 +163,6 @@ func (s *Supervisor) resume(ctx context.Context, request ResumeRequest) Response
 	}
 	if request.OperationID != s.operationID {
 		return refusal(request.OperationID, "operation is not prepared")
-	}
-	if request.Epoch < s.epoch {
-		return refusal(request.OperationID, "stale epoch")
 	}
 	if skew := s.now().Sub(request.WallClock).Abs(); skew > s.maxClockSkew {
 		return refusal(request.OperationID, "guest clock differs from host wall clock")
