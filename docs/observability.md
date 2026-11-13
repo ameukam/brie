@@ -146,3 +146,24 @@ RBAC: the Node authorizer's static node rules let a node identity
 (`system:node:<name>` in group `system:nodes`) `create`, `update`, and `patch`
 `events` in the core and `events.k8s.io` groups, in any namespace. Brie needs
 no additional role. NodeRestriction does not restrict Events.
+
+## Probes
+
+`internal/probe` runs readiness and liveness probes per Pod UID: `exec`
+through CRI `ExecSync`, and `httpGet` and `tcpSocket` against the Pod IP and a
+declared container port. It honors `initialDelaySeconds` (from the container
+start time), `periodSeconds`, `timeoutSeconds`, and the success and failure
+thresholds. At most 16 probes run at once and at most 110 Pods are tracked by
+default. HTTP probes send `User-Agent: kube-probe/brie`, use no proxy, read at
+most 10 KiB of the body, treat 200-399 as success, and do not follow redirects
+to another host (such a redirect counts as success, as in kubelet).
+
+Readiness starts false and becomes true after `successThreshold` consecutive
+successes. Liveness failure latches after `failureThreshold` consecutive
+failures; the manager never restarts or stops anything. A timeout or a non-zero
+exit is a failure. A probe that could not run (for example, CRI unavailable)
+counts against readiness but not against liveness, because it is not evidence
+about the application. `Suspend(uid, state)` stops a Pod's probes for a
+recorded extension state: readiness becomes false, liveness evidence is kept,
+and after `Resume` readiness must succeed again. Probe output is never logged
+or stored.
