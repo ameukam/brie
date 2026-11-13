@@ -47,6 +47,43 @@ Audience: engineers implementing and reviewing the node agent, runtime integrati
   increment found by code reading, two of them reproduced against the fake
   runtime; they are unscheduled.
 
+### Lab run r20261113, 2026-11-13 (local branches only)
+
+- Scope of evidence: unit, fuzz, and local e2e tests against fake CRI
+  runtimes, fake API servers, a fake Firecracker API socket, and a fake GCS
+  server. No hardware, cloud project, Kata VM, or Firecracker process was used,
+  because the run's authorization named no project, zone, or spend ceiling. No
+  item below is hardware-verified, and no gate in section 16 passed.
+- Local branch `design-impl-r20261113`, unreviewed and unmerged, builds on the
+  deletion-evidence increment. It adds the following, all opt-in and disabled
+  by default:
+  - the creation-evidence rule, per-Pod fault isolation, and bounded per-Pod
+    workers with priority for stop, delete, and status work (section 6.4);
+  - journal compaction and watch-based assignment with bookmarks and relist
+    (sections 6.2 and 6.4);
+  - bounded, deduplicated pull workers with backoff, and CRI image collection
+    (section 10.4);
+  - a kubelet-style serving endpoint with TokenReview and SubjectAccessReview;
+  - probes (exec, httpGet, tcpSocket) and the matching validator increment;
+  - metrics, Events, structured logs, and container log rotation (section 12);
+  - a cooperative guest supervisor protocol reached through CRI ExecSync, a
+    sample counter workload, a checkpoint manifest schema, a GCS store, and a
+    conditional checkpoint-reference commit helper (sections 3 and 5);
+  - label- and cost-guarded lab scripts, tested only with a mock `gcloud`.
+  Independent reviews found safety defects in every lane; the reported fixes
+  are applied.
+- A local Kata 4.3.1 fork adds a versioned `brie.lifecycle.v1alpha1` ttRPC
+  service in the shim. It has a durable operation journal, idempotent operation
+  IDs, and stale-generation rejection. Firecracker pause and resume use
+  `PATCH /vm`, and full snapshots go to operation-scoped new paths. Restore
+  loads into a fresh process but is reported unsupported: container identity
+  mapping, agent reconnect, and create-time wiring remain open. Brie does not
+  call the extension, and the WarmPaused state is not implemented.
+- A local agent-sandbox v1.0.11 fork adds experimental Sandbox fields: desired
+  lifecycle, placement epoch, committed checkpoint, and fenced execution. It
+  also adds a fence-gated replacement Pod and a bounded router wake path behind
+  a flag. No fencing owner or runtime consumes them.
+
 ## 1. Requirements and unresolved decisions
 
 ### 1.1 Confirmed requirements
