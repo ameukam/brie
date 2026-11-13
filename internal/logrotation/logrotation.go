@@ -205,13 +205,27 @@ func (r *Rotator) rotateContainer(ctx context.Context, podUID, containerID strin
 	}
 	if err := r.runtime.ReopenContainerLog(ctx, containerID); err != nil {
 		r.observe("reopen_failed")
-		// The runtime still writes to the renamed file; restore its name.
-		if restoreErr := root.Rename(rotated, base); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore container log name: %w", restoreErr))
-		}
-		return err
+		return errors.Join(err, restoreName(root, rotated, base))
 	}
 	r.observe("rotated")
+	return nil
+}
+
+// restoreName gives the rotated file its original name again after a failed
+// reopen. A reopen error is ambiguous: the runtime may have reopened the log
+// and lost the reply. The name is therefore restored with a hard link, which
+// never replaces an existing file; when the runtime already created a new
+// current file, both files are kept.
+func restoreName(root *os.Root, rotated, base string) error {
+	if err := root.Link(rotated, base); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errors.New("the runtime created a new container log despite the reopen error; both files were kept")
+		}
+		return fmt.Errorf("restore container log name: %w", err)
+	}
+	if err := root.Remove(rotated); err != nil {
+		return fmt.Errorf("remove rotated container log link: %w", err)
+	}
 	return nil
 }
 

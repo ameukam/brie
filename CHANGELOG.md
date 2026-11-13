@@ -18,7 +18,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   only against fakes.
 - Size-based container log rotation (`internal/logrotation`) through CRI
   `ReopenContainerLog`, with bounded max size and max files, restoring the log
-  name when the runtime cannot reopen it, and removal of Pod log directories
+  name after a reopen error without ever replacing a current log the runtime
+  may already have created, and removal of Pod log directories
   only for journal-finished Pods with no remaining sandbox. Symlinks and paths
   outside the Pod log directory are refused.
 - A probe manager (`internal/probe`) for readiness and liveness probes: exec
