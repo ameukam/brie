@@ -7,8 +7,9 @@
 # workload hosts with a persistent data disk each, and up to two
 # c4a-standard-8 hosts. Every create is checked against the spend ceiling
 # first. Instance creates fall back from ZONE to ZONE2 on stockout; after 45
-# minutes of total stockout the run aborts and tears down. Any failure after
-# the first create also runs teardown.sh.
+# minutes of total stockout the run aborts and tears down. A run that already
+# has resources is refused before any create. Any failure after this
+# invocation created the run's network also runs teardown.sh.
 set -euo pipefail
 
 HW_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -67,11 +68,15 @@ if hw_greater "$plan_usd" "$SPEND_CEILING_USD"; then
 fi
 printf 'provision: plan projects %s USD over %s h (ceiling %s USD)\n' "$plan_usd" "$PLANNED_HOURS" "$SPEND_CEILING_USD"
 
-create_started=0
+# Teardown is armed only after this invocation has created the run's network,
+# its exclusive claim on the run: names are fixed per run, so a concurrent or
+# repeated provision.sh fails that create and exits without deleting
+# anything. Before the claim, a run that already has resources is refused.
+claimed=0
 finished=0
 on_exit() {
 	local status=$?
-	if ((create_started == 1 && finished == 0)); then
+	if ((claimed == 1 && finished == 0)); then
 		hw_log abort "provision failed with status $status; running teardown"
 		printf 'provision: failed; running teardown for run %s\n' "$RUN_ID" >&2
 		"$HW_DIR/teardown.sh" || printf 'provision: TEARDOWN INCOMPLETE; inspect run %s manually\n' "$RUN_ID" >&2
@@ -81,7 +86,6 @@ on_exit() {
 trap on_exit EXIT
 
 create() {
-	create_started=1
 	hw_gcloud "$@"
 }
 
@@ -112,7 +116,6 @@ check_stockout_cap() {
 created_zone=
 create_instance() {
 	local name=$1 role=$2 machine_type=$3 nic_type=$4 zone output status
-	create_started=1
 	while true; do
 		for zone in "$ZONE" "$ZONE2"; do
 			status=0
@@ -167,8 +170,14 @@ add_host() {
 }
 
 [[ ! -e $INVENTORY ]] || hw_die "inventory $INVENTORY already exists; use a new RUN_ID or HW_LOG_DIR"
+if ! "$HW_DIR/verify-empty.sh" >/dev/null; then
+	hw_die "run $RUN_ID already has resources in $PROJECT, or they could not be listed; refusing to provision or clean up"
+fi
 hw_budget_reserve fixed-overhead 1 "fixed overhead"
-create compute networks create "$NETWORK" --subnet-mode=custom --description="$HW_MARKER"
+create compute networks create "$NETWORK" --subnet-mode=custom --description="$HW_MARKER" ||
+	hw_die "could not create network $NETWORK; another provision may own run $RUN_ID, so nothing is cleaned up"
+claimed=1
+hw_log claim "network $NETWORK"
 create compute networks subnets create "$SUBNET" --network="$NETWORK" --region="$HW_REGION" \
 	--range="$SUBNET_RANGE" --enable-private-ip-google-access --description="$HW_MARKER"
 create compute firewall-rules create "$HW_PREFIX-internal" --network="$NETWORK" --direction=INGRESS \
