@@ -7,6 +7,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A structured JSON agent logger (`internal/agentlog`) with Pod UID, operation
+  ID, and journal stage fields, key-based redaction of environment values,
+  commands, arguments, request bodies, and credentials, and rate limiting of
+  repeated warnings and errors. It is not yet the default agent log format.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
