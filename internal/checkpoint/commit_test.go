@@ -97,9 +97,32 @@ func TestCommitCheckpointReference(t *testing.T) {
 		{name: "already committed after lost reply", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {
 			s := suspending()
 			s.Committed = &reference
-			s.Deleting = true
 			return s
 		}()}, committed: &reference},
+		{name: "already committed but deleting", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {
+			s := suspending()
+			s.Committed = &reference
+			s.Deleting = true
+			return s
+		}()}, want: ErrSandboxDeleting, committed: &reference},
+		{name: "already committed but epoch advanced", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {
+			s := suspending()
+			s.Committed = &reference
+			s.PlacementEpoch = 4
+			return s
+		}()}, want: ErrStaleEpoch, committed: &reference},
+		{name: "already committed but suspension withdrawn", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {
+			s := suspending()
+			s.Committed = &reference
+			s.SuspendOperationID = ""
+			return s
+		}()}, want: ErrNotSuspending, committed: &reference},
+		{name: "already committed but another suspension requested", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {
+			s := suspending()
+			s.Committed = &reference
+			s.SuspendOperationID = "op-2"
+			return s
+		}()}, want: ErrNotSuspending, committed: &reference},
 		{name: "sandbox gone", sandboxes: &fakeSandboxes{}, want: ErrSandboxNotFound},
 		{name: "sandbox replaced", sandboxes: &fakeSandboxes{state: suspending()}, uid: "7c9e6679-7425-40de-944b-e07fc1f90ae7", want: ErrSandboxReplaced, committed: &previous},
 		{name: "deleting", sandboxes: &fakeSandboxes{state: func() *SandboxCheckpointState {

@@ -34,7 +34,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - A conditional checkpoint-reference commit helper. It updates a Sandbox's
   committed-checkpoint reference only with UID and resource-version
   preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
-  older generations, and is idempotent after a lost reply. It is an interface
+  older generations, and is idempotent after a lost reply only while the
+  Sandbox is not being deleted, is still at the reference's placement epoch,
+  and still requests suspension by its operation. It is an interface
   tested against a fake; the Sandbox controller implementation is separate.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
