@@ -97,15 +97,15 @@ Pod name, namespace, UID, image, or error text becomes a label.
 | Metric | Labels | Meaning |
 | --- | --- | --- |
 | `brie_node_admission_decisions_total` | `reason`: `Admitted`, `UnsupportedPod`, `RuntimeClassOverheadMismatch`, `UnsupportedResources`, `InsufficientResources`, `Other` | Admission decisions |
-| `brie_node_reserved_{cpu_cores,memory_bytes,executions}` | none | Reservations, including overhead |
-| `brie_node_budget_{cpu_cores,memory_bytes,executions}` | none | Configured envelope |
+| `brie_node_reserved_{cpu_cores,memory_bytes,executions}` | none | Unfinished journal reservations, including overhead; no samples until the first journal save |
+| `brie_node_budget_{cpu_cores,memory_bytes,executions}` | none | Configured envelope; no samples until set |
 | `brie_node_last_complete_reconcile_age_seconds` | none | Age of the last error-free pass; `NaN` before the first |
 | `brie_node_admission_barrier` | `cause`: `IncompletePass`, `UnresolvedExecution`, `RuntimeUnhealthy`, `RecoveryRequired`, `Other` | 1 for the active cause; no samples until first observed |
-| `brie_node_oldest_pending_stage_age_seconds` | `stage`: `reserved`, `sandbox-pending`, `container-pending`, `start-pending` | Oldest pending record per stage; no sample when none is pending |
+| `brie_node_oldest_pending_stage_age_seconds` | `stage`: `reserved`, `sandbox-pending`, `container-pending`, `start-pending` | Oldest pending record per stage; `NaN` when a pending record's entry time is unknown; no sample when none is pending |
 | `brie_node_cri_request_duration_seconds` | `method`: known CRI methods or `other` | CRI call latency |
 | `brie_node_cri_request_errors_total` | `method`, `code` (gRPC code) | CRI call errors |
 | `brie_node_image_pull_duration_seconds`, `brie_node_image_pull_failures_total` | none | `PullImage` duration and failures |
-| `brie_node_journal_{records,bytes}` and `_limit` | none | Journal size against its 10,000-record and 4 MiB bounds |
+| `brie_node_journal_{records,bytes}` and `_limit` | none | Journal size after the last successful save against its 10,000-record and 4 MiB bounds; no samples until the first save |
 | `brie_node_lease_renewal_failures_total` | none | Failed Lease renewals |
 | `brie_node_probe_results_total` | `probe`, `handler`, `result` | Probe outcomes |
 | `brie_node_container_log_rotations_total` | `result`: `rotated`, `reopen_failed`, `failed` | Log rotation attempts |
@@ -113,8 +113,9 @@ Pod name, namespace, UID, image, or error text becomes a label.
 
 Go runtime and process collectors are also registered. CRI latency, errors,
 and pull metrics come from an observer installed on a `cri.Client`
-(`SetObserver`); the other agent signals need executor hooks (see "Executor
-hooks" below).
+(`SetObserver`); the other agent signals come from executor hooks (see
+"Executor hooks" below). A gauge that was never set is not exported, so a
+missing sample means "not observed", never zero.
 
 ## Events
 
@@ -125,7 +126,8 @@ as host. Reasons are stable:
 | Reason | Object | Type |
 | --- | --- | --- |
 | Published admission reason, such as `UnsupportedPod` or `InsufficientResources` | Pod | Warning |
-| `ImagePullFailed` | Pod | Warning |
+| `ImagePullFailed`, `ImagePullBackOff` | Pod | Warning |
+| `ExecutionBlocked` condition reason, such as `ExecutionConfigChanged` | Pod | Warning |
 | `CleanupBlocked` | Pod | Warning |
 | `ReadinessProbeFailed`, `LivenessProbeFailed` | Pod | Warning |
 | `AdmissionBarrierRaised` | Node | Warning |
@@ -158,6 +160,14 @@ default. HTTP probes send `User-Agent: kube-probe/brie`, use no proxy, read at
 most 10 KiB of the body, treat 200-399 as success, and do not follow redirects
 to another host (such a redirect counts as success, as in kubelet).
 
+With `--enable-probes`, the executor adds a Pod to the manager when it observes
+its container running, removes it on deletion, terminal phase, or container
+exit, and gates `Ready` and `ContainersReady` on `Status.Ready` for a Pod with
+a readiness probe; a liveness failure stops the container through CRI and
+fails the Pod (see `docs/pod-profile.md`). Exec probes use their own CRI client
+with a two-minute deadline and 16 call slots. The manager tracks at most
+`--max-pods` Pods.
+
 Readiness starts false and becomes true after `successThreshold` consecutive
 successes. Liveness failure latches after `failureThreshold` consecutive
 failures; the manager never restarts or stops anything. A timeout or a non-zero
@@ -189,7 +199,7 @@ cleanup is disabled; the executor does not provide one yet.
 
 ## Agent flags
 
-All services are off by default. Serving, Events, and rotation require
+All services are off by default. Serving, Events, probes, and rotation require
 `--enable-workloads` and its execution configuration; `--log-format` requires
 `--run`.
 
@@ -200,7 +210,8 @@ All services are off by default. Serving, Events, and rotation require
 | `--serving-address` | `:10250` | HTTPS listen address |
 | `--tls-cert-file`, `--tls-private-key-file` | none | Absolute PEM serving certificate and key (required with serving) |
 | `--client-ca-file` | none | Absolute PEM CA bundle for client certificates (required with serving) |
-| `--enable-events` | off | Record bounded Events; today only barrier entry and exit |
+| `--enable-events` | off | Record bounded Events (see "Events") |
+| `--enable-probes` | off | Accept, run, and enforce readiness and liveness probes (see "Probes") |
 | `--container-log-max-size` | none | Enables rotation above this size, such as `10Mi` |
 | `--container-log-max-files` | `5` | Files kept per container, including the current one |
 
@@ -211,46 +222,49 @@ The serving TLS files are read once at startup and are not reloaded.
 
 What the wiring feeds today: CRI latency, errors, and pull metrics from every
 Brie CRI client; the configured budget; the last complete pass age; Lease
-renewal failures; and the barrier cause (`RecoveryRequired`,
-`RuntimeUnhealthy`, or `IncompletePass`) with Events when it changes. The
-other signals need the executor hooks below.
+renewal failures; the barrier cause (`RecoveryRequired`, `RuntimeUnhealthy`,
+or `IncompletePass`) with Events when it changes; admission decisions by
+reason, with a Pod Event for each published refusal; reservations, journal
+size, and pending-stage age after each journal save; Pod Events for image pull
+failure and backoff (with the gRPC code, never the image reference or runtime
+error text), for a newly published `ExecutionBlocked` condition, and for
+cleanup that waits for deletion or runtime evidence; and, with
+`--enable-probes`, probe results and a `LivenessProbeFailed` Event.
 
-## Executor hooks still required
+## Executor hooks
 
-`nodeagent.ExecuteObserved` passes `ExecutionHooks` (CRI observer, Lease
-renewal, pass result, readiness-gate inputs) into the executor. A later stage
-must add these hooks before the corresponding signals exist:
+`nodeagent.ExecuteObserved` passes `ExecutionHooks` into the executor. Each
+hook observes a decision the executor already made and must not block:
 
-1. Probes feeding readiness. When a container is observed running, call
-   `probe.Manager.Add` with the Pod UID, the sandbox's Pod IP, the container
-   ID and start time, the declared ports, and the probes; call `Remove` when
-   the execution stops or is cleaned up. In Pod status publication, set
-   `ContainersReady` and `Ready` true only when `Status.Ready` is true for a
-   Pod with a readiness probe. On `Status.LivenessFailed`, stop the container
-   with the Pod's grace period, publish phase `Failed` with reason
-   `LivenessProbeFailed`, record `ProbeFailed`, and never restart. Exec probes
-   need their own CRI client with a timeout above 60 seconds. Only then pass
-   `ProfileProbes` to `ValidatePodProfile`.
-2. Admission decisions. At each decision of DESIGN section 7.2, call
-   `metrics.AdmissionDecision` with the published reason (`Admitted` once the
-   `reserved` record is committed) and `events.PodRefused` for refusals.
-3. Pull failures. Where `PullImage` fails for a Pod, call
-   `events.ImagePullFailed` with the gRPC code, not the image reference. Pull
-   duration and failure metrics already come from the CRI observer.
-4. Cleanup blocked. Where cleanup waits for positive deletion evidence (DESIGN
-   section 6.3), call `events.CleanupBlocked`.
-5. Reservations and journal size. After each journal save, call
-   `metrics.SetReservations` with unfinished CPU, memory, and record count, and
-   `metrics.SetJournal` with the record count and encoded bytes.
-6. Pending stage age. `metrics.SetPendingStages` needs the time each record
-   entered its pending stage, which the journal does not record; adding it is
-   a journal schema change.
-7. Barrier cause detail. `UnresolvedExecution` is never reported because the
+| Hook | Call site | Fed to |
+| --- | --- | --- |
+| `CRI` | every executor CRI client | CRI and pull metrics |
+| `LeaseRenewal`, `Pass`, `Health` | Lease loop, end of each pass, health loop | Lease failures, last pass age, barrier metric and Events |
+| `Admission` | each published decision of DESIGN section 7.2: `Admitted` after the `reserved` record is saved, a refusal after its status is published | `admission_decisions_total`; refusal Event |
+| `Journal` | every successful journal save | reservations, journal size, pending-stage age |
+| `ImagePullFailed` | a Pod's image wait reports `ErrImagePull` (once per failure) or `ImagePullBackOff` | `ImagePullFailed` or `ImagePullBackOff` Event |
+| `ExecutionBlocked` | the `brie.dev/ExecutionBlocked` condition is newly written | Event with the condition reason |
+| `CleanupBlocked` | cleanup of an ambiguous execution, a deletion without usable list evidence, or a deleted Pod whose sandbox creation is unresolved | `CleanupBlocked` Event |
+| `ProbeResult`, `LivenessFailed` | probe outcomes; a Pod failed after its liveness probe failed | `probe_results_total`; `LivenessProbeFailed` Event |
+
+Pending-stage age needs the time a record entered its stage. Each journal
+record carries `PendingStage` and `PendingSince`, stamped by the save that
+commits a pending stage before its CRI call and cleared when it leaves. A
+pending record from an older journal has no entry time; it keeps
+`PendingSince` empty until it leaves the stage, and its stage's age is `NaN`.
+These fields are optional, so the journal version is unchanged; an older agent
+refuses a journal that carries them, as it refuses any unknown field.
+
+Still missing:
+
+1. Barrier cause detail. `UnresolvedExecution` is never reported because the
    executor folds unresolved executions into its pass error and recovery flag;
    the pass hook must report the cause to separate it.
-8. Finished Pods for log cleanup. Provide `logrotation.FinishedPods` from the
+2. Readiness failure Events. `ReadinessProbeFailed` exists in `internal/events`
+   but no hook records it.
+3. Finished Pods for log cleanup. Provide `logrotation.FinishedPods` from the
    reconcile loop, because the journal map is not safe for concurrent reads.
    Until then, log directory cleanup stays disabled.
-9. Extension states. The lifecycle extension must provide
+4. Extension states. The lifecycle extension must provide
    `serving.ExtensionStates` and call `probe.Manager.Suspend` and `Resume`.
    Brie has no lifecycle extension yet, so no state is ever reported.

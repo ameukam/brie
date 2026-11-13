@@ -7,14 +7,31 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Opt-in `--enable-probes` (requires `--enable-workloads`) accepts the
+  `ProfileProbes` increment in execution mode. The agent probes a container it
+  observes running, publishes `Ready` and `ContainersReady` for a Pod with a
+  readiness probe only after that probe succeeds, and after a liveness failure
+  stops the container through CRI with the Pod's grace period and publishes it
+  `Failed` with reason `LivenessProbeFailed`, never restarting it. Probes stop
+  when the Pod is deleted, becomes terminal, or exits. Tested only against a
+  fake CRI runtime and a fake exec prober.
+- Executor hooks now feed the opt-in metrics and Events: admission decisions by
+  reason with a Pod Event per refusal; reservations, journal records and bytes,
+  and pending-stage age after each journal save; `ImagePullFailed` and
+  `ImagePullBackOff` Events carrying the gRPC code, not the image reference;
+  an Event when the `ExecutionBlocked` condition is published; `CleanupBlocked`
+  Events when cleanup waits for deletion or runtime evidence; probe results;
+  and a `LivenessProbeFailed` Event. Journal records gain optional
+  `PendingStage` and `PendingSince` fields; a pending record from an older
+  journal reports its age as `NaN` instead of a guessed time.
+
 - Opt-in `brie-node` flags, all off by default: `--log-format=json`;
   `--enable-serving` with `--serving-address`, `--tls-cert-file`,
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
   `--container-log-max-size` with `--container-log-max-files`. Serving, Events,
   and rotation require `--enable-workloads`. The executor now exposes
   observation hooks for CRI calls, Lease renewals, reconciliation passes, and
-  barrier inputs. Probes, admission reason metrics, and Pod Events still need
-  executor hooks; see [docs/observability.md](docs/observability.md). Tested
+  barrier inputs; see [docs/observability.md](docs/observability.md). Tested
   only against fakes.
 - Size-based container log rotation (`internal/logrotation`) through CRI
   `ReopenContainerLog`, with bounded max size and max files, restoring the log
@@ -25,8 +42,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
   Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
   accepts bounded probes and declared TCP ports only with the new
-  `ProfileProbes` feature, which execution mode does not pass yet, so Pods with
-  probes are still refused there.
+  `ProfileProbes` feature, which execution mode passes only with
+  `--enable-probes`.
 - A bounded Kubernetes Events recorder (`internal/events`) for admission
   refusals, image pull failures, barrier entry and exit, blocked cleanup, and
   probe failures, with local deduplication, an agent-wide rate limit, and
@@ -36,7 +53,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
   pending stage age, CRI latency and errors by method, image pulls, journal
   bounds, Lease renewal failures, probes, log rotation, and Events, with
   bounded label values and no tenant data in labels. CRI clients accept a call
-  observer. Only CRI metrics can be fed without further executor hooks.
+  observer. A gauge that was never set is not exported.
 - A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
   1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
   authorization using kubelet's node subresource mapping, `/healthz`,

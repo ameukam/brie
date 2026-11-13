@@ -53,11 +53,22 @@ are not runtime configuration or proof of ownership.
 
 `ValidatePodProfile` accepts readiness and liveness probes, and the TCP
 container ports they name, only when the caller passes the `ProfileProbes`
-feature. The execution path does not pass it yet: it does not run probes or
-gate readiness on them, so it still refuses every Pod with probes or port
-declarations. A caller may pass the feature only once it runs the
-`internal/probe` manager, publishes `Ready` from probe results, and fails the
-Pod after a liveness failure.
+feature. The execution path passes it only with `--enable-probes`; without
+that flag it refuses every Pod with probes or port declarations. With the
+flag, the agent starts the `internal/probe` manager for a container it
+observes running and stops it when the Pod is deleted, becomes terminal, or
+its container exits. A Pod with a readiness probe publishes `Ready` and
+`ContainersReady` true only after its readiness probe succeeded; a probe that
+has not run never counts as success. After a liveness failure the agent
+re-reads the Pod, stops the container through CRI `StopContainer` with the
+Pod's `terminationGracePeriodSeconds`, and publishes phase `Failed` with
+reason `LivenessProbeFailed`, even if the container then exits 0. The
+liveness verdict is held in memory only: if the agent restarts between the
+stop and the status write, the Pod is published from the container's exit
+code without that reason. An agent restarted without `--enable-probes` runs
+no probes, so a Pod admitted with a readiness probe stays not ready and its
+liveness probe is not enforced. This is tested against a fake CRI runtime and
+a fake exec prober only.
 
 With the feature:
 
