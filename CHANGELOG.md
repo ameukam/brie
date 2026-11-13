@@ -36,6 +36,50 @@ versioning. Dated nightly prereleases are development builds, not stable release
   preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
   older generations, and is idempotent after a lost reply. It is an interface
   tested against a fake; the Sandbox controller implementation is separate.
+||||||| a2365eb
+- Opt-in `brie-node` flags, all off by default: `--log-format=json`;
+  `--enable-serving` with `--serving-address`, `--tls-cert-file`,
+  `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
+  `--container-log-max-size` with `--container-log-max-files`. Serving, Events,
+  and rotation require `--enable-workloads`. The executor now exposes
+  observation hooks for CRI calls, Lease renewals, reconciliation passes, and
+  barrier inputs. Probes, admission reason metrics, and Pod Events still need
+  executor hooks; see [docs/observability.md](docs/observability.md). Tested
+  only against fakes.
+- Size-based container log rotation (`internal/logrotation`) through CRI
+  `ReopenContainerLog`, with bounded max size and max files, restoring the log
+  name when the runtime cannot reopen it, and removal of Pod log directories
+  only for journal-finished Pods with no remaining sandbox. Symlinks and paths
+  outside the Pod log directory are refused.
+- A probe manager (`internal/probe`) for readiness and liveness probes: exec
+  through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
+  Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
+  accepts bounded probes and declared TCP ports only with the new
+  `ProfileProbes` feature, which execution mode does not pass yet, so Pods with
+  probes are still refused there.
+- A bounded Kubernetes Events recorder (`internal/events`) for admission
+  refusals, image pull failures, barrier entry and exit, blocked cleanup, and
+  probe failures, with local deduplication, an agent-wide rate limit, and
+  client-go correlation. It needs no RBAC beyond the Node authorizer.
+- An agent Prometheus registry (`internal/metrics`) for admission decisions,
+  reservations against the budget, reconciliation pass age, barrier cause,
+  pending stage age, CRI latency and errors by method, image pulls, journal
+  bounds, Lease renewal failures, probes, log rotation, and Events, with
+  bounded label values and no tenant data in labels. CRI clients accept a call
+  observer. Only CRI metrics can be fed without further executor hooks.
+- A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
+  1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
+  authorization using kubelet's node subresource mapping, `/healthz`,
+  `/metrics`, bounded `/containerLogs`, and `/exec`, `/attach`, and
+  `/portForward` proxied to CRI streaming URLs. Review errors refuse requests,
+  and a sandbox in a lifecycle-extension state other than running is refused
+  without being resumed. CRI `Exec`, `Attach`, `PortForward`, `ExecSync`, and
+  `ReopenContainerLog` client calls support it. Not yet wired into the agent;
+  tested only against fakes. See [docs/observability.md](docs/observability.md).
+- A structured JSON agent logger (`internal/agentlog`) with Pod UID, operation
+  ID, and journal stage fields, key-based redaction of environment values,
+  commands, arguments, request bodies, and credentials, and rate limiting of
+  repeated warnings and errors. It is not yet the default agent log format.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled

@@ -72,6 +72,7 @@ func (e *executor) assignedPods(ctx context.Context) ([]corev1.Pod, string, erro
 func (e *executor) reconcile(ctx context.Context) (retErr error) {
 	defer func() {
 		e.synced.Store(retErr == nil)
+		e.hooks.passFinished(retErr)
 	}()
 	pods, listVersion, err := e.assignedPods(ctx)
 	if err != nil {

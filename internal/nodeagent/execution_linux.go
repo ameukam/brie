@@ -39,11 +39,17 @@ type executor struct {
 	recovery atomic.Bool
 	network  string
 	logger   *log.Logger
+	hooks    ExecutionHooks
 }
 
 // Execute explicitly enables scheduling and CRI execution for the restricted
 // profile. It never directly accesses a VMM and does not kill workloads on exit.
-func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfig string, stderr io.Writer) (retErr error) {
+func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfig string, stderr io.Writer) error {
+	return ExecuteObserved(ctx, node, config, kubeconfig, stderr, ExecutionHooks{})
+}
+
+// ExecuteObserved is Execute with observation hooks.
+func ExecuteObserved(ctx context.Context, node Config, config ExecutionConfig, kubeconfig string, stderr io.Writer, hooks ExecutionHooks) (retErr error) {
 	if err := node.Validate(); err != nil {
 		return fmt.Errorf("validate agent configuration: %w", err)
 	}
@@ -80,9 +86,10 @@ func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfi
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, health.Close()) }()
+	hooks.observeCRI(workloads, health)
 	agent := &executor{
 		node: node, config: config, api: api, journal: journal, runtime: workloads, health: health,
-		logger: log.New(stderr, "brie-node: ", 0),
+		logger: log.New(stderr, "brie-node: ", 0), hooks: hooks,
 	}
 	if err := agent.initialize(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -174,7 +181,9 @@ func (e *executor) run(ctx context.Context) error {
 		}
 	}
 	go loop(heartbeatInterval, func(ctx context.Context) error {
-		return renewLease(ctx, e.api.CoordinationV1().Leases(leaseNamespace), e.node.NodeName, e.nodeUID)
+		err := renewLease(ctx, e.api.CoordinationV1().Leases(leaseNamespace), e.node.NodeName, e.nodeUID)
+		e.hooks.leaseRenewed(err)
+		return err
 	})
 	go loop(5*time.Second, e.updateHealth)
 	go loop(2*time.Second, e.reconcile)
@@ -243,6 +252,7 @@ func (e *executor) updateHealth(ctx context.Context) (retErr error) {
 		e.healthy.Store(false)
 	}
 	ready := e.healthy.Load() && e.synced.Load() && !e.recovery.Load()
+	e.hooks.healthUpdated(HealthState{RuntimeHealthy: e.healthy.Load(), Synced: e.synced.Load(), RecoveryRequired: e.recovery.Load()})
 	statusErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		node, getErr := nodes.Get(ctx, e.node.NodeName, metav1.GetOptions{})
 		if getErr != nil {

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,7 +122,12 @@ func TestExecuteAPITransportAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- Execute(ctx, e.node, e.config, kubeconfig, io.Discard) }()
+	var criCalls, leaseRenewals atomic.Int32
+	hooks := ExecutionHooks{
+		CRI:          func(string, time.Duration, error) { criCalls.Add(1) },
+		LeaseRenewal: func(error) { leaseRenewals.Add(1) },
+	}
+	go func() { done <- ExecuteObserved(ctx, e.node, e.config, kubeconfig, io.Discard, hooks) }()
 	seen := make(map[string]bool)
 	for len(seen) < 3 {
 		select {
@@ -136,5 +142,8 @@ func TestExecuteAPITransportAndShutdown(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+	if criCalls.Load() == 0 || leaseRenewals.Load() == 0 {
+		t.Fatalf("hooks observed %d CRI calls and %d Lease renewals", criCalls.Load(), leaseRenewals.Load())
 	}
 }
