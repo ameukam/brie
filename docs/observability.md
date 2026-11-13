@@ -198,9 +198,11 @@ seconds. When the runtime-reported log file, which must be a regular file
 directly inside the Pod's log directory, exceeds the maximum size (1 MiB to
 10 GiB), it removes the oldest rotated files so that at most `max files`
 remain including the current one (2 to 100), renames the log to
-`<name>.<UTC YYYYMMDD-HHMMSS>`, and calls CRI `ReopenContainerLog`. If the
-runtime cannot reopen the log, the rename is undone so the runtime keeps
-writing to the same name. Rotated files are not compressed. Exited containers
+`<name>.<UTC YYYYMMDD-HHMMSS>`, and calls CRI `ReopenContainerLog`. A reopen
+error is ambiguous, because the runtime may have reopened the log and lost the
+reply. Brie then restores the original name with a hard link, which never
+replaces an existing file: if the runtime already created a new current log,
+both files are kept; otherwise the runtime keeps writing to the same name. Rotated files are not compressed. Exited containers
 are not rotated.
 
 Directory cleanup removes `<pod-log-dir>/<sha256(UID)>` only for UIDs the
