@@ -68,15 +68,20 @@ func (h *hookCalls) hooks() ExecutionHooks {
 	}
 }
 
-// probeExecer answers exec probes with a configurable exit code.
+// probeExecer answers exec probes with a configurable exit code. With
+// failContainer set, only probes of that container fail, with exit code 1.
 type probeExecer struct {
-	mu   sync.Mutex
-	exit int32
+	mu            sync.Mutex
+	exit          int32
+	failContainer string
 }
 
-func (p *probeExecer) ExecSync(context.Context, string, []string, int64) (*cri.ExecSyncResult, error) {
+func (p *probeExecer) ExecSync(_ context.Context, containerID string, _ []string, _ int64) (*cri.ExecSyncResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.failContainer != "" && containerID == p.failContainer {
+		return &cri.ExecSyncResult{ExitCode: 1}, nil
+	}
 	return &cri.ExecSyncResult{ExitCode: p.exit}, nil
 }
 
