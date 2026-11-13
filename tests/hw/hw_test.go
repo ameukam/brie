@@ -243,7 +243,7 @@ func ownedLab() []mockResource {
 	}
 }
 
-var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh", "fence.sh"}
+var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh", "fence.sh", "run-on-host.sh"}
 
 func TestRequiredInputs(t *testing.T) {
 	for _, script := range scripts {

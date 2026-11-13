@@ -94,3 +94,38 @@ evidence records why the fence is unverified.
 The fence does not stop an authorized principal from starting the instance
 again; evidence describes one observed point in time. It has never been run
 against a real instance.
+
+## Host installation (D4, D9, D11)
+
+Copy `checksums.template`, verify every URL and SHA-256 against the upstream
+releases yourself, and fill in all placeholders. The scripts refuse any
+placeholder, a D4 version other than the pinned one, non-HTTPS URLs or hosts
+other than GitHub releases and `dl.k8s.io`, URLs that do not name their
+version, malformed digests, and duplicate records. Check a file locally with
+`install-host.sh --check-only FILE` and `install-control-plane.sh --check-only FILE`.
+
+`run-on-host.sh INSTANCE ZONE SCRIPT [FILE...]` refuses instances without the
+run label, copies the script, `checksums.sh`, and the input files over IAP
+SSH, and runs the script as root.
+
+`install-host.sh CHECKSUMS` requires root, Arm64, Ubuntu 24.04, and `/dev/kvm`.
+It installs containerd 2.4.2, Kata 4.3.1 (whose Firecracker must report
+1.17.0), CNI plugins 1.9.1, and crictl 1.37.0; writes the D9 digest manifest
+`/etc/brie/hw-digests.sha256` from the operator's `binary` records; and verifies
+`firecracker`, `jailer`, `containerd-shim-kata-v2`, and `kata-runtime` against
+it before configuring containerd. Re-verify later with
+`install-host.sh --verify-manifest`. It configures a `kata-fc` runtime on a
+loopback devmapper thin pool (16 GiB data, 256 MiB metadata, recreated at boot)
+and a bridge CNI template filled from the Pod CIDR Brie sends through CRI. It
+records the Kata Firecracker settings `jailer_path` and
+`disable_guest_seccomp` without changing them. Evidence goes to
+`/var/lib/brie-hw/evidence/install-host.txt` with a SHA-256 file.
+
+`install-control-plane.sh CHECKSUMS` installs containerd with runc and kubeadm,
+kubelet, and kubectl 1.37.x from `dl.k8s.io`, runs `kubeadm init` with the Node
+authorizer, NodeRestriction, and kube-proxy in iptables mode, verifies those
+settings, and writes a bridge CNI configuration for the control-plane Pod CIDR.
+Its evidence records versions and settings, never a kubeconfig or token.
+
+Not covered: Pod routes between hosts, kube-proxy on Brie workers, Brie node
+credentials, and installing `brie-node` itself.
