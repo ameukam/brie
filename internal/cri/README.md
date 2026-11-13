@@ -18,6 +18,11 @@ inventory. Separate calls are not an atomic snapshot and cannot authorize cleanu
 See the [initial Pod profile](../../docs/pod-profile.md) for the next execution
 boundary and identity requirements.
 
+`ListImages`, `RemoveImage`, and `ImageFsInfo` serve image collection. An image
+list fails without partial results on invalid, duplicate, or oversized
+responses; it says which images exist, not which are unused. `RemoveImage`
+succeeds for an absent image, so it is never an observation.
+
 Lifecycle calls have no automatic retries. A failed create/start may already
 have committed; callers must retain durable intent and reconcile identities
 before proceeding. `DefiniteRejection` identifies status codes that only a

@@ -116,6 +116,9 @@ brie-node --run --enable-workloads \
   --state-dir=/var/lib/brie/execution --pod-log-dir=/var/log/brie/pods
 ```
 
+Add `--image-gc-threshold=<bytes>` to enable image collection, described under
+[Lifecycle and failure behavior](#lifecycle-and-failure-behavior).
+
 Addresses and budgets are illustrative, not host discovery or sizing guidance.
 Reserve host services before selecting budgets; per-Pod VM overhead must come
 from measurement. Never share the state directory between hosts. It must be
@@ -206,6 +209,31 @@ seconds up to five minutes. A failed or slow pull never holds a creation worker,
 changes Node readiness, or blocks other admissions. Pod intent is read again
 after the image wait and before the sandbox is created, so a Pod deleted during
 its pull never reaches the runtime. Pull Secrets remain unsupported.
+
+Image collection is disabled by default. With `--image-gc-threshold=<bytes>`,
+such as `50Gi`, the agent checks every five minutes whether the image filesystem
+usage reported by CRI `ImageFsInfo` exceeds the threshold and, if so, removes
+images through CRI `RemoveImage`, largest first, until the reported usage minus
+the removed sizes is at or below it. An image is removed only when all of these
+hold in one pass:
+
+- The CRI image filesystem, image, sandbox, and container lists all succeeded.
+  A failed or partial list removes nothing.
+- The last reconciliation pass completed and no execution is unresolved.
+- The runtime does not pin the image. The sandbox inventory does not name the
+  sandbox image, so collection refuses to run while sandboxes exist and no
+  listed image is pinned.
+- No container names it by ID, reference, or digest, and no unfinished journal
+  record names its reference. A digest also matches the same digest in another
+  repository. Collection refuses to run while an unfinished record written by
+  an earlier agent has no image reference.
+- The image was already unreferenced at a pass at least five minutes earlier.
+
+The reported usage is the runtime's view of its image store, not a measurement
+of a devmapper thin pool. Choose the threshold from measured pool usage;
+collection behavior against a real thin pool is unqualified. Retained checkpoints
+and templates are not tracked yet, so do not enable collection on hosts that
+keep them.
 
 Pod status reports observed pending/running/unknown/exited state, IP, readiness,
 exit code, and runtime identity; restartPolicy Never never restarts an exit.
