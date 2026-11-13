@@ -13,6 +13,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
   the workload container; the host reaches it through CRI ExecSync, so Kata
   stays the only guest-control channel. Nothing in the node agent calls it,
   and it is tested only against fakes and local sockets, not on Kata.
+- A credential-free sample cooperative workload, `brie-counter`, with an
+  unbuilt `scratch` image Dockerfile in `examples/counter`. It fsyncs every
+  acknowledged increment to a state file, stops admitting work at prepare,
+  reports its count as the safe point and acknowledged-request watermark, and
+  on resume verifies the state file, rebinds identity, and refreshes entropy
+  before reopening. It does not hibernate anything by itself.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
