@@ -22,7 +22,7 @@ versioning. Dated nightly prereleases are development builds, not stable release
   kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
   operator-filled checksums file that refuses placeholders, and the host
   install verifies Kata, Firecracker, and jailer binaries against a node-local
-  digest manifest (D9). Only the input validation is tested; neither script has
+  digest manifest (D9) that must list each required binary exactly once. Only the input validation is tested; neither script has
   run on a host.
 - `tests/hw/fence.sh`, a provisional lab fence (D5) that stops only a host
   labelled for the run, waits for the same incarnation to report TERMINATED,
