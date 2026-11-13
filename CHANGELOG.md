@@ -280,5 +280,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   (`linux/arm64` on `devmapper`) for the `kata-fc` runtime. Without it,
   containerd 2.4.2 failed `RunPodSandbox` with `no unpack platforms defined`
   when pulling the pause image.
+- The hardware lab's M1 probes step declares container port 8080 on its probe
+  Pod. Brie's profile refused the Pod's TCP readiness probe on an undeclared
+  port. A test now checks every harness manifest against the Pod profile.
 
 [Unreleased]: https://github.com/ameukam/brie/commits/main
