@@ -72,11 +72,11 @@ func newLab(t *testing.T, state mockState) *lab {
 	wrappers := map[string]string{
 		// A race-enabled test binary otherwise sleeps one second at exit.
 		"gcloud": "#!/bin/sh\nGORACE=atexit_sleep_ms=0 BRIE_HW_MOCK_TOOL=gcloud exec '" + self + "' \"$@\"\n",
-		"date": "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\ncase \"$*\" in\n" +
-			"*+%s*) echo \"$now\" ;;\n" +
-			"*'+%Y-%m-%dT%H:%M:%SZ'*) exec '" + realDate + "' -u -d \"@$now\" +%Y-%m-%dT%H:%M:%SZ ;;\n" +
+		"date": "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\nformat=\nfor arg; do case $arg in +*) format=$arg ;; esac; done\n" +
+			"case $format in\n+%s) echo \"$now\" ;;\n+*) exec '" + realDate + "' -u -d \"@$now\" \"$format\" ;;\n" +
 			"*) echo \"mock date: unsupported $*\" >&2; exit 2 ;;\nesac\n",
-		"sleep": "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\necho $((now + $1)) >\"$BRIE_HW_MOCK_CLOCK\"\n",
+		"kubectl": "#!/bin/sh\nGORACE=atexit_sleep_ms=0 BRIE_HW_MOCK_TOOL=kubectl exec '" + self + "' \"$@\"\n",
+		"sleep":   "#!/bin/sh\nnow=$(cat \"$BRIE_HW_MOCK_CLOCK\")\necho $((now + $1)) >\"$BRIE_HW_MOCK_CLOCK\"\n",
 	}
 	for name, body := range wrappers {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
@@ -106,8 +106,10 @@ func newLab(t *testing.T, state mockState) *lab {
 	if err := os.WriteFile(l.env[mockClockEnv], []byte(fmt.Sprintf("%d\n", testClockStart)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if r := l.runCommand("sh", "-c", "command -v gcloud"); strings.TrimSpace(r.stdout) != filepath.Join(bin, "gcloud") {
-		t.Fatalf("gcloud resolves to %q, not the mock; refusing to run scripts", r.stdout)
+	for _, tool := range []string{"gcloud", "kubectl"} {
+		if r := l.runCommand("sh", "-c", "command -v "+tool); strings.TrimSpace(r.stdout) != filepath.Join(bin, tool) {
+			t.Fatalf("%s resolves to %q, not the mock; refusing to run scripts", tool, r.stdout)
+		}
 	}
 	return l
 }
@@ -243,7 +245,7 @@ func ownedLab() []mockResource {
 	}
 }
 
-var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh", "fence.sh", "run-on-host.sh"}
+var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh", "fence.sh", "run-on-host.sh", "m1-harness.sh"}
 
 func TestRequiredInputs(t *testing.T) {
 	for _, script := range scripts {

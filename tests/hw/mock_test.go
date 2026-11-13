@@ -52,9 +52,38 @@ type mockState struct {
 	// StopStatus is the status an instance reports after stop; empty means
 	// TERMINATED.
 	StopStatus string `json:"stopStatus,omitempty"`
-	// SSHOutput maps a substring of an ssh --command to its stdout.
-	SSHOutput map[string]string `json:"sshOutput,omitempty"`
-	NextID    int               `json:"nextID"`
+	// SSH answers gcloud compute ssh by its --command; Kubectl answers
+	// kubectl by its joined arguments. Unmatched calls succeed silently.
+	SSH     []mockResponse `json:"ssh,omitempty"`
+	Kubectl []mockResponse `json:"kubectl,omitempty"`
+	NextID  int            `json:"nextID"`
+}
+
+// mockResponse answers the first call containing Match. A positive Times
+// limits how many calls it answers.
+type mockResponse struct {
+	Match  string `json:"match"`
+	Output string `json:"output,omitempty"`
+	Exit   int    `json:"exit,omitempty"`
+	Times  int    `json:"times,omitempty"`
+}
+
+// respond writes the first matching response and returns its exit status.
+func respond(responses []mockResponse, call string) ([]mockResponse, int) {
+	for i, r := range responses {
+		if !strings.Contains(call, r.Match) {
+			continue
+		}
+		fmt.Print(r.Output)
+		if r.Times > 0 {
+			responses[i].Times--
+			if responses[i].Times == 0 {
+				responses = append(responses[:i], responses[i+1:]...)
+			}
+		}
+		return responses, r.Exit
+	}
+	return responses, 0
 }
 
 type mockCall struct {
@@ -70,6 +99,8 @@ func runMock(tool string, args []string) int {
 	switch tool {
 	case "gcloud":
 		return runMockGcloud(args)
+	case "kubectl":
+		return runMockKubectl(args)
 	default:
 		fmt.Fprintf(os.Stderr, "mock: unknown tool %q\n", tool)
 		return 90
@@ -170,6 +201,26 @@ func runMockGcloud(args []string) int {
 	return code
 }
 
+func runMockKubectl(args []string) int {
+	if len(args) == 0 || !strings.HasPrefix(args[0], "--kubeconfig=/") {
+		fmt.Fprintln(os.Stderr, "mock kubectl: missing explicit --kubeconfig")
+		return exitMissingProject
+	}
+	statePath := os.Getenv(mockStateEnv)
+	state, err := loadMockState(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mock kubectl: %v\n", err)
+		return 90
+	}
+	var code int
+	state.Kubectl, code = respond(state.Kubectl, strings.Join(args, " "))
+	if err := saveMockState(statePath, state); err != nil {
+		fmt.Fprintf(os.Stderr, "mock kubectl: %v\n", err)
+		return 90
+	}
+	return code
+}
+
 // resourceRef splits the command words into kind, verb, and name.
 func resourceRef(words []string) (kind, verb, name string) {
 	at := func(i int) string {
@@ -220,12 +271,11 @@ func (s *mockState) now() string {
 func (s *mockState) handle(cmd gcloudCommand) int {
 	kind, verb, name := resourceRef(cmd.words)
 	switch verb {
-	case "ssh", "scp":
-		for match, out := range s.SSHOutput {
-			if strings.Contains(cmd.flags["command"], match) {
-				fmt.Print(out)
-			}
-		}
+	case "ssh":
+		var code int
+		s.SSH, code = respond(s.SSH, cmd.flags["command"])
+		return code
+	case "scp":
 		return 0
 	case "list":
 		return s.list(kind, cmd.flags)
