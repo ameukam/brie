@@ -236,7 +236,8 @@ other signals need the executor hooks below.
 ## Executor hooks still required
 
 `nodeagent.ExecuteObserved` passes `ExecutionHooks` (CRI observer, Lease
-renewal, pass result, readiness-gate inputs) into the executor. A later stage
+renewal, pass result, readiness-gate inputs, verified execution inventory)
+into the executor. A later stage
 must add these hooks before the corresponding signals exist:
 
 1. Probes feeding readiness. When a container is observed running, call
