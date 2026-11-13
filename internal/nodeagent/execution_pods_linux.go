@@ -291,6 +291,7 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		describe := fmt.Sprintf("clean up deleted Pod %s/%s", record.Namespace, record.Name)
 		if ambiguous[uid] {
 			passFailed = true
+			e.hooks.cleanupBlocked(recordPod(record), cleanupAmbiguous)
 			report(fmt.Errorf("%s: ambiguous runtime ownership; preserving execution for recovery", describe))
 			continue
 		}
@@ -312,13 +313,16 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		if busy[uid] {
 			continue
 		}
+		deleting := pod.DeletionTimestamp != nil || terminalPod(pod)
 		if ambiguous[uid] {
 			passFailed = true
+			if deleting {
+				e.hooks.cleanupBlocked(pod, cleanupAmbiguous)
+			}
 			report(fmt.Errorf("%s: ambiguous runtime ownership; preserving execution for recovery", describe))
 			continue
 		}
 		record := records[uid]
-		deleting := pod.DeletionTimestamp != nil || terminalPod(pod)
 		if record == nil && !deleting {
 			// Admission runs serially in creation order, so an older Pod is
 			// never refused for a budget a younger Pod took in the same pass.
@@ -474,15 +478,15 @@ func (e *executor) currentPod(ctx context.Context, expected *corev1.Pod, destruc
 // without a journal record. It returns the reserved record, or nil after
 // publishing a refusal.
 func (e *executor) admitPod(ctx context.Context, pod *corev1.Pod) (*executionRecord, error) {
-	if err := ValidatePodProfile(pod, e.node.NodeName, e.config.RuntimeClass); err != nil {
-		return nil, e.publishPodStatus(ctx, pod, nil, nil, "UnsupportedPod", err.Error())
+	if err := ValidatePodProfile(pod, e.node.NodeName, e.config.RuntimeClass, e.profileFeatures()...); err != nil {
+		return nil, e.refusePod(ctx, pod, "UnsupportedPod", err.Error())
 	}
 	if !equality.Semantic.DeepEqual(pod.Spec.Overhead, e.overhead) {
-		return nil, e.publishPodStatus(ctx, pod, nil, nil, "RuntimeClassOverheadMismatch", "Pod overhead must match the pinned RuntimeClass")
+		return nil, e.refusePod(ctx, pod, "RuntimeClassOverheadMismatch", "Pod overhead must match the pinned RuntimeClass")
 	}
 	cpu, memory, err := executionResources(pod.Spec.Containers[0].Resources.Limits)
 	if err != nil {
-		return nil, e.publishPodStatus(ctx, pod, nil, nil, "UnsupportedResources", err.Error())
+		return nil, e.refusePod(ctx, pod, "UnsupportedResources", err.Error())
 	}
 	hash, err := podExecutionHash(pod)
 	if err != nil {
@@ -500,12 +504,22 @@ func (e *executor) admitPod(ctx context.Context, pod *corev1.Pod) (*executionRec
 	}
 	e.mu.Unlock()
 	if !fits {
-		return nil, e.publishPodStatus(ctx, pod, nil, nil, "InsufficientResources", "Configured CPU, memory, or Pod budget exhausted")
+		return nil, e.refusePod(ctx, pod, "InsufficientResources", "Configured CPU, memory, or Pod budget exhausted")
 	}
 	if err != nil {
 		return nil, err
 	}
+	e.hooks.admission(pod, AdmissionAdmitted, "")
 	return record, nil
+}
+
+// refusePod publishes an admission refusal and reports it once published.
+func (e *executor) refusePod(ctx context.Context, pod *corev1.Pod, reason, message string) error {
+	if err := e.publishPodStatus(ctx, pod, nil, nil, reason, message); err != nil {
+		return err
+	}
+	e.hooks.admission(pod, reason, message)
+	return nil
 }
 
 // resolveCreateRejection returns a pending stage whose create the
@@ -604,6 +618,16 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 						return err
 					}
 				}
+				if handled, err := e.enforceLiveness(ctx, runtime, pod, sandbox, container); handled {
+					return err
+				}
+				if container.State == runtimeapi.ContainerState_CONTAINER_RUNNING {
+					if err := e.trackProbes(pod, sandbox, container); err != nil {
+						return err
+					}
+				} else {
+					e.untrackProbes(record.UID)
+				}
 				return e.publishPodStatus(ctx, pod, sandbox, container, "", "")
 			}
 			if container.State == runtimeapi.ContainerState_CONTAINER_UNKNOWN {
@@ -690,6 +714,7 @@ func terminalPod(pod *corev1.Pod) bool {
 }
 
 func (e *executor) cleanupPod(ctx context.Context, runtime *cri.Client, pod *corev1.Pod, record *executionRecord, inventory *podInventory) error {
+	e.untrackProbes(string(pod.UID))
 	if record != nil {
 		if err := e.resolveCreateRejection(record, inventory); err != nil {
 			return err
@@ -731,11 +756,13 @@ func (e *executor) cleanupPod(ctx context.Context, runtime *cri.Client, pod *cor
 // authorizer rejects once the Pod is gone. A deleted Pod has no remaining
 // grace period, so the container is stopped immediately, as for force deletion.
 func (e *executor) cleanupDeleted(ctx context.Context, runtime *cri.Client, record *executionRecord, inventory *podInventory, evidence string) error {
+	e.untrackProbes(record.UID)
 	if err := e.resolveCreateRejection(record, inventory); err != nil {
 		return err
 	}
 	if record.DeletionObserved == "" {
 		if evidence == "" || len(evidence) > maxResourceVersion {
+			e.hooks.cleanupBlocked(recordPod(record), "Cleanup waits for positive deletion evidence; execution preserved")
 			return errors.New("assigned-Pod list has no usable resource version; deletion is unproven")
 		}
 		if err := e.commit(func() { record.DeletionObserved = evidence }); err != nil {
@@ -750,6 +777,7 @@ func (e *executor) cleanupDeleted(ctx context.Context, runtime *cri.Client, reco
 // destructive CRI call. Every step is idempotent.
 func (e *executor) removeExecution(ctx context.Context, runtime *cri.Client, record *executionRecord, inventory *podInventory, grace int64, authorize func(context.Context) error) error {
 	if record.Stage == "sandbox-pending" && inventory.sandbox == nil {
+		e.hooks.cleanupBlocked(recordPod(record), "Cleanup waits for runtime evidence of the unresolved sandbox creation")
 		return errors.New("sandbox creation is unresolved; deletion must wait for runtime evidence")
 	}
 	if inventory.sandbox != nil {
