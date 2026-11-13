@@ -15,3 +15,8 @@ import (
 func Execute(context.Context, Config, ExecutionConfig, string, io.Writer) error {
 	return errors.New("workload execution requires Linux")
 }
+
+// ExecuteObserved is unavailable outside Linux.
+func ExecuteObserved(context.Context, Config, ExecutionConfig, string, io.Writer, ExecutionHooks) error {
+	return errors.New("workload execution requires Linux")
+}
