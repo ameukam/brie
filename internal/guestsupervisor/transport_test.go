@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,7 +187,7 @@ func TestListen(t *testing.T) {
 	}
 
 	// A stale socket file left by a dead process is replaced.
-	first.(*net.UnixListener).SetUnlinkOnClose(false)
+	first.(*ownedListener).SetUnlinkOnClose(false)
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -200,8 +201,143 @@ func TestListen(t *testing.T) {
 	_ = second.Close()
 
 	missingDir := filepath.Join(filepath.Dir(live), "missing", "s.sock")
-	if _, err := Listen(ctx, missingDir); err == nil || !strings.Contains(err.Error(), "listen") {
+	if _, err := Listen(ctx, missingDir); err == nil || !strings.Contains(err.Error(), "lock") {
 		t.Fatalf("missing directory error = %v", err)
+	}
+}
+
+func TestListenLockFile(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(t *testing.T, lockPath string)
+		want  string
+	}{
+		{name: "directory", setup: func(t *testing.T, lockPath string) {
+			if err := os.Mkdir(lockPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "open supervisor socket lock"},
+		{name: "symlink", setup: func(t *testing.T, lockPath string) {
+			if err := os.Symlink(filepath.Join(filepath.Dir(lockPath), "target"), lockPath); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "open supervisor socket lock"},
+		{name: "group readable", setup: func(t *testing.T, lockPath string) {
+			if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(lockPath, 0o640); err != nil {
+				t.Fatal(err)
+			}
+		}, want: "private regular file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := shortSocketPath(t)
+			tt.setup(t, path+".lock")
+			if _, err := Listen(t.Context(), path); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Listen error = %v, want %q", err, tt.want)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("socket path was touched: %v", err)
+			}
+		})
+	}
+}
+
+// TestListenKeepsSocketOnInconclusiveProbe covers a live listener that does
+// not hold the lock, such as one started by an older binary: a probe that
+// fails for any reason other than a refused connection must not unlink it.
+func TestListenKeepsSocketOnInconclusiveProbe(t *testing.T) {
+	path := shortSocketPath(t)
+	live, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = live.Close() }()
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := Listen(cancelled, path); err == nil || !strings.Contains(err.Error(), "cannot tell") {
+		t.Fatalf("cancelled probe error = %v", err)
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("live socket was removed: %v", err)
+	}
+	_ = conn.Close()
+	// The failed attempt released the lock.
+	if _, err := Listen(t.Context(), path); err == nil || !strings.Contains(err.Error(), "another supervisor is listening") {
+		t.Fatalf("live socket error = %v", err)
+	}
+}
+
+func TestListenConcurrentStarters(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		stale bool
+	}{
+		{name: "fresh path"},
+		{name: "stale socket", stale: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := shortSocketPath(t)
+			if tt.stale {
+				stale, err := net.Listen("unix", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stale.(*net.UnixListener).SetUnlinkOnClose(false)
+				_ = stale.Close()
+			}
+			const starters = 8
+			results := make(chan net.Listener, starters)
+			errs := make(chan error, starters)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for range starters {
+				wg.Go(func() {
+					<-start
+					listener, err := Listen(t.Context(), path)
+					if err != nil {
+						errs <- err
+						return
+					}
+					results <- listener
+				})
+			}
+			close(start)
+			wg.Wait()
+			close(results)
+			close(errs)
+			var owners []net.Listener
+			for listener := range results {
+				owners = append(owners, listener)
+			}
+			for err := range errs {
+				if !strings.Contains(err.Error(), "another supervisor") {
+					t.Errorf("starter error = %v", err)
+				}
+			}
+			if len(owners) != 1 {
+				t.Fatalf("%d starters own the socket, want 1", len(owners))
+			}
+			defer func() { _ = owners[0].Close() }()
+			accepted := make(chan error, 1)
+			go func() {
+				conn, err := owners[0].Accept()
+				if err == nil {
+					_ = conn.Close()
+				}
+				accepted <- err
+			}()
+			conn, err := net.Dial("unix", path)
+			if err != nil {
+				t.Fatalf("owner socket unreachable: %v", err)
+			}
+			_ = conn.Close()
+			if err := <-accepted; err != nil {
+				t.Fatalf("owner did not accept: %v", err)
+			}
+		})
 	}
 }
 
