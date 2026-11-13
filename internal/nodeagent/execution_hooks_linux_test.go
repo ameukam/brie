@@ -5,13 +5,17 @@ package nodeagent
 
 import (
 	"errors"
+	"maps"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ameukam/brie/internal/execinventory"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 func TestExecutionHooksObserveBarrierInputs(t *testing.T) {
@@ -80,5 +84,60 @@ func TestAPIConfig(t *testing.T) {
 	}
 	if _, err := APIConfig(write("plain", "http://api.example.test"), "x"); err == nil || !strings.Contains(err.Error(), "HTTPS") {
 		t.Fatalf("plain HTTP accepted: %v", err)
+	}
+}
+
+// TestExecutionHooksPublishVerifiedInventory checks that only executions the
+// executor verified are published for serving and log rotation.
+func TestExecutionHooksPublishVerifiedInventory(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		modify func(service *executionRuntime, owned *runtimeapi.PodSandbox)
+		want   int
+	}{
+		{name: "verified", want: 1},
+		{name: "foreign owner with the same Pod name", want: 1, modify: func(service *executionRuntime, owned *runtimeapi.PodSandbox) {
+			labels := maps.Clone(owned.Labels)
+			labels[executionMarker] = "another-owner"
+			labels[podUIDLabel] = "foreign-uid"
+			service.sandboxes["foreign"] = &runtimeapi.PodSandbox{Id: "foreign", CreatedAt: owned.CreatedAt + 1, Labels: labels,
+				RuntimeHandler: owned.RuntimeHandler, State: owned.State,
+				Metadata: &runtimeapi.PodSandboxMetadata{Name: owned.Metadata.Name, Namespace: owned.Metadata.Namespace, Uid: "foreign-uid"}}
+		}},
+		{name: "duplicate sandbox for the UID", want: 0, modify: func(service *executionRuntime, owned *runtimeapi.PodSandbox) {
+			duplicate := proto.Clone(owned).(*runtimeapi.PodSandbox)
+			duplicate.Id = "duplicate"
+			service.sandboxes["duplicate"] = duplicate
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			reconcilePasses(t, e, 5)
+			var published [][]execinventory.Execution
+			e.hooks = ExecutionHooks{Inventory: func(executions []execinventory.Execution) { published = append(published, executions) }}
+			service.mu.Lock()
+			var owned *runtimeapi.PodSandbox
+			for _, sandbox := range service.sandboxes {
+				owned = sandbox
+			}
+			if tt.modify != nil {
+				tt.modify(service, owned)
+			}
+			service.mu.Unlock()
+			_ = e.reconcile(t.Context())
+			if len(published) != 1 || len(published[0]) != tt.want {
+				t.Fatalf("published = %+v, want one inventory of %d", published, tt.want)
+			}
+			if tt.want == 0 {
+				return
+			}
+			got := published[0][0]
+			if got.Namespace != "default" || got.Name != "app" || got.SandboxID != owned.Id || got.PodUID != owned.Metadata.Uid ||
+				got.ContainerID == "" || got.ContainerName == "" {
+				t.Fatalf("verified execution = %+v", got)
+			}
+		})
 	}
 }

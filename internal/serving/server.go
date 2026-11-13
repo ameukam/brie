@@ -60,6 +60,9 @@ type Dependencies struct {
 	API kubernetes.Interface
 	// Runtime is a CRI client dedicated to serving.
 	Runtime Runtime
+	// Executions is the executor-verified execution inventory. Only its
+	// runtime objects are served.
+	Executions Executions
 	// Gatherer supplies /metrics; nil serves an empty registry.
 	Gatherer prometheus.Gatherer
 	// States reports lifecycle-extension states; nil means none exist.
@@ -70,13 +73,14 @@ type Dependencies struct {
 
 // Server is an authenticated kubelet-compatible endpoint.
 type Server struct {
-	config  Config
-	api     kubernetes.Interface
-	runtime Runtime
-	states  ExtensionStates
-	logger  *slog.Logger
-	mux     *http.ServeMux
-	slots   chan struct{}
+	config     Config
+	api        kubernetes.Interface
+	runtime    Runtime
+	executions Executions
+	states     ExtensionStates
+	logger     *slog.Logger
+	mux        *http.ServeMux
+	slots      chan struct{}
 	// streamTransport reaches the runtime's local streaming server.
 	streamTransport http.RoundTripper
 }
@@ -100,8 +104,8 @@ func New(config Config, deps Dependencies) (*Server, error) {
 	if !filepath.IsAbs(config.LogDir) || filepath.Clean(config.LogDir) == "/" {
 		return nil, errors.New("serving requires an absolute non-root Pod log directory")
 	}
-	if deps.API == nil || deps.Runtime == nil {
-		return nil, errors.New("serving requires API and runtime clients")
+	if deps.API == nil || deps.Runtime == nil || deps.Executions == nil {
+		return nil, errors.New("serving requires API and runtime clients and the verified execution inventory")
 	}
 	if config.MaxConcurrent <= 0 {
 		config.MaxConcurrent = 64
@@ -113,7 +117,7 @@ func New(config Config, deps Dependencies) (*Server, error) {
 		deps.Logger = slog.New(slog.DiscardHandler)
 	}
 	s := &Server{
-		config: config, api: deps.API, runtime: deps.Runtime, states: deps.States, logger: deps.Logger,
+		config: config, api: deps.API, runtime: deps.Runtime, executions: deps.Executions, states: deps.States, logger: deps.Logger,
 		mux: http.NewServeMux(), slots: make(chan struct{}, config.MaxConcurrent),
 		streamTransport: &http.Transport{
 			Proxy: nil, DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
