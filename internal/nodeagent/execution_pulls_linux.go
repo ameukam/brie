@@ -6,7 +6,9 @@ package nodeagent
 import (
 	"context"
 	"errors"
+	"maps"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +28,7 @@ import (
 // imagePullDeadline per call. The image size is unknown before the pull, so
 // the deadline is one implementation constant, not a value sized to the image.
 // A failed pull backs off per image reference: the delay doubles from the base
-// up to the limit, with up to 50% added jitter.
+// up to the limit, with up to 50% added jitter, and never exceeds the limit.
 const (
 	pullWorkers       = 2
 	imagePullDeadline = 10 * time.Minute
@@ -65,10 +67,13 @@ type imagePull struct {
 type imagePuller struct {
 	client *cri.Client
 	// wake, when set, is signaled after each finished pull.
-	wake    chan<- struct{}
-	mu      sync.Mutex
-	pulls   map[string]*imagePull
-	ready   map[string]string
+	wake  chan<- struct{}
+	mu    sync.Mutex
+	pulls map[string]*imagePull
+	ready map[string]string
+	// pulled maps a Pod UID to the image ID that a successful pull returned
+	// for it. Image collection protects that ID until retain drops the UID.
+	pulled  map[string]string
 	slots   chan struct{}
 	running sync.WaitGroup
 }
@@ -76,7 +81,7 @@ type imagePuller struct {
 func newImagePuller(client *cri.Client) *imagePuller {
 	return &imagePuller{
 		client: client, pulls: make(map[string]*imagePull), ready: make(map[string]string),
-		slots: make(chan struct{}, pullWorkers),
+		pulled: make(map[string]string), slots: make(chan struct{}, pullWorkers),
 	}
 }
 
@@ -84,7 +89,7 @@ func newImagePuller(client *cri.Client) *imagePuller {
 // failures of the same image reference.
 func pullBackoff(failures int) time.Duration {
 	delay := min(pullBackoffBase<<min(failures, 5), pullBackoffLimit)
-	return delay + rand.N(delay/2+1)
+	return min(pullBackoffLimit, delay+rand.N(delay/2+1))
 }
 
 // unchanged reports whether uid already reported the current state of its
@@ -104,7 +109,8 @@ func (p *imagePuller) unchanged(uid, image string, now time.Time) bool {
 // request asks for image on behalf of uid. It returns true once a pull that uid
 // waited on succeeded; otherwise it returns the container waiting reason and
 // message to publish. ctx bounds a pull it starts and must outlive the caller's
-// operation, normally the agent's lifetime.
+// operation, normally the agent's lifetime. The caller holds e.imageGate for
+// reading, so no pull starts while image collection holds the gate.
 func (p *imagePuller) request(ctx context.Context, uid, image string, sandbox *runtimeapi.PodSandboxConfig, now time.Time) (bool, string, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -142,7 +148,7 @@ func (p *imagePuller) request(ctx context.Context, uid, image string, sandbox *r
 
 func (p *imagePuller) pull(ctx context.Context, image string, sandbox *runtimeapi.PodSandboxConfig) {
 	defer p.running.Done()
-	_, err := p.client.PullImage(ctx, image, sandbox)
+	id, err := p.client.PullImage(ctx, image, sandbox)
 	p.mu.Lock()
 	<-p.slots
 	pull := p.pulls[image]
@@ -151,6 +157,7 @@ func (p *imagePuller) pull(ctx context.Context, image string, sandbox *runtimeap
 	case err == nil:
 		for uid := range pull.waiters {
 			p.ready[uid] = image
+			p.pulled[uid] = id
 		}
 		delete(p.pulls, image)
 	case ctx.Err() == nil:
@@ -179,6 +186,11 @@ func (p *imagePuller) retain(keep func(uid string) bool) {
 	for uid := range p.ready {
 		if !keep(uid) {
 			delete(p.ready, uid)
+		}
+	}
+	for uid := range p.pulled {
+		if !keep(uid) {
+			delete(p.pulled, uid)
 		}
 	}
 	for image, pull := range p.pulls {
@@ -210,6 +222,18 @@ func pullCode(err error) string {
 		return codes.DeadlineExceeded.String()
 	}
 	return status.Code(err).String()
+}
+
+// collectionView reports whether any pull is running and returns the image
+// IDs that finished pulls returned for Pods still retained.
+func (p *imagePuller) collectionView() (bool, []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	running := false
+	for _, pull := range p.pulls {
+		running = running || pull.running
+	}
+	return running, slices.Collect(maps.Values(p.pulled))
 }
 
 // wait blocks until every started pull has finished.

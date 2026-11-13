@@ -233,12 +233,14 @@ only from matching observations, including across restart. An uncertain absent
 result blocks admission rather than triggering another create or start.
 A sandbox or container create is proven to have created nothing only when the
 runtime answered with a definite rejection (`InvalidArgument`, `NotFound`,
-`FailedPrecondition`, `PermissionDenied`, or `OutOfRange`, codes grpc-go never
-generates itself), the code is journaled, and a later complete sandbox and
-container inventory holds no object claiming the Pod. The Pod then fails with
+`FailedPrecondition`, or `OutOfRange`, codes grpc-go never generates itself),
+the code is journaled, and a later complete sandbox and container inventory
+holds no object claiming the Pod. The Pod then fails with
 `SandboxCreateRejected` or `ContainerCreateRejected` and its reservation is
 released through normal cleanup; the create is never retried. Unavailable,
-deadline, cancellation, `Unknown`, and other codes remain unresolved.
+deadline, cancellation, `Unknown`, and other codes remain unresolved, including
+`PermissionDenied`, which grpc-go also reports for an HTTP/2
+`INADEQUATE_SECURITY` stream reset or an HTTP 403 reply.
 
 Faults confined to one Pod's inputs do not change Node readiness or other
 admissions. A spec change to an admitted Pod sets the Pod condition
@@ -267,14 +269,21 @@ hold in one pass:
 
 - The CRI image filesystem, image, sandbox, and container lists all succeeded.
   A failed or partial list removes nothing.
-- The last reconciliation pass completed and no execution is unresolved.
-- The runtime does not pin the image. The sandbox inventory does not name the
-  sandbox image, so collection refuses to run while sandboxes exist and no
-  listed image is pinned.
-- No container names it by ID, reference, or digest, and no unfinished journal
-  record names its reference. A digest also matches the same digest in another
-  repository. Collection refuses to run while an unfinished record written by
-  an earlier agent has no image reference.
+- The last reconciliation pass completed, no execution is unresolved, and no
+  image pull is running. No pull starts while a collection pass runs.
+- No sandbox exists. CRI does not name the image a sandbox uses, and a pinned
+  image is not known to be that image, so collection refuses to run while any
+  sandbox exists. This keeps collection from running on a node with running
+  executions.
+- The runtime does not pin the image.
+- Every listed container's image ID or image reference matches a listed image;
+  a container without one stops the pass.
+- No container names it by ID, reference, or digest; no image pull for a Pod
+  still waiting to start returned its ID; and no retained journal record names
+  its reference. A finished record stays retained until `RemovePodSandbox`
+  succeeded for the sandbox it names. A digest also matches the same digest in
+  another repository. Collection refuses to run while a retained record written
+  by an earlier agent has no image reference.
 - The image was already unreferenced at a pass at least five minutes earlier.
 
 The reported usage is the runtime's view of its image store, not a measurement

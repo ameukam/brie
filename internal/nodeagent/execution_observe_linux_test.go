@@ -337,7 +337,7 @@ func TestExecutionHooksReportCleanupBlocked(t *testing.T) {
 			e.hooks = calls.hooks()
 			record := &executionRecord{UID: "gone-uid", Namespace: "team", Name: "gone", Hash: strings.Repeat("a", 64),
 				Stage: tt.stage, CPU: 100, Memory: 1024}
-			if err := e.commit(func() { e.journal.Records[record.UID] = record }); err != nil {
+			if err := e.commit(record, func() { e.journal.Records[record.UID] = record }); err != nil {
 				t.Fatal(err)
 			}
 			if err := e.cleanupDeleted(t.Context(), e.runtime, record, &podInventory{}, tt.evidence); err == nil {

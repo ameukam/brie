@@ -5,6 +5,8 @@ package nodeagent
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,6 +99,9 @@ func TestExecutionCreationEvidence(t *testing.T) {
 		{name: "sandbox-rejected-foreign-claim", method: "RunPodSandbox", code: codes.NotFound, foreignClaim: true, want: "unresolved"},
 		{name: "sandbox-server-deadline", method: "RunPodSandbox", code: codes.DeadlineExceeded, want: "unresolved"},
 		{name: "sandbox-unknown", method: "RunPodSandbox", code: codes.Unknown, want: "unresolved"},
+		// grpc-go also reports transport resets and HTTP 403 as PermissionDenied.
+		{name: "sandbox-permission-denied", method: "RunPodSandbox", code: codes.PermissionDenied, want: "unresolved"},
+		{name: "container-permission-denied", method: "CreateContainer", code: codes.PermissionDenied, want: "unresolved"},
 		{name: "container-rejected", method: "CreateContainer", code: codes.FailedPrecondition, want: "ContainerCreateRejected"},
 		{name: "container-rejected-restart", method: "CreateContainer", code: codes.InvalidArgument, restart: true, want: "ContainerCreateRejected"},
 		{name: "container-rejected-but-created", method: "CreateContainer", code: codes.NotFound, createOnReject: true, want: "running"},
@@ -178,10 +183,233 @@ func TestExecutionCreationEvidence(t *testing.T) {
 	}
 }
 
+// failJournal makes every later journal save fail until the returned
+// function restores the journal directory.
+func failJournal(e *executor) func() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	dir := e.journal.dir
+	e.journal.dir = filepath.Join(dir, "missing")
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.journal.dir = dir
+	}
+}
+
+// TestExecutionCreationEvidenceJournalFailure is a regression test: a create
+// rejection, or its resolution, whose journal save failed must not be used.
+// The execution stays unresolved, unpublished, and untouched until a save
+// succeeds.
+func TestExecutionCreationEvidenceJournalFailure(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		// failRecording fails the save of the rejection itself; otherwise
+		// the save of its resolution fails.
+		failRecording bool
+	}{
+		{name: "rejection-recording", failRecording: true},
+		{name: "rejection-resolution"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			service.reject = map[string]codes.Code{"CreateContainer": codes.InvalidArgument}
+			var restore func()
+			failed := make(chan func(), 1)
+			if test.failRecording {
+				var once sync.Once
+				service.beforeCreate = func(method string) {
+					if method == "CreateContainer" {
+						once.Do(func() { failed <- failJournal(e) })
+					}
+				}
+			}
+			rejected := false
+			for range 8 {
+				if err := e.reconcile(t.Context()); status.Code(err) == codes.InvalidArgument {
+					rejected = true
+					break
+				}
+			}
+			if !rejected {
+				t.Fatal("container create was not rejected")
+			}
+			if test.failRecording {
+				restore = <-failed
+			} else {
+				if record := e.record("app-uid"); record.CreateRejected != "InvalidArgument" {
+					t.Fatalf("rejection not journaled: %+v", record)
+				}
+				restore = failJournal(e)
+			}
+			for range 3 {
+				if err := e.reconcile(t.Context()); err == nil {
+					t.Fatal("pass succeeded without a journal")
+				}
+				e.mu.Lock()
+				record := *e.journal.Records["app-uid"]
+				e.mu.Unlock()
+				if record.Stage != "container-pending" ||
+					test.failRecording && record.CreateRejected != "" {
+					t.Fatalf("unjournaled creation evidence used: %+v", record)
+				}
+				pod, err := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
+				if err != nil || terminalPod(pod) || countCalls(service, "StopPodSandbox") != 0 ||
+					countCalls(service, "RemovePodSandbox") != 0 || !e.recovery.Load() {
+					t.Fatalf("execution progressed without a journaled rejection: %v %+v", err, pod.Status)
+				}
+			}
+			restore()
+			if test.failRecording {
+				// The unjournaled rejection is lost, so the create stays
+				// unresolved rather than failing the Pod.
+				for range 3 {
+					_ = e.reconcile(t.Context())
+				}
+				if record := e.record("app-uid"); record.Stage != "container-pending" || countCalls(service, "StopPodSandbox") != 0 {
+					t.Fatalf("unjournaled rejection resolved the create: %+v", record)
+				}
+				return
+			}
+			reconcilePasses(t, e, 3)
+			pod, err := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
+			if err != nil || pod.Status.Phase != corev1.PodFailed || e.record("app-uid").Stage != "finished" {
+				t.Fatalf("journaled resolution did not complete: %v %+v", err, pod.Status)
+			}
+			if calls := countCalls(service, "CreateContainer"); calls != 1 {
+				t.Fatalf("CreateContainer issued %d times", calls)
+			}
+		})
+	}
+}
+
+// TestExecutionPodFaultPublicationFailure is a regression test: a Pod fault
+// whose status publication failed is reported as an error, keeps its worker
+// fault, and is not cleared as a reported Pod fault.
+func TestExecutionPodFaultPublicationFailure(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		err   error
+		check func(error) bool
+	}{
+		{"service-unavailable", apierrors.NewServiceUnavailable("apiserver unavailable"), apierrors.IsServiceUnavailable},
+		{"forbidden", apierrors.NewForbidden(corev1.Resource("pods"), "first", errors.New("denied")), apierrors.IsForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, _ := newExecutor(t, executionPod("first"))
+			reconcilePasses(t, e, 6)
+			var failStatus atomic.Bool
+			e.api.(*fake.Clientset).PrependReactor("update", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() == "status" && failStatus.Load() {
+					return true, nil, test.err
+				}
+				return false, nil, nil
+			})
+			pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
+			pod.Spec.Containers[0].Image = "registry.example/other@sha256:" + strings.Repeat("1", 64)
+			if _, err := e.api.CoreV1().Pods("default").Update(t.Context(), pod, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			failStatus.Store(true)
+			for range 2 {
+				err := e.reconcile(t.Context())
+				if err == nil || !test.check(err) {
+					t.Fatalf("failed fault publication = %v, want the API error", err)
+				}
+				var fault *podFault
+				if errors.As(err, &fault) {
+					t.Fatalf("failed publication still classified as a Pod fault: %v", err)
+				}
+				if !e.recovery.Load() || !e.workers.outstanding(func(string) bool { return true }) {
+					t.Fatal("failed fault publication cleared as success")
+				}
+			}
+			failStatus.Store(false)
+			reconcilePasses(t, e, 2)
+			pod, _ = e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
+			if condition := blockedCondition(pod); condition == nil || condition.Reason != "ExecutionConfigChanged" {
+				t.Fatalf("fault not published after the API recovered: %+v", pod.Status)
+			}
+			if e.recovery.Load() {
+				t.Fatal("published Pod fault kept the node barrier")
+			}
+		})
+	}
+}
+
+// TestExecutionFaultScanDuringCleanupRetry is a regression test for the
+// final fault scan of a pass that does not wait: it reads the journal stage of
+// a faulted execution while the retried cleanup of that execution commits a
+// new stage. Run it with the race detector.
+func TestExecutionFaultScanDuringCleanupRetry(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		passes int
+	}{
+		{name: "retry-on-next-pass", passes: 1},
+		{name: "retry-after-repeated-scans", passes: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			reconcilePasses(t, e, 5)
+			service.mu.Lock()
+			service.failStop = true
+			service.mu.Unlock()
+			if err := e.api.CoreV1().Pods("default").Delete(t.Context(), "app", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.reconcile(t.Context()); err == nil {
+				t.Fatal("interrupted cleanup not reported")
+			}
+			for range test.passes {
+				if err := e.reconcilePass(t.Context(), false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.workers.running.Wait()
+			if !e.unfinished("app-uid") && countCalls(service, "RemovePodSandbox") != 1 {
+				t.Fatal("cleanup finished without removing the sandbox")
+			}
+			reconcilePasses(t, e, 2)
+			if e.unfinished("app-uid") || e.recovery.Load() {
+				t.Fatal("retried cleanup did not finish")
+			}
+		})
+	}
+}
+
+// TestExecutionAdmissionJournalFailure is a regression test: a reservation
+// whose journal save failed is dropped, and admission retries it later.
+func TestExecutionAdmissionJournalFailure(t *testing.T) {
+	t.Parallel()
+	e, _ := newExecutor(t, executionPod("app"))
+	restore := failJournal(e)
+	// The first pass synchronizes the inventory; admission runs after it.
+	_ = e.reconcile(t.Context())
+	if err := e.reconcile(t.Context()); err == nil || !strings.Contains(err.Error(), "execution journal") {
+		t.Fatalf("admission without a journal = %v", err)
+	}
+	if record := e.record("app-uid"); record != nil {
+		t.Fatalf("unjournaled reservation kept: %+v", record)
+	}
+	restore()
+	reconcilePasses(t, e, 6)
+	if record := e.record("app-uid"); record == nil || record.Stage != "running" {
+		t.Fatalf("admission not retried after the journal recovered: %+v", record)
+	}
+}
+
 func TestExecutionJournalRejectsInvalidCreationEvidence(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct{ name, code string }{
 		{"lost-reply-code", "Unavailable"},
+		{"transport-permission-denied", "PermissionDenied"},
 		{"unknown-code", "Bogus"},
 		{"started-stage", "InvalidArgument"},
 	} {
@@ -322,14 +550,26 @@ func containerWaiting(pod *corev1.Pod) *corev1.ContainerStateWaiting {
 	return pod.Status.ContainerStatuses[0].State.Waiting
 }
 
-// TestImagePullBackoff checks the jittered exponential pull backoff bounds.
+// TestImagePullBackoff checks the jittered pull backoff against the documented
+// bounds: from the doubled base up to 50% more, never above five minutes.
 func TestImagePullBackoff(t *testing.T) {
 	t.Parallel()
-	for failures := range 10 {
-		base := min(pullBackoffBase<<min(failures, 5), pullBackoffLimit)
-		for range 20 {
-			if delay := pullBackoff(failures); delay < base || delay > base+base/2 {
-				t.Fatalf("failure %d: delay %s outside [%s, %s]", failures, delay, base, base+base/2)
+	for _, test := range []struct {
+		failures int
+		low      time.Duration
+		high     time.Duration
+	}{
+		{failures: 0, low: 10 * time.Second, high: 15 * time.Second},
+		{failures: 1, low: 20 * time.Second, high: 30 * time.Second},
+		{failures: 3, low: 80 * time.Second, high: 120 * time.Second},
+		{failures: 4, low: 160 * time.Second, high: 240 * time.Second},
+		// Regression: jitter once pushed the capped delay to 7.5 minutes.
+		{failures: 5, low: 5 * time.Minute, high: 5 * time.Minute},
+		{failures: 9, low: 5 * time.Minute, high: 5 * time.Minute},
+	} {
+		for range 50 {
+			if delay := pullBackoff(test.failures); delay < test.low || delay > test.high || delay > pullBackoffLimit {
+				t.Fatalf("failure %d: delay %s outside [%s, %s]", test.failures, delay, test.low, test.high)
 			}
 		}
 	}

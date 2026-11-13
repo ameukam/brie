@@ -387,8 +387,7 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		e.pulls.wait()
 	}
 	faulted = e.workers.outstanding(func(uid string) bool {
-		record := e.record(uid)
-		return byUID[uid] != nil || record != nil && record.Stage != "finished"
+		return byUID[uid] != nil || e.unfinished(uid)
 	})
 	if faulted || passFailed {
 		e.recovery.Store(true)
@@ -444,13 +443,30 @@ func (e *executor) record(uid string) *executionRecord {
 	return e.journal.Records[uid]
 }
 
-// commit applies change to records and durably saves the journal. The
-// operation in flight for a Pod is the only writer of that Pod's record.
-func (e *executor) commit(change func()) error {
+// unfinished reports whether uid has a journal record that is not finished.
+// It reads the stage under e.mu because an operation still in flight for uid
+// may commit a new stage concurrently.
+func (e *executor) unfinished(uid string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	record := e.journal.Records[uid]
+	return record != nil && record.Stage != "finished"
+}
+
+// commit applies change, which may modify only record, and durably saves the
+// journal. A failed save restores record, so no later step can act on a change
+// that was never journaled. The operation in flight for a Pod is the only
+// writer of that Pod's record.
+func (e *executor) commit(record *executionRecord, change func()) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	previous := *record
 	change()
-	return e.journal.save()
+	if err := e.journal.save(); err != nil {
+		*record = previous
+		return err
+	}
+	return nil
 }
 
 // currentNode confirms that the registered Node still carries this agent's
@@ -524,7 +540,9 @@ func (e *executor) admitPod(ctx context.Context, pod *corev1.Pod) (*executionRec
 	fits = fits && e.budgetFits(cpu, memory)
 	if fits {
 		e.journal.Records[record.UID] = record
-		err = e.journal.save()
+		if err = e.journal.save(); err != nil {
+			delete(e.journal.Records, record.UID)
+		}
 	}
 	e.mu.Unlock()
 	if !fits {
@@ -554,7 +572,7 @@ func (e *executor) resolveCreateRejection(record *executionRecord, inventory *po
 		return nil
 	}
 	inventory.createRejected = false
-	return e.commit(func() {
+	return e.commit(record, func() {
 		switch record.Stage {
 		case "sandbox-pending":
 			record.Stage = "reserved"
@@ -572,7 +590,7 @@ func (e *executor) recordCreateError(record *executionRecord, err error) error {
 	if !rejected {
 		return err
 	}
-	return errors.Join(err, e.commit(func() { record.CreateRejected = code.String() }))
+	return errors.Join(err, e.commit(record, func() { record.CreateRejected = code.String() }))
 }
 
 func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *corev1.Pod, inventory *podInventory, admit bool) error {
@@ -588,7 +606,12 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		// execution is preserved without further mutation until deletion.
 		fault := &podFault{reason: "ExecutionConfigChanged",
 			message: "Pod spec no longer matches its admitted execution; delete the Pod to replace it"}
-		return errors.Join(fault, e.publishPodBlocked(ctx, pod, fault.reason, fault.message))
+		// Only a published fault is confined to the Pod; a failed publication
+		// is an ordinary error.
+		if err := e.publishPodBlocked(ctx, pod, fault.reason, fault.message); err != nil {
+			return err
+		}
+		return fault
 	}
 	if err := e.resolveCreateRejection(record, inventory); err != nil {
 		return err
@@ -617,7 +640,7 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 			return errors.New("sandbox status changed execution identity")
 		}
 		if record.SandboxID == "" && record.Stage == "sandbox-pending" {
-			if err := e.commit(func() { record.SandboxID, record.Stage, record.CreateRejected = sandbox.Id, "sandbox", "" }); err != nil {
+			if err := e.commit(record, func() { record.SandboxID, record.Stage, record.CreateRejected = sandbox.Id, "sandbox", "" }); err != nil {
 				return err
 			}
 		}
@@ -631,14 +654,14 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 				return errors.New("container status changed execution identity")
 			}
 			if record.ContainerID == "" && record.Stage == "container-pending" {
-				if err := e.commit(func() { record.ContainerID, record.Stage, record.CreateRejected = container.Id, "created", "" }); err != nil {
+				if err := e.commit(record, func() { record.ContainerID, record.Stage, record.CreateRejected = container.Id, "created", "" }); err != nil {
 					return err
 				}
 			}
 			if container.State == runtimeapi.ContainerState_CONTAINER_RUNNING ||
 				container.State == runtimeapi.ContainerState_CONTAINER_EXITED {
 				if record.Stage == "start-pending" {
-					if err := e.commit(func() { record.Stage = "running" }); err != nil {
+					if err := e.commit(record, func() { record.Stage = "running" }); err != nil {
 						return err
 					}
 				}
@@ -691,14 +714,14 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		if err := os.MkdirAll(sandbox.LogDirectory, 0750); err != nil {
 			return err
 		}
-		if err := e.commit(func() { record.Stage = "sandbox-pending" }); err != nil {
+		if err := e.commit(record, func() { record.Stage = "sandbox-pending" }); err != nil {
 			return err
 		}
 		id, err := runtime.RunPodSandbox(ctx, sandbox, e.config.RuntimeHandler)
 		if err != nil {
 			return e.recordCreateError(record, err)
 		}
-		return e.commit(func() { record.SandboxID, record.Stage = id, "sandbox" })
+		return e.commit(record, func() { record.SandboxID, record.Stage = id, "sandbox" })
 	case "sandbox":
 		if inventory.sandbox == nil {
 			return errors.New("known sandbox is absent; refusing replacement execution")
@@ -706,14 +729,14 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		if _, err := e.currentPod(ctx, pod, false); err != nil {
 			return err
 		}
-		if err := e.commit(func() { record.Stage = "container-pending" }); err != nil {
+		if err := e.commit(record, func() { record.Stage = "container-pending" }); err != nil {
 			return err
 		}
 		id, err := runtime.CreateContainer(ctx, record.SandboxID, container, sandbox)
 		if err != nil {
 			return e.recordCreateError(record, err)
 		}
-		return e.commit(func() { record.ContainerID, record.Stage = id, "created" })
+		return e.commit(record, func() { record.ContainerID, record.Stage = id, "created" })
 	case "created":
 		if inventory.container == nil {
 			return errors.New("known container is absent; refusing replacement execution")
@@ -721,13 +744,13 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		if _, err := e.currentPod(ctx, pod, false); err != nil {
 			return err
 		}
-		if err := e.commit(func() { record.Stage = "start-pending" }); err != nil {
+		if err := e.commit(record, func() { record.Stage = "start-pending" }); err != nil {
 			return err
 		}
 		if err := runtime.StartContainer(ctx, record.ContainerID); err != nil {
 			return err
 		}
-		return e.commit(func() { record.Stage = "running" })
+		return e.commit(record, func() { record.Stage = "running" })
 	default:
 		return errors.New("execution outcome remains unknown; waiting for runtime evidence without retrying mutations")
 	}
@@ -789,7 +812,7 @@ func (e *executor) cleanupDeleted(ctx context.Context, runtime *cri.Client, reco
 			e.hooks.cleanupBlocked(recordPod(record), "Cleanup waits for positive deletion evidence; execution preserved")
 			return errors.New("assigned-Pod list has no usable resource version; deletion is unproven")
 		}
-		if err := e.commit(func() { record.DeletionObserved = evidence }); err != nil {
+		if err := e.commit(record, func() { record.DeletionObserved = evidence }); err != nil {
 			return err
 		}
 	}
@@ -833,10 +856,10 @@ func (e *executor) removeExecution(ctx context.Context, runtime *cri.Client, rec
 		if err := runtime.RemovePodSandbox(ctx, inventory.sandbox.Id); err != nil {
 			return err
 		}
-		return e.commit(func() { record.Stage, record.SandboxRemoved = "finished", true })
+		return e.commit(record, func() { record.Stage, record.SandboxRemoved = "finished", true })
 	}
 	if record.Stage != "finished" {
-		return e.commit(func() { record.Stage = "finished" })
+		return e.commit(record, func() { record.Stage = "finished" })
 	}
 	return nil
 }

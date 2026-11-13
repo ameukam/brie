@@ -56,9 +56,14 @@ type executionRuntime struct {
 	// createOnReject, the object is created before the rejection is returned.
 	reject         map[string]codes.Code
 	createOnReject bool
-	pullError      error
+	// beforeCreate, when set before the first call, runs at the start of
+	// each create method without the service lock.
+	beforeCreate func(method string)
+	pullError    error
 	// pullGate, when set, holds PullImage until it is closed.
 	pullGate chan struct{}
+	// pullRef, when set, is the image ID PullImage returns.
+	pullRef string
 	// images, imageFsUsed, and removedImages back image collection;
 	// failImages names an image or list method that fails.
 	images        []*runtimeapi.Image
@@ -141,10 +146,16 @@ func (s *executionRuntime) PullImage(context.Context, *runtimeapi.PullImageReque
 	if s.pullError != nil {
 		return nil, s.pullError
 	}
+	if s.pullRef != "" {
+		return &runtimeapi.PullImageResponse{ImageRef: s.pullRef}, nil
+	}
 	return &runtimeapi.PullImageResponse{ImageRef: "sha256:image"}, nil
 }
 
 func (s *executionRuntime) RunPodSandbox(_ context.Context, request *runtimeapi.RunPodSandboxRequest) (*runtimeapi.RunPodSandboxResponse, error) {
+	if s.beforeCreate != nil {
+		s.beforeCreate("RunPodSandbox")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "RunPodSandbox")
@@ -167,6 +178,9 @@ func (s *executionRuntime) RunPodSandbox(_ context.Context, request *runtimeapi.
 }
 
 func (s *executionRuntime) CreateContainer(_ context.Context, request *runtimeapi.CreateContainerRequest) (*runtimeapi.CreateContainerResponse, error) {
+	if s.beforeCreate != nil {
+		s.beforeCreate("CreateContainer")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "CreateContainer")

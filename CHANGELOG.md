@@ -163,16 +163,19 @@ versioning. Dated nightly prereleases are development builds, not stable release
   objects. The journal schema moves to version 2; version 1 journals are
   migrated on start, and older agents refuse version 2 journals.
 - With `--enable-workloads`, a sandbox or container create that the runtime
-  definitely rejected, and that a later complete CRI inventory shows created
+  definitely rejected (`InvalidArgument`, `NotFound`, `FailedPrecondition`, or
+  `OutOfRange`), and that a later complete CRI inventory shows created
   nothing, now fails its Pod with `SandboxCreateRejected` or
   `ContainerCreateRejected` and releases the reservation instead of blocking
-  admission. Lost or interrupted replies still block admission.
+  admission. Lost or interrupted replies, and `PermissionDenied`, which
+  grpc-go also reports for transport failures, still block admission.
 - With `--enable-workloads`, the new `--image-gc-threshold` flag enables image
   collection through CRI (disabled by default). While the reported image
-  filesystem usage exceeds the threshold, images that no container or
-  unfinished execution references, that the runtime does not pin, and that were
-  unreferenced for five minutes are removed, largest first. A failed or partial
-  list removes nothing.
+  filesystem usage exceeds the threshold, images that no container, image pull,
+  or retained execution references, that the runtime does not pin, and that
+  were unreferenced for five minutes are removed, largest first. A failed or
+  partial list, a running pull, a container whose image is not identified, or
+  any existing sandbox, whose image CRI does not name, removes nothing.
 - With `--enable-workloads`, image pulls run on two bounded pull workers,
   shared by every Pod that needs the same image reference, with a ten-minute
   deadline and per-image backoff with jitter. A waiting Pod reports
