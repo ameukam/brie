@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A label-guarded hardware lab teardown in `tests/hw`: it deletes only
+  resources carrying the run's label or description marker, refuses others,
+  and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
+  explicit project, zones, run id, and spend ceiling, and never reads gcloud
+  configuration. Tested only against a mock `gcloud`; it has not run against
+  Google Cloud.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
