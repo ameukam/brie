@@ -246,7 +246,8 @@ func TestExecutionPodFaultIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 		reconcilePasses(t, e, 2)
-		if e.journal.Records["first-uid"].Stage != "finished" {
+		// The finished record is compacted once the Pod is gone.
+		if e.journal.Records["first-uid"] != nil || countCalls(service, "RemovePodSandbox") != 1 {
 			t.Fatal("blocked execution was not cleaned up on deletion")
 		}
 	})

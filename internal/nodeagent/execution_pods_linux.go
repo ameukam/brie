@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"sort"
@@ -199,6 +200,16 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 				(record.ContainerID != "" || record.Stage == "container-pending") && inventory.container == nil) {
 			blocked = true
 		}
+	}
+	var compact []string
+	for uid, record := range records {
+		if !busy[uid] && compactable(record, byUID[uid] != nil, sandboxes, containers) {
+			compact = append(compact, uid)
+		}
+	}
+	if err := e.compactJournal(compact); err != nil {
+		e.synced.Store(false)
+		return err
 	}
 	faulted := e.workers.outstanding(func(uid string) bool {
 		return byUID[uid] != nil || records[uid] != nil && records[uid].Stage != "finished"
@@ -751,9 +762,68 @@ func (e *executor) removeExecution(ctx context.Context, runtime *cri.Client, rec
 		if err := runtime.RemovePodSandbox(ctx, inventory.sandbox.Id); err != nil {
 			return err
 		}
+		return e.commit(func() { record.Stage, record.SandboxRemoved = "finished", true })
 	}
 	if record.Stage != "finished" {
 		return e.commit(func() { record.Stage = "finished" })
+	}
+	return nil
+}
+
+// compactable reports whether journal compaction (section 6.4 of DESIGN.md)
+// may drop record. Every condition must hold in the same pass:
+//
+//  1. The record is finished, so its reservation is released and no operation
+//     for it remains.
+//  2. RemovePodSandbox succeeded for the sandbox the record names, or the
+//     record never named one. A sandbox that disappeared without a successful
+//     RemovePodSandbox, including one an operator removed, keeps its record.
+//  3. The Pod UID is absent from the complete assigned-Pod view, so the Pod is
+//     deleted and its UID cannot be admitted again.
+//  4. The complete, successful sandbox and container lists of the pass hold no
+//     object that the record names or that claims the Pod UID, whatever its
+//     owner.
+func compactable(record *executionRecord, listed bool, sandboxes []*runtimeapi.PodSandbox, containers []*runtimeapi.Container) bool {
+	if record.Stage != "finished" || listed || record.SandboxID != "" && !record.SandboxRemoved {
+		return false
+	}
+	for _, sandbox := range sandboxes {
+		if sandbox.Id == record.SandboxID || sandbox.Metadata.Uid == record.UID || sandbox.Labels[podUIDLabel] == record.UID {
+			return false
+		}
+	}
+	for _, container := range containers {
+		if record.ContainerID != "" && container.Id == record.ContainerID ||
+			record.SandboxID != "" && container.PodSandboxId == record.SandboxID ||
+			container.Labels[podUIDLabel] == record.UID {
+			return false
+		}
+	}
+	return true
+}
+
+// compactJournal durably drops the records in uids that are still finished.
+// The caller runs it before it starts any operation of the pass, so no worker
+// holds those records. On a failed save the records are restored.
+func (e *executor) compactJournal(uids []string) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	dropped := make(map[string]*executionRecord, len(uids))
+	for _, uid := range uids {
+		if record := e.journal.Records[uid]; record != nil && record.Stage == "finished" {
+			dropped[uid] = record
+			delete(e.journal.Records, uid)
+		}
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	if err := e.journal.save(); err != nil {
+		maps.Copy(e.journal.Records, dropped)
+		return fmt.Errorf("compact execution journal: %w", err)
 	}
 	return nil
 }
