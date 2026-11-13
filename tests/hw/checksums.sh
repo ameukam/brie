@@ -113,11 +113,27 @@ hw_write_manifest() {
 	mv "$manifest.tmp" "$manifest"
 }
 
-# hw_verify_manifest checks every listed binary; any mismatch, missing file,
-# or malformed line fails.
+# hw_verify_manifest first requires the manifest to list each binary in
+# HW_MANIFEST_BINARIES exactly once and nothing else, then checks every
+# listed binary; any mismatch, missing file, or malformed line fails.
 hw_verify_manifest() {
-	local manifest=$1
+	local manifest=$1 line path
+	local -A listed=()
 	[[ -s $manifest ]] || hw_checksums_die "digest manifest $manifest is missing or empty"
+	while IFS= read -r line || [[ -n $line ]]; do
+		[[ $line =~ ^[0-9a-f]{64}\ \ (/[A-Za-z0-9._/-]+)$ ]] ||
+			hw_checksums_die "digest manifest $manifest has a malformed line"
+		path=${BASH_REMATCH[1]}
+		[[ -z ${listed[$path]:-} ]] || hw_checksums_die "digest manifest $manifest lists $path more than once"
+		listed[$path]=1
+	done <"$manifest"
+	for path in "${HW_MANIFEST_BINARIES[@]}"; do
+		[[ -n ${listed[$path]:-} ]] || hw_checksums_die "digest manifest $manifest does not cover $path"
+		unset 'listed[$path]'
+	done
+	for path in "${!listed[@]}"; do
+		hw_checksums_die "digest manifest $manifest lists unexpected binary $path"
+	done
 	sha256sum --check --strict "$manifest" || hw_checksums_die "binaries do not match digest manifest $manifest"
 }
 
