@@ -62,6 +62,8 @@ type executionRuntime struct {
 	pullError    error
 	// pullGate, when set, holds PullImage until it is closed.
 	pullGate chan struct{}
+	// pullRef, when set, is the image ID PullImage returns.
+	pullRef string
 	// images, imageFsUsed, and removedImages back image collection;
 	// failImages names an image or list method that fails.
 	images        []*runtimeapi.Image
@@ -143,6 +145,9 @@ func (s *executionRuntime) PullImage(context.Context, *runtimeapi.PullImageReque
 	}
 	if s.pullError != nil {
 		return nil, s.pullError
+	}
+	if s.pullRef != "" {
+		return &runtimeapi.PullImageResponse{ImageRef: s.pullRef}, nil
 	}
 	return &runtimeapi.PullImageResponse{ImageRef: "sha256:image"}, nil
 }
