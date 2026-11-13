@@ -117,6 +117,19 @@ func TestRun(t *testing.T) {
 			"--max-pods=10", "--node-ip=192.0.2.10", "--cluster-dns=10.96.0.10", "--cluster-domain=cluster.local",
 			"--state-dir=/unused/state", "--pod-log-dir=/unused/logs",
 		}},
+		{name: "image collection without opt-in", args: []string{"--run", "--node-name=node-1", "--image-gc-threshold=50Gi"}, wantErr: "requires --enable-workloads"},
+		{name: "invalid image collection threshold", args: []string{
+			"--run", "--node-name=node-1", "--enable-workloads", "--kubeconfig=/unused", "--runtime-socket=/unused",
+			"--runtime-class=kata-fc", "--runtime-handler=kata-fc", "--allocatable-cpu=4", "--allocatable-memory=8Gi",
+			"--max-pods=10", "--node-ip=192.0.2.10", "--cluster-dns=10.96.0.10", "--cluster-domain=cluster.local",
+			"--state-dir=/unused/state", "--pod-log-dir=/unused/logs", "--image-gc-threshold=0.5",
+		}, wantErr: "image-gc-threshold"},
+		{name: "cancelled execution with image collection", args: []string{
+			"--run", "--node-name=node-1", "--enable-workloads", "--kubeconfig=/unused", "--runtime-socket=/unused",
+			"--runtime-class=kata-fc", "--runtime-handler=kata-fc", "--allocatable-cpu=4", "--allocatable-memory=8Gi",
+			"--max-pods=10", "--node-ip=192.0.2.10", "--cluster-dns=10.96.0.10", "--cluster-domain=cluster.local",
+			"--state-dir=/unused/state", "--pod-log-dir=/unused/logs", "--image-gc-threshold=50Gi",
+		}},
 	}
 
 	for _, tt := range tests {

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +27,29 @@ import (
 )
 
 type executor struct {
-	node     Config
-	config   ExecutionConfig
-	api      kubernetes.Interface
-	runtime  *cri.Client
-	health   *cri.Client
-	journal  *executionJournal
+	node   Config
+	config ExecutionConfig
+	api    kubernetes.Interface
+	// runtime serves inventory, stop, delete, and status calls; create serves
+	// image, sandbox, and container creation; health serves the health loop.
+	// Each client bounds its own calls in flight.
+	runtime *cri.Client
+	create  *cri.Client
+	health  *cri.Client
+	// mu guards journal records and saves once reconciliation workers run.
+	mu      sync.Mutex
+	journal *executionJournal
+	workers *podWorkers
+	// pulls runs image pulls outside Pod reconciliation (section 10.4 of
+	// DESIGN.md).
+	pulls *imagePuller
+	// images, when set, collects unreferenced images; imageGate orders
+	// image presence checks (read) against collection (write).
+	images    *imageCollector
+	imageGate sync.RWMutex
+	// watch, when set, serves the assigned-Pod view of each pass; run sets
+	// it. Without it, each pass lists the assigned Pods.
+	watch    *assignedPodWatch
 	nodeUID  types.UID
 	overhead corev1.ResourceList
 	healthy  atomic.Bool
@@ -76,20 +94,41 @@ func ExecuteObserved(ctx context.Context, node Config, config ExecutionConfig, k
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, journal.close()) }()
-	workloads, err := cri.New(node.RuntimeSocket, 2*time.Minute)
+	// One slot beyond the priority workers keeps inventory lists from
+	// queueing behind slow stop or delete calls.
+	workloads, err := cri.NewConcurrent(node.RuntimeSocket, 2*time.Minute, priorityWorkers+1)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, workloads.Close()) }()
+	creation, err := cri.NewConcurrent(node.RuntimeSocket, 2*time.Minute, creationWorkers)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, creation.Close()) }()
 	health, err := cri.New(node.RuntimeSocket, 10*time.Second)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, health.Close()) }()
-	hooks.observeCRI(workloads, health)
+	pulls, err := cri.NewConcurrent(node.RuntimeSocket, imagePullDeadline, pullWorkers)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, pulls.Close()) }()
+	hooks.observeCRI(workloads, creation, health, pulls)
 	agent := &executor{
-		node: node, config: config, api: api, journal: journal, runtime: workloads, health: health,
-		logger: log.New(stderr, "brie-node: ", 0), hooks: hooks,
+		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
+		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(stderr, "brie-node: ", 0), hooks: hooks,
+	}
+	if threshold, _ := imageGCThresholdBytes(config.ImageGCThreshold); threshold > 0 {
+		collection, err := cri.New(node.RuntimeSocket, 2*time.Minute)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, collection.Close()) }()
+		hooks.observeCRI(collection)
+		agent.images = &imageCollector{client: collection, threshold: threshold, unusedSince: make(map[string]time.Time)}
 	}
 	if err := agent.initialize(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -164,8 +203,12 @@ func (e *executor) initialize(ctx context.Context) error {
 func (e *executor) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 3)
-	loop := func(interval time.Duration, step func(context.Context) error) {
+	loops := 4
+	if e.images != nil {
+		loops++
+	}
+	done := make(chan struct{}, loops)
+	loop := func(interval time.Duration, wake <-chan struct{}, step func(context.Context) error) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -177,21 +220,36 @@ func (e *executor) run(ctx context.Context) error {
 				done <- struct{}{}
 				return
 			case <-ticker.C:
+			case <-wake:
 			}
 		}
 	}
-	go loop(heartbeatInterval, func(ctx context.Context) error {
+	// A change to the assigned-Pod view wakes the next pass. Finished Pod
+	// operations do not, because status operations finish on every pass.
+	wake := make(chan struct{}, 1)
+	e.watch = newAssignedPodWatch(wake)
+	e.pulls.wake = wake
+	go func() {
+		e.watchAssigned(ctx, e.watch)
+		done <- struct{}{}
+	}()
+	go loop(heartbeatInterval, nil, func(ctx context.Context) error {
 		err := renewLease(ctx, e.api.CoordinationV1().Leases(leaseNamespace), e.node.NodeName, e.nodeUID)
 		e.hooks.leaseRenewed(err)
 		return err
 	})
-	go loop(5*time.Second, e.updateHealth)
-	go loop(2*time.Second, e.reconcile)
+	go loop(5*time.Second, nil, e.updateHealth)
+	go loop(inventoryInterval, wake, func(ctx context.Context) error { return e.reconcilePass(ctx, false) })
+	if e.images != nil {
+		go loop(imageGCInterval, nil, e.collectImages)
+	}
 	<-ctx.Done()
 	cancel()
-	for range 3 {
+	for range loops {
 		<-done
 	}
+	e.workers.running.Wait()
+	e.pulls.wait()
 	return shutdownError(ctx.Err())
 }
 
@@ -318,6 +376,8 @@ func (e *executor) labelsMatch(labels map[string]string, record *executionRecord
 		labels[configHashLabel] == record.Hash
 }
 
+// budgetFits reports whether a reservation fits the configured envelope next
+// to every unfinished record. The caller holds e.mu.
 func (e *executor) budgetFits(cpu, memory int64) bool {
 	remainingCPU, remainingMemory, _ := executionResources(corev1.ResourceList{
 		corev1.ResourceCPU: parseQuantity(e.config.CPU), corev1.ResourceMemory: parseQuantity(e.config.Memory),

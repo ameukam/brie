@@ -104,7 +104,7 @@ unready, exited, and `CONTAINER_UNKNOWN` objects are not filtered out or claimed
 Container status has no sandbox ID: retain its list association, never join by
 name alone, and recheck identity before any future action.
 
-Each RPC shares the existing serialized slot, timeout (including queueing and
+Each RPC shares the client's bounded call slots, timeout (including queueing and
 connection setup), cancellation, and 64-KiB send/receive bounds. CRI lists have
 no pagination here; an oversized response fails rather than returning a truncated
 inventory. Malformed identities, missing metadata, unknown enum values, invalid
@@ -153,6 +153,9 @@ brie-node --run --enable-workloads \
   --state-dir=/var/lib/brie/execution --pod-log-dir=/var/log/brie/pods
 ```
 
+Add `--image-gc-threshold=<bytes>` to enable image collection, described under
+[Lifecycle and failure behavior](#lifecycle-and-failure-behavior).
+
 Addresses and budgets are illustrative, not host discovery or sizing guidance.
 Reserve host services before selecting budgets; per-Pod VM overhead must come
 from measurement. Never share the state directory between hosts. It must be
@@ -185,10 +188,25 @@ unsupported.
 
 ## Lifecycle and failure behavior
 
-Assigned Pods are listed with a node field selector and bounded pagination, then
-reconciled serially on a two-second poll. Lease renewal runs independently of the
-five-second health/status loop and the workload RPC queue. Workload RPCs have a
-two-minute timeout; health RPCs retain ten-second deadlines.
+Assigned Pods are read through a node-scoped watch. A complete,
+quorum-consistent list with a node field selector and bounded pagination seeds
+the view; a watch with bookmarks, scoped by the same selector, then continues
+from the list's resource version. A closed stream resumes from the latest event
+or bookmark version. An expired resource version (HTTP 410), a watch error
+event, or an event the view cannot apply triggers a full relist with bounded
+exponential backoff (one to thirty seconds with jitter), and a full relist also
+runs every five minutes as a safety net. While the view is not synchronized,
+passes mutate nothing and the Node stays unready. WatchList streaming is not
+used. A pass runs when the view changes and at least every two seconds, reading
+the watched view and the complete local CRI inventory; it makes no API list
+request. After each complete read, at most one operation per Pod UID runs
+on bounded workers: four for deletion, cleanup, and status work, and two for
+admitted creation, each pool with its own CRI client. A Pod with an operation in
+flight is skipped until it ends, and a full pool defers work to the next pass
+without delaying other Pods. Admission still runs in Pod creation order. Lease
+renewal runs independently of the five-second health/status loop and the
+workload RPC queues. Workload RPCs have a two-minute timeout; health RPCs retain
+ten-second deadlines.
 
 The agent observes/pulls immutable public images, runs a sandbox with the explicit
 handler, creates the container, then starts it. Security settings, CPU/memory
@@ -202,6 +220,57 @@ checksum, exclusive lock, and write/fsync/rename/directory-fsync commit sequence
 Each create/start intent is committed before the RPC. Lost replies are recovered
 only from matching observations, including across restart. An uncertain absent
 result blocks admission rather than triggering another create or start.
+A sandbox or container create is proven to have created nothing only when the
+runtime answered with a definite rejection (`InvalidArgument`, `NotFound`,
+`FailedPrecondition`, `PermissionDenied`, or `OutOfRange`, codes grpc-go never
+generates itself), the code is journaled, and a later complete sandbox and
+container inventory holds no object claiming the Pod. The Pod then fails with
+`SandboxCreateRejected` or `ContainerCreateRejected` and its reservation is
+released through normal cleanup; the create is never retried. Unavailable,
+deadline, cancellation, `Unknown`, and other codes remain unresolved.
+
+Faults confined to one Pod's inputs do not change Node readiness or other
+admissions. A spec change to an admitted Pod sets the Pod condition
+`brie.dev/ExecutionBlocked` with reason `ExecutionConfigChanged` and leaves the
+execution untouched until the Pod is deleted.
+
+Image pulls run outside Pod reconciliation on two pull workers with their own CRI
+client and a ten-minute deadline per pull. The deadline is fixed, not sized to
+the image. Pods that need the same image reference share one pull. An admitted
+Pod whose image the runtime reports absent stays `Pending` with its reservation,
+and its container status reports why it is waiting: `ContainerCreating` while
+the pull is queued or running, `ErrImagePull` with the bounded runtime error once
+after a failure, and `ImagePullBackOff` while the next attempt waits. Failed
+pulls retry per image reference with exponential backoff and jitter from ten
+seconds up to five minutes. A failed or slow pull never holds a creation worker,
+changes Node readiness, or blocks other admissions. Pod intent is read again
+after the image wait and before the sandbox is created, so a Pod deleted during
+its pull never reaches the runtime. Pull Secrets remain unsupported.
+
+Image collection is disabled by default. With `--image-gc-threshold=<bytes>`,
+such as `50Gi`, the agent checks every five minutes whether the image filesystem
+usage reported by CRI `ImageFsInfo` exceeds the threshold and, if so, removes
+images through CRI `RemoveImage`, largest first, until the reported usage minus
+the removed sizes is at or below it. An image is removed only when all of these
+hold in one pass:
+
+- The CRI image filesystem, image, sandbox, and container lists all succeeded.
+  A failed or partial list removes nothing.
+- The last reconciliation pass completed and no execution is unresolved.
+- The runtime does not pin the image. The sandbox inventory does not name the
+  sandbox image, so collection refuses to run while sandboxes exist and no
+  listed image is pinned.
+- No container names it by ID, reference, or digest, and no unfinished journal
+  record names its reference. A digest also matches the same digest in another
+  repository. Collection refuses to run while an unfinished record written by
+  an earlier agent has no image reference.
+- The image was already unreferenced at a pass at least five minutes earlier.
+
+The reported usage is the runtime's view of its image store, not a measurement
+of a devmapper thin pool. Choose the threshold from measured pool usage;
+collection behavior against a real thin pool is unqualified. Retained checkpoints
+and templates are not tracked yet, so do not enable collection on hosts that
+keep them.
 
 Pod status reports observed pending/running/unknown/exited state, IP, readiness,
 exit code, and runtime identity; restartPolicy Never never restarts an exit.
@@ -214,27 +283,36 @@ A Pod that disappears before cleanup finishes, including a terminal Pod deleted
 right after its exit is reported, a force-deleted running Pod, and terminated-Pod
 garbage collection, is cleaned up only on positive deletion evidence: a
 successful, complete, quorum-consistent node-scoped Pod list with a resource
-version that omits the Pod UID. The execution must be this agent's own: its
+version that omits the Pod UID, or a watch `DELETED` event for that UID received
+on a stream that continues such a list without a gap. The execution must be this agent's own: its
 journal record, sandbox metadata UID, and owner labels agree. The agent journals
-that list resource version as `DeletionObserved` before the first destructive
-step; the durable record then authorizes the idempotent stop/remove steps across
+the `DELETED` event's resource version, or otherwise the view's resource
+version, as `DeletionObserved` before the first destructive step; the durable record then authorizes the idempotent stop/remove steps across
 restarts without a Pod read, which the Node authorizer rejects once the Pod is
 gone. The container is stopped with zero grace. A failed, forbidden, truncated,
 or version-less list, a `NotFound` or `Forbidden` Pod read, a foreign or
 ambiguous runtime object, an unresolved sandbox creation, and a recorded deletion
 contradicted by a listed Pod are not evidence; they preserve the execution and
-block admission. There is no watch yet, so watch `DELETED` events are not used.
+block admission.
 
 API/runtime outages, foreign or orphan executions without deletion evidence,
 ambiguous associations, missing known IDs, and over-budget reconstructed
 reservations preserve workloads and block admission. Shutdown closes agent
 connections without killing VMs. There is no age- or inventory-based orphan GC,
 cross-host recovery, probes, streaming,
-hibernation, or conformance claim. Terminal journal records are retained; the
-journal is bounded to 10,000 records and 4 MiB and requires reviewed operator
-maintenance before those limits are reached. Polling, startup latency, host/guest
-resource enforcement, and real scheduler-to-Kata execution still require runtime
-qualification before deploying this mode.
+hibernation, or conformance claim. A finished journal record is compacted only
+when, in one pass, `RemovePodSandbox` succeeded for the sandbox it names (or it
+never named one), its Pod UID is absent from the complete assigned-Pod view, and
+complete sandbox and container lists hold no object that it names or that claims
+its Pod UID. A terminal Pod that is still listed keeps its record, and so does a
+record whose sandbox disappeared without a successful `RemovePodSandbox`, such as
+one removed by an operator or finished under the version 1 journal schema. The
+journal schema is now version 2; version 1 journals are read and rewritten as
+version 2, and older agents refuse version 2. The journal stays bounded to
+10,000 records and 4 MiB; retained records still need reviewed operator
+maintenance before those limits are reached. Watch and pass intervals, startup
+latency, host/guest resource enforcement, and real scheduler-to-Kata execution
+still require runtime qualification before deploying this mode.
 
 ## C4A hardware smoke (2026-10-30)
 

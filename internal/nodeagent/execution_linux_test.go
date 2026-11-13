@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -51,6 +52,57 @@ type executionRuntime struct {
 	onPull     func()
 	failStop   bool
 	stopGrace  []int64
+	// reject answers the named create method with a status code. With
+	// createOnReject, the object is created before the rejection is returned.
+	reject         map[string]codes.Code
+	createOnReject bool
+	pullError      error
+	// pullGate, when set, holds PullImage until it is closed.
+	pullGate chan struct{}
+	// images, imageFsUsed, and removedImages back image collection;
+	// failImages names an image or list method that fails.
+	images        []*runtimeapi.Image
+	imageFsUsed   uint64
+	removedImages []string
+	failImages    string
+}
+
+func (s *executionRuntime) imageFailure(method string) error {
+	if s.failImages == method {
+		return status.Error(codes.Unavailable, method+" unavailable")
+	}
+	return nil
+}
+
+func (s *executionRuntime) ListImages(context.Context, *runtimeapi.ListImagesRequest) (*runtimeapi.ListImagesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	response := &runtimeapi.ListImagesResponse{}
+	for _, image := range s.images {
+		response.Images = append(response.Images, proto.Clone(image).(*runtimeapi.Image))
+	}
+	return response, s.imageFailure("ListImages")
+}
+
+func (s *executionRuntime) RemoveImage(_ context.Context, request *runtimeapi.RemoveImageRequest) (*runtimeapi.RemoveImageResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "RemoveImage")
+	if err := s.imageFailure("RemoveImage"); err != nil {
+		return nil, err
+	}
+	s.removedImages = append(s.removedImages, request.GetImage().GetImage())
+	s.images = slices.DeleteFunc(s.images, func(image *runtimeapi.Image) bool { return image.Id == request.GetImage().GetImage() })
+	return &runtimeapi.RemoveImageResponse{}, nil
+}
+
+func (s *executionRuntime) ImageFsInfo(context.Context, *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &runtimeapi.ImageFsInfoResponse{ImageFilesystems: []*runtimeapi.FilesystemUsage{{
+		Timestamp: 1, FsId: &runtimeapi.FilesystemIdentifier{Mountpoint: "/var/lib/containerd"},
+		UsedBytes: &runtimeapi.UInt64Value{Value: s.imageFsUsed},
+	}}}, s.imageFailure("ImageFsInfo")
 }
 
 func (s *executionRuntime) Version(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -75,10 +127,19 @@ func (s *executionRuntime) ImageStatus(context.Context, *runtimeapi.ImageStatusR
 
 func (s *executionRuntime) PullImage(context.Context, *runtimeapi.PullImageRequest) (*runtimeapi.PullImageResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	gate := s.pullGate
 	s.calls = append(s.calls, "PullImage")
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.onPull != nil {
 		s.onPull()
+	}
+	if s.pullError != nil {
+		return nil, s.pullError
 	}
 	return &runtimeapi.PullImageResponse{ImageRef: "sha256:image"}, nil
 }
@@ -87,11 +148,17 @@ func (s *executionRuntime) RunPodSandbox(_ context.Context, request *runtimeapi.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "RunPodSandbox")
+	if code, ok := s.reject["RunPodSandbox"]; ok && !s.createOnReject {
+		return nil, status.Error(code, "sandbox rejected")
+	}
 	id := "sandbox-" + request.Config.Metadata.Uid
 	s.sandboxes[id] = &runtimeapi.PodSandbox{
 		Id: id, Metadata: proto.Clone(request.Config.Metadata).(*runtimeapi.PodSandboxMetadata),
 		State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: time.Now().UnixNano(),
 		Labels: request.Config.Labels, RuntimeHandler: request.RuntimeHandler,
+	}
+	if code, ok := s.reject["RunPodSandbox"]; ok {
+		return nil, status.Error(code, "sandbox rejected after a partial create")
 	}
 	if s.loseReply == "RunPodSandbox" {
 		return nil, status.Error(codes.Unavailable, "lost committed sandbox reply")
@@ -103,6 +170,9 @@ func (s *executionRuntime) CreateContainer(_ context.Context, request *runtimeap
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "CreateContainer")
+	if code, ok := s.reject["CreateContainer"]; ok && !s.createOnReject {
+		return nil, status.Error(code, "container rejected")
+	}
 	id := "container-" + request.PodSandboxId
 	s.containers[id] = &runtimeapi.Container{
 		Id: id, PodSandboxId: request.PodSandboxId,
@@ -111,6 +181,9 @@ func (s *executionRuntime) CreateContainer(_ context.Context, request *runtimeap
 		Labels: request.Config.Labels, Image: request.Config.Image, ImageRef: "sha256:image",
 	}
 	s.configs[id] = request.Config
+	if code, ok := s.reject["CreateContainer"]; ok {
+		return nil, status.Error(code, "container rejected after a partial create")
+	}
 	if s.loseReply == "CreateContainer" {
 		return nil, status.Error(codes.Unavailable, "lost committed container reply")
 	}
@@ -134,6 +207,9 @@ func (s *executionRuntime) ListPodSandbox(context.Context, *runtimeapi.ListPodSa
 	if s.listError {
 		return nil, status.Error(codes.Unavailable, "inventory unavailable")
 	}
+	if err := s.imageFailure("ListPodSandbox"); err != nil {
+		return nil, err
+	}
 	response := &runtimeapi.ListPodSandboxResponse{}
 	for _, sandbox := range s.sandboxes {
 		response.Items = append(response.Items, proto.Clone(sandbox).(*runtimeapi.PodSandbox))
@@ -144,6 +220,9 @@ func (s *executionRuntime) ListPodSandbox(context.Context, *runtimeapi.ListPodSa
 func (s *executionRuntime) ListContainers(context.Context, *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.imageFailure("ListContainers"); err != nil {
+		return nil, err
+	}
 	response := &runtimeapi.ListContainersResponse{}
 	for _, container := range s.containers {
 		response.Containers = append(response.Containers, proto.Clone(container).(*runtimeapi.Container))
@@ -282,8 +361,19 @@ func newExecutor(t *testing.T, pods ...*corev1.Pod) (*executor, *executionRuntim
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = health.Close() })
+	creation, err := cri.NewConcurrent(socket, time.Second, creationWorkers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = creation.Close() })
+	pulls, err := cri.NewConcurrent(socket, 5*time.Second, pullWorkers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pulls.Close() })
 	e := &executor{node: Config{NodeName: "worker-1", RuntimeSocket: socket}, config: config,
-		api: api, journal: journal, runtime: client, health: health, logger: log.New(io.Discard, "", 0)}
+		api: api, journal: journal, runtime: client, create: creation, health: health,
+		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(io.Discard, "", 0)}
 	if err := e.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -404,9 +494,14 @@ func TestExecutionDeletionAndExit(t *testing.T) {
 			} else if err != nil || pod.Status.Phase != corev1.PodSucceeded {
 				t.Fatalf("exit not reported truthfully: %v, %v", pod.Status, err)
 			}
-			if len(service.sandboxes) != 0 || len(service.containers) != 0 ||
-				e.journal.Records["app-uid"].Stage != "finished" {
-				t.Fatal("runtime cleanup or reservation release incomplete")
+			if len(service.sandboxes) != 0 || len(service.containers) != 0 {
+				t.Fatal("runtime cleanup incomplete")
+			}
+			// A terminal Pod that is still listed keeps its finished record;
+			// a deleted Pod's record is compacted once nothing remains.
+			record := e.journal.Records["app-uid"]
+			if deleting && record != nil || !deleting && (record == nil || record.Stage != "finished" || !record.SandboxRemoved) {
+				t.Fatalf("reservation release or compaction incorrect: %+v", record)
 			}
 		})
 	}
@@ -507,6 +602,8 @@ func TestExecutionConfigurationAndJournal(t *testing.T) {
 		func(c *ExecutionConfig) { c.MaxPods = 10001 }, func(c *ExecutionConfig) { c.NodeIP = "127.0.0.1" },
 		func(c *ExecutionConfig) { c.ClusterDNS = "" }, func(c *ExecutionConfig) { c.ClusterDomain = ".." },
 		func(c *ExecutionConfig) { c.StateDir = "relative" }, func(c *ExecutionConfig) { c.LogDir = c.StateDir },
+		func(c *ExecutionConfig) { c.ImageGCThreshold = "0" }, func(c *ExecutionConfig) { c.ImageGCThreshold = "-1Gi" },
+		func(c *ExecutionConfig) { c.ImageGCThreshold = "0.5" }, func(c *ExecutionConfig) { c.ImageGCThreshold = "invalid" },
 	} {
 		config := executionConfig(t)
 		change(&config)
@@ -599,7 +696,8 @@ func TestExecutionUncertainAbsence(t *testing.T) {
 	t.Parallel()
 	e, service := newExecutor(t, executionPod("app"))
 	service.loseReply = "RunPodSandbox"
-	reconcilePasses(t, e, 1)
+	// The first pass synchronizes; the second admits the Pod and pulls its image.
+	reconcilePasses(t, e, 2)
 	if err := e.reconcile(t.Context()); status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected uncertain mutation: %v", err)
 	}
@@ -710,21 +808,34 @@ func TestExecutionOwnershipAndAdministratorFields(t *testing.T) {
 	}
 }
 
+// TestExecutionDeletionDuringPull is a regression test for section 10.4 of
+// DESIGN.md: Pod intent is re-read after the image wait and before sandbox
+// creation, so a Pod deleted during its pull never reaches the runtime even
+// when the pass still sees it undeleted.
 func TestExecutionDeletionDuringPull(t *testing.T) {
 	t.Parallel()
 	e, service := newExecutor(t, executionPod("app"))
+	stale, err := e.api.CoreV1().Pods("default").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	service.onPull = func() {
 		pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
 		now := metav1.Now()
 		pod.DeletionTimestamp = &now
 		_, _ = e.api.CoreV1().Pods("default").Update(t.Context(), pod, metav1.UpdateOptions{})
 	}
-	reconcilePasses(t, e, 1)
+	reconcilePasses(t, e, 2)
+	// The next pass reads a view that predates the deletion.
+	e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, stale.DeepCopy(), nil
+	})
 	if err := e.reconcile(t.Context()); err == nil {
 		t.Fatal("deletion during image pull was ignored")
 	}
-	reconcilePasses(t, e, 1)
-	if len(service.calls) != 1 || service.calls[0] != "PullImage" {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.calls) != 1 || service.calls[0] != "PullImage" || e.journal.Records["app-uid"].Stage != "reserved" {
 		t.Fatalf("deleted Pod reached sandbox execution: %v", service.calls)
 	}
 }
@@ -1017,6 +1128,8 @@ func TestExecutionDeletionEvidenceReleasesUnstartedReservation(t *testing.T) {
 			reconcilePasses(t, e, 1)
 			_ = e.reconcile(t.Context())
 			if lost != "" {
+				// The pull finished in the previous pass; this one creates the sandbox.
+				_ = e.reconcile(t.Context())
 				// The sandbox creation outcome is unknown and its object is gone.
 				service.mu.Lock()
 				clear(service.sandboxes)

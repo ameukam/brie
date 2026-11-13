@@ -31,6 +31,10 @@ type ExecutionConfig struct {
 	ClusterDomain  string
 	StateDir       string
 	LogDir         string
+	// ImageGCThreshold, when set, is the image filesystem usage in bytes
+	// above which unreferenced images are removed through CRI. Empty
+	// disables image collection.
+	ImageGCThreshold string
 }
 
 // Validate rejects incomplete execution configuration before contacting services.
@@ -75,7 +79,28 @@ func (c ExecutionConfig) Validate() error {
 	if c.ClusterDomain == "" || len(validation.IsDNS1123Subdomain(c.ClusterDomain)) != 0 {
 		return errors.New("execution requires an explicit valid cluster-domain")
 	}
+	if _, err := imageGCThresholdBytes(c.ImageGCThreshold); err != nil {
+		return err
+	}
 	return nil
+}
+
+// imageGCThresholdBytes parses the image collection threshold. Empty means
+// disabled and returns zero; otherwise the value is a positive whole number
+// of bytes, such as 50Gi.
+func imageGCThresholdBytes(value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	quantity, err := resource.ParseQuantity(value)
+	if err != nil {
+		return 0, errors.New("image-gc-threshold must be a byte quantity such as 50Gi")
+	}
+	bytes, exact := quantity.AsInt64()
+	if !exact || bytes <= 0 {
+		return 0, errors.New("image-gc-threshold must be a positive whole number of bytes fitting int64")
+	}
+	return bytes, nil
 }
 
 func parseQuantity(value string) resource.Quantity {

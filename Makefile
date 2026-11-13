@@ -32,10 +32,14 @@ fuzz:
 	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzConfig$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzPodProfile$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzExecutionResources$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzExecutionJournal$$' -fuzztime=10s -fuzzminimizetime=1s -parallel=2
+	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzImageReference$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzImageGCThreshold$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/cri -run='^$$' -fuzz='^FuzzNew$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/podlog -run='^$$' -fuzz='^FuzzParseLine$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/serving -run='^$$' -fuzz='^FuzzServingQueries$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/logrotation -run='^$$' -fuzz='^FuzzParseMaxSize$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/cri -run='^$$' -fuzz='^FuzzValidateImage$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzDecodeInfo$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzArtifactPath$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzVsockConfig$$' -fuzztime=10s -parallel=2

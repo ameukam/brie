@@ -6,8 +6,9 @@ The node agent reads only Version and Status at startup in registration-only
 mode. Explicit `--enable-workloads` uses inventory and bounded image, network
 configuration, sandbox, and container lifecycle calls.
 
-Create a client with `New(socketPath, timeout)` and close it when done.
-Calls run one at a time; the timeout includes queueing and connection setup.
+Create a client with `New(socketPath, timeout)`, or `NewConcurrent` to allow a
+fixed number of calls in flight, and close it when done. `New` runs calls one at
+a time; the timeout includes queueing and connection setup.
 Responses are limited to 64 KiB, except `ExecSync` output, which is limited to
 1 MiB. Restrict socket access with filesystem permissions.
 
@@ -23,7 +24,14 @@ inventory. Separate calls are not an atomic snapshot and cannot authorize cleanu
 See the [initial Pod profile](../../docs/pod-profile.md) for the next execution
 boundary and identity requirements.
 
+`ListImages`, `RemoveImage`, and `ImageFsInfo` serve image collection. An image
+list fails without partial results on invalid, duplicate, or oversized
+responses; it says which images exist, not which are unused. `RemoveImage`
+succeeds for an absent image, so it is never an observation.
+
 Lifecycle calls have no automatic retries. A failed create/start may already
 have committed; callers must retain durable intent and reconcile identities
-before proceeding. Socket access grants runtime mutation authority and must
+before proceeding. `DefiniteRejection` identifies status codes that only a
+completed runtime handler returns to refuse a request; it is necessary, not
+sufficient, evidence that nothing was created. Socket access grants runtime mutation authority and must
 remain restricted to the trusted node/runtime owner.

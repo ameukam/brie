@@ -111,6 +111,41 @@ versioning. Dated nightly prereleases are development builds, not stable release
   explicit project, zones, run id, and spend ceiling, and never reads gcloud
   configuration. Tested only against a mock `gcloud`; it has not run against
   Google Cloud.
+- With `--enable-workloads`, assigned Pods are read through a node-scoped watch
+  with bookmarks instead of a two-second API list. An expired resource version
+  or a watch error triggers a full relist with bounded backoff, and a full
+  relist runs every five minutes. A watch `DELETED` event for an execution the
+  agent created is journaled as deletion evidence before cleanup. Passes still
+  read the complete CRI inventory at least every two seconds.
+- With `--enable-workloads`, finished execution journal records are compacted
+  once `RemovePodSandbox` succeeded, the Pod is gone from the complete
+  assigned-Pod view, and a complete CRI inventory shows none of the record's
+  objects. The journal schema moves to version 2; version 1 journals are
+  migrated on start, and older agents refuse version 2 journals.
+- With `--enable-workloads`, a sandbox or container create that the runtime
+  definitely rejected, and that a later complete CRI inventory shows created
+  nothing, now fails its Pod with `SandboxCreateRejected` or
+  `ContainerCreateRejected` and releases the reservation instead of blocking
+  admission. Lost or interrupted replies still block admission.
+- With `--enable-workloads`, the new `--image-gc-threshold` flag enables image
+  collection through CRI (disabled by default). While the reported image
+  filesystem usage exceeds the threshold, images that no container or
+  unfinished execution references, that the runtime does not pin, and that were
+  unreferenced for five minutes are removed, largest first. A failed or partial
+  list removes nothing.
+- With `--enable-workloads`, image pulls run on two bounded pull workers,
+  shared by every Pod that needs the same image reference, with a ten-minute
+  deadline and per-image backoff with jitter. A waiting Pod reports
+  `ContainerCreating`, `ErrImagePull`, or `ImagePullBackOff` in its container
+  status, and a failed pull no longer withholds Node readiness or other
+  admissions.
+- With `--enable-workloads`, a spec change to an admitted Pod is published on
+  that Pod as the `brie.dev/ExecutionBlocked` condition
+  (`ExecutionConfigChanged`) and no longer withholds Node readiness or other
+  admissions.
+- With `--enable-workloads`, Pods are reconciled by bounded workers with at most
+  one operation per Pod, and deletion, cleanup, and status work has its own
+  workers and CRI client, so a slow create or pull no longer delays other Pods.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
