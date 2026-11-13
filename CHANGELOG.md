@@ -31,6 +31,11 @@ versioning. Dated nightly prereleases are development builds, not stable release
   strict manifest reads, a redacting GCE metadata-server token source, refused
   redirects, and bounded retries with per-attempt deadlines. It is tested only
   against an in-process fake server; no real bucket has been used.
+- A conditional checkpoint-reference commit helper. It updates a Sandbox's
+  committed-checkpoint reference only with UID and resource-version
+  preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
+  older generations, and is idempotent after a lost reply. It is an interface
+  tested against a fake; the Sandbox controller implementation is separate.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
