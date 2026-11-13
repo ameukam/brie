@@ -96,6 +96,20 @@ func (e *executor) reconcile(ctx context.Context) error {
 // their journal record and inventory may change while the lists are read.
 // Without wait, the pass returns once its operations are started.
 func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
+	err := e.runPass(ctx, wait)
+	observed := err
+	if observed == nil && !e.synced.Load() {
+		observed = errIncompletePass
+	}
+	e.hooks.passFinished(observed)
+	return err
+}
+
+// errIncompletePass reports a pass that returned without error but left the
+// node unsynced, for example with a worker fault outstanding.
+var errIncompletePass = errors.New("reconciliation pass incomplete")
+
+func (e *executor) runPass(ctx context.Context, wait bool) error {
 	busy := e.workers.busySet()
 	e.mu.Lock()
 	records := make(map[string]*executionRecord, len(e.journal.Records))
