@@ -226,3 +226,39 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+func TestNodeConformancePlacement(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		missing bool
+		stderr  string
+	}{
+		{name: "every test Pod on the Brie node", content: "pods-1 p1 <none>\npods-1 p1 brie-worker-1\nkube-system kube-proxy-x cp-1\n"},
+		{name: "test Pod on the control plane", content: "pods-1 p1 brie-worker-1\npods-2 p2 cp-1\n", stderr: "1 test Pods were bound to nodes other than brie-worker-1"},
+		{name: "no test Pod observed", content: "kube-system kube-proxy-x cp-1\npods-1 p1 <none>\n", stderr: "no test Pod was observed on brie-worker-1"},
+		{name: "empty record", content: "", stderr: "no test Pod was observed"},
+		{name: "malformed line", content: "pods-1 p1\n", stderr: "malformed Pod placement line"},
+		{name: "missing record", missing: true, stderr: "cannot read the Pod placement record"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newLab(t, mockState{})
+			l.env["NODE_NAME"] = "brie-worker-1"
+			path := filepath.Join(l.dir, "pod-placement.txt")
+			if !tt.missing {
+				writeFile(t, l.dir, "pod-placement.txt", tt.content)
+			}
+			r := l.run("node-conformance.sh", "--check-placement", path)
+			if tt.stderr == "" && r.code != 0 {
+				t.Fatalf("exit=%d stderr=%q; want success", r.code, r.stderr)
+			}
+			if tt.stderr != "" && (r.code == 0 || !strings.Contains(r.stderr, tt.stderr)) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if strings.Contains(tt.content, "cp-1\n") && strings.Contains(tt.content, "pods-2") &&
+				!strings.Contains(r.stdout, "MISPLACED\tpods-2/p2\tcp-1") {
+				t.Errorf("misplaced Pod not listed: stdout=%q", r.stdout)
+			}
+		})
+	}
+}

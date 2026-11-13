@@ -14,6 +14,7 @@
 #   node-conformance.sh --check-only CHECKSUMS
 #   node-conformance.sh --summarize REPORT_DIR
 #   NODE_NAME=NODE node-conformance.sh --check-nodes NODES_JSON
+#   NODE_NAME=NODE node-conformance.sh --check-placement PLACEMENT_FILE
 set -euo pipefail
 
 HW_SCRIPT='node-conformance'
@@ -29,7 +30,7 @@ CONTROL_PLANE_TAINT_KEY=node-role.kubernetes.io/control-plane
 BRIE_TAINT_KEY=brie.dev/runtime
 
 usage() {
-	hw_checksums_die "usage: node-conformance.sh CHECKSUMS | --check-only CHECKSUMS | --summarize REPORT_DIR | --check-nodes NODES_JSON"
+	hw_checksums_die "usage: node-conformance.sh CHECKSUMS | --check-only CHECKSUMS | --summarize REPORT_DIR | --check-nodes NODES_JSON | --check-placement PLACEMENT_FILE"
 }
 
 load_checksums() {
@@ -148,6 +149,40 @@ print(f"node-conformance: only {brie} can accept test Pods among {len(names)} no
 PY
 }
 
+# check_placement reads the Pod placement watch recorded during the run
+# ("NAMESPACE NAME NODE" lines) and fails unless every Pod outside the kube-*
+# namespaces that was bound to a node was bound to NODE_NAME, and at least one
+# was.
+check_placement() {
+	python3 - "$1" "$NODE_NAME" <<'PY'
+import sys
+
+path, brie = sys.argv[1:]
+try:
+    with open(path) as f:
+        lines = f.read().splitlines()
+except OSError as err:
+    sys.exit(f"node-conformance: cannot read the Pod placement record {path}: {err}")
+on_brie = set()
+elsewhere = set()
+for number, line in enumerate(lines, 1):
+    fields = line.split()
+    if len(fields) != 3:
+        sys.exit(f"node-conformance: {path}:{number}: malformed Pod placement line")
+    namespace, name, node = fields
+    if namespace.startswith("kube-") or node == "<none>":
+        continue
+    (on_brie if node == brie else elsewhere).add((namespace, name, node))
+for namespace, name, node in sorted(elsewhere):
+    print(f"MISPLACED\t{namespace}/{name}\t{node}")
+if elsewhere:
+    sys.exit(f"node-conformance: {len(elsewhere)} test Pods were bound to nodes other than {brie}")
+if not on_brie:
+    sys.exit(f"node-conformance: no test Pod was observed on {brie}")
+print(f"node-conformance: all {len(on_brie)} observed test Pods were bound to {brie}")
+PY
+}
+
 case ${1:-} in
 --check-only)
 	(($# == 2)) || usage
@@ -166,6 +201,12 @@ case ${1:-} in
 	check_nodes "$2"
 	exit 0
 	;;
+--check-placement)
+	(($# == 2)) || usage
+	[[ -n ${NODE_NAME:-} ]] || hw_checksums_die "required input NODE_NAME is not set"
+	check_placement "$2"
+	exit 0
+	;;
 '' | -*) usage ;;
 esac
 (($# == 1)) || usage
@@ -181,7 +222,8 @@ k() {
 server=$(k version -o json | python3 -c 'import json, sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"])')
 [[ $server == "v$K8S_VERSION" ]] || hw_checksums_die "server $server does not match kubernetes-test v$K8S_VERSION"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+watcher=
+trap 'if [[ -n $watcher ]]; then kill "$watcher" 2>/dev/null || true; fi; rm -rf "$work"' EXIT
 # The inventory is captured and checked as a whole; a failed or empty list
 # stops the run instead of skipping the isolation check.
 k get nodes -o json >"$work/nodes.json" || hw_checksums_die "cannot list the cluster nodes"
@@ -200,6 +242,12 @@ cp "$work/nodes.json" "$out/nodes.json"
 } >"$out/inputs.txt"
 
 status=0
+# Record where every Pod is bound for the whole run. The watch outlives the
+# suite timeout; if it ends early, placement is unknown and the run fails.
+kubectl --kubeconfig="$KUBECONFIG_PATH" --request-timeout=7h get pods --all-namespaces --watch \
+	--no-headers -o 'custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName' \
+	>"$out/pod-placement.txt" 2>"$out/pod-placement.err" &
+watcher=$!
 # The Brie runtime taint must not block suite startup; it is not a skip filter.
 "$work/kubernetes/test/bin/e2e.test" \
 	--kubeconfig="$KUBECONFIG_PATH" --provider=skeleton \
@@ -209,12 +257,25 @@ status=0
 	>"$out/e2e.log" 2>&1 || status=$?
 printf 'e2e.test exit status %d\n' "$status" >>"$out/inputs.txt"
 
+placement_status=0
+if kill -0 "$watcher" 2>/dev/null; then
+	kill "$watcher" 2>/dev/null || true
+	wait "$watcher" 2>/dev/null || true
+	watcher=
+	check_placement "$out/pod-placement.txt" >"$out/placement.txt" 2>&1 || placement_status=1
+else
+	watcher=
+	printf 'node-conformance: the Pod placement watch ended before the suite; placement is unknown\n' >"$out/placement.txt"
+	placement_status=1
+fi
+cat "$out/placement.txt"
+
 summary_status=0
 summarize "$out" || summary_status=$?
 sums=$(cd "$out" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
 printf '%s\n' "$sums" >"$out/SHA256SUMS"
 printf 'node-conformance: results in %s; publish every line of failures.txt\n' "$out"
-if ((status != 0 || summary_status == 1)); then
+if ((status != 0 || summary_status == 1 || placement_status != 0)); then
 	exit 1
 fi
 if ((summary_status != 0)); then
