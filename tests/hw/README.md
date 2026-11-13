@@ -50,7 +50,9 @@ Every script that calls `gcloud` sources `lib.sh`, which:
 (`gcloud storage rm --recursive`), firewall rules, the Cloud NAT and router, the
 subnet, and the VPC. It discovers candidates by run label or name prefix, then
 re-describes each one immediately before deletion. Candidates without the
-run's label or description marker are reported as `REFUSED` and kept. It then
+run's label or description marker are reported as `REFUSED` and kept. A NAT
+has neither, so under an owned router only `brie-hw-$RUN_ID-nat` is deleted;
+any other NAT is refused and the router is kept for it. It then
 runs `verify-empty.sh`, which lists every type by label and prefix and fails
 unless all lists succeed and are empty. Teardown exits nonzero on any refusal,
 failed call, or remaining resource.

@@ -35,8 +35,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
   spend ceiling, falls back to a second zone on stockout, and tears down after
   45 minutes of stockout or any failure. Tested only against a mock `gcloud`.
 - A label-guarded hardware lab teardown in `tests/hw`: it deletes only
-  resources carrying the run's label or description marker, refuses others,
-  and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
+  resources carrying the run's label or description marker, refuses others
+  (including any NAT other than the run's own under an owned router, whose
+  router is then kept), and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
   explicit project, zones, run id, and spend ceiling, and never reads gcloud
   configuration. Tested only against a mock `gcloud`; it has not run against
   Google Cloud.
