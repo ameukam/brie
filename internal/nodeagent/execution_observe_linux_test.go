@@ -126,7 +126,7 @@ func TestExecutionHooksReportAdmissionDecisions(t *testing.T) {
 			calls := &hookCalls{}
 			e.hooks = calls.hooks()
 			if tt.probes {
-				e.probes = newProbeManager(&probeExecer{}, e.config.MaxPods, e.hooks)
+				e.probes = newProbeManager(&probeExecer{}, e.config.MaxPods, e.hooks, nil)
 				t.Cleanup(e.probes.Close)
 			}
 			if tt.change != nil {
@@ -411,7 +411,7 @@ func TestExecutionReadinessWaitsForProbes(t *testing.T) {
 			e.hooks = calls.hooks()
 			// The Pod is admitted with the probe increment; "no probe manager"
 			// then runs without one, as after a restart without --enable-probes.
-			e.probes = newProbeManager(&probeExecer{exit: tt.exit}, e.config.MaxPods, e.hooks)
+			e.probes = newProbeManager(&probeExecer{exit: tt.exit}, e.config.MaxPods, e.hooks, nil)
 			t.Cleanup(e.probes.Close)
 			// The first pass only completes reconstruction; the second admits.
 			reconcilePasses(t, e, 2)
@@ -453,7 +453,7 @@ func TestExecutionLivenessFailureFailsPod(t *testing.T) {
 	calls := &hookCalls{}
 	e.hooks = calls.hooks()
 	execer := &probeExecer{}
-	e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks)
+	e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks, nil)
 	t.Cleanup(e.probes.Close)
 	reconcilePasses(t, e, 6)
 	if _, found := e.probes.Status(string(pod.UID)); !found {
@@ -491,12 +491,53 @@ func TestExecutionLivenessFailureFailsPod(t *testing.T) {
 	}
 }
 
+// TestExecutionProbeStatusWakesPass checks that a probe status change wakes
+// the next reconciliation pass instead of waiting for the poll interval.
+func TestExecutionProbeStatusWakesPass(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		probe func(*corev1.Container)
+	}{
+		{name: "liveness failure", probe: func(c *corev1.Container) { c.LivenessProbe = execProbe(0) }},
+		{name: "readiness failure", probe: func(c *corev1.Container) { c.ReadinessProbe = execProbe(0) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pod := executionPod("app")
+			tt.probe(&pod.Spec.Containers[0])
+			e, _ := newExecutor(t, pod)
+			execer := &probeExecer{}
+			wake := make(chan struct{}, 1)
+			e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks, wake)
+			t.Cleanup(e.probes.Close)
+			reconcilePasses(t, e, 6)
+			if _, found := e.probes.Status(string(pod.UID)); !found {
+				t.Fatal("probes not started for the running container")
+			}
+			waitProbeStatus(t, e, string(pod.UID), func(ready, failed bool) bool {
+				return !failed && (ready || pod.Spec.Containers[0].ReadinessProbe == nil)
+			})
+			select {
+			case <-wake:
+			default:
+			}
+			execer.set(1)
+			select {
+			case <-wake:
+			case <-time.After(10 * time.Second):
+				t.Fatal("probe status change did not wake a pass")
+			}
+		})
+	}
+}
+
 func TestExecutionLivenessFailureAfterExit(t *testing.T) {
 	t.Parallel()
 	pod := executionPod("app")
 	pod.Spec.Containers[0].LivenessProbe = execProbe(0)
 	e, service := newExecutor(t, pod)
-	e.probes = newProbeManager(&probeExecer{exit: 1}, e.config.MaxPods, e.hooks)
+	e.probes = newProbeManager(&probeExecer{exit: 1}, e.config.MaxPods, e.hooks, nil)
 	t.Cleanup(e.probes.Close)
 	reconcilePasses(t, e, 6)
 	waitProbeStatus(t, e, string(pod.UID), func(_, failed bool) bool { return failed })
