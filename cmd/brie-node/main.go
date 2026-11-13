@@ -51,9 +51,12 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	flags.StringVar(&execution.ClusterDomain, "cluster-domain", "", "Cluster DNS domain")
 	flags.StringVar(&execution.StateDir, "state-dir", "", "Private durable execution journal directory")
 	flags.StringVar(&execution.LogDir, "pod-log-dir", "", "Dedicated host directory for CRI container logs")
+	flags.StringVar(&execution.ImageGCThreshold, "image-gc-threshold", "",
+		"Remove unreferenced images through CRI while image filesystem usage exceeds this many bytes, such as 50Gi (default disabled)")
 	executionFlags := map[string]bool{
 		"runtime-class": true, "runtime-handler": true, "allocatable-cpu": true, "allocatable-memory": true,
 		"max-pods": true, "node-ip": true, "cluster-dns": true, "cluster-domain": true, "state-dir": true, "pod-log-dir": true,
+		"image-gc-threshold": true,
 	}
 
 	if err := flags.Parse(args); err != nil {
