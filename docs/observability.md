@@ -251,8 +251,9 @@ cleanup that waits for deletion or runtime evidence; and, with
 
 ## Executor hooks
 
-`nodeagent.ExecuteObserved` passes `ExecutionHooks` into the executor. Each
-hook observes a decision the executor already made and must not block:
+`nodeagent.ExecuteObserved` passes `ExecutionHooks` into the executor,
+including the verified execution inventory that serving and log rotation use.
+Each hook observes a decision the executor already made and must not block:
 
 | Hook | Call site | Fed to |
 | --- | --- | --- |
