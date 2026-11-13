@@ -9,6 +9,23 @@ No project, zone, or spend ceiling was named for that session, so no cloud
 resource was created, read, or deleted, and no hardware result exists. Treat
 every script as unit-tested against a mock, not hardware-verified.
 
+## Order of operations
+
+1. Fill a copy of `checksums.template` and a price table; check both locally.
+2. `provision.sh` (aborts and tears down on failure or a 45-minute stockout).
+3. `run-on-host.sh` with `install-control-plane.sh` on a standard host and
+   `install-host.sh` on each metal host; then install and start `brie-node`
+   (not scripted here; see `docs/pod-profile.md`).
+4. `m1-harness.sh`, then `node-conformance.sh` through `run-on-host.sh`.
+5. `fence.sh` for M2 fencing experiments.
+6. `teardown.sh`, which ends with `verify-empty.sh`. Run it even after a
+   failure; it only deletes resources carrying the run's marker.
+
+`go test ./tests/hw` (part of `make test`) runs every script against a mock
+`gcloud` and `kubectl` placed first on `PATH`, with an empty `CLOUDSDK_CONFIG`
+and `HOME`, and a simulated clock. The mock records each call and fails any
+call without the explicit project or any `gcloud config` call.
+
 ## Safety guards
 
 Every script that calls `gcloud` sources `lib.sh`, which:
@@ -106,7 +123,9 @@ version, malformed digests, and duplicate records. Check a file locally with
 
 `run-on-host.sh INSTANCE ZONE SCRIPT [FILE...]` refuses instances without the
 run label, copies the script, `checksums.sh`, and the input files over IAP
-SSH, and runs the script as root.
+SSH, and runs the script as root. It forwards `NODE_NAME`, `POD_CIDR`,
+`SERVICE_CIDR`, and `ADVERTISE_ADDRESS` when set, and refuses values outside
+`[A-Za-z0-9./_-]`.
 
 `install-host.sh CHECKSUMS` requires root, Arm64, Ubuntu 24.04, and `/dev/kvm`.
 It installs containerd 2.4.2, Kata 4.3.1 (whose Firecracker must report

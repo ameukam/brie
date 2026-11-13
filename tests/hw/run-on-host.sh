@@ -4,7 +4,8 @@
 #
 # Copies a host-side lab script, its shared helpers, and input files to one
 # instance labelled for this run, then runs the script there as root through
-# IAP SSH. It refuses instances without the run label.
+# IAP SSH. It refuses instances without the run label. NODE_NAME, POD_CIDR,
+# SERVICE_CIDR, and ADVERTISE_ADDRESS are forwarded when set.
 #
 # Usage: run-on-host.sh INSTANCE ZONE SCRIPT [INPUT_FILE...]
 set -euo pipefail
@@ -33,6 +34,14 @@ if ! hw_owned_by_label compute instances describe "$INSTANCE" --zone="$HOST_ZONE
 	hw_die "instance $INSTANCE in $HOST_ZONE does not carry label $HW_MARKER; refusing to run on it"
 fi
 
+remote_env=()
+for name in NODE_NAME POD_CIDR SERVICE_CIDR ADVERTISE_ADDRESS; do
+	if [[ -n ${!name:-} ]]; then
+		[[ ${!name} =~ ^[A-Za-z0-9./_-]+$ ]] || hw_die "$name contains characters that cannot be forwarded"
+		remote_env+=("$name=${!name}")
+	fi
+done
+
 remote_dir=/tmp/brie-hw-$RUN_ID
 remote_args=()
 for file in "$@"; do
@@ -43,4 +52,4 @@ hw_gcloud compute ssh "$INSTANCE" --zone="$HOST_ZONE" --tunnel-through-iap \
 hw_gcloud compute scp --zone="$HOST_ZONE" --tunnel-through-iap \
 	"$HW_DIR/$SCRIPT" "$HW_DIR/checksums.sh" "$@" "$INSTANCE:$remote_dir/"
 hw_gcloud compute ssh "$INSTANCE" --zone="$HOST_ZONE" --tunnel-through-iap \
-	--command="sudo bash $remote_dir/$SCRIPT ${remote_args[*]}"
+	--command="sudo env ${remote_env[*]} bash $remote_dir/$SCRIPT ${remote_args[*]}"
