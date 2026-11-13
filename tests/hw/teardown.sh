@@ -84,7 +84,7 @@ firewall_rules() {
 }
 
 routers() {
-	local name region nat nats candidates
+	local name region nat nats candidates foreign
 	list compute routers list --filter="$(hw_prefix_filter)" --format='value(name,region.basename())'
 	candidates=$listed
 	while read -r name region; do
@@ -93,8 +93,22 @@ routers() {
 			refuse "router $name in $region and its NAT: description is not $HW_MARKER"
 			continue
 		fi
+		# NATs carry neither labels nor descriptions, so only the NAT name
+		# provision.sh records for this run is deleted. Any other NAT under
+		# the router is refused, and the router is kept for it.
 		list compute routers nats list --router="$name" --region="$region" --format='value(name)'
 		nats=$listed
+		foreign=0
+		while read -r nat; do
+			[[ -n $nat ]] || continue
+			if [[ $nat != "$HW_PREFIX-nat" ]]; then
+				refuse "NAT $nat on router $name in $region: it is not this run's NAT $HW_PREFIX-nat; keeping the router"
+				foreign=1
+			fi
+		done <<<"$nats"
+		if ((foreign == 1)); then
+			continue
+		fi
 		while read -r nat; do
 			[[ -n $nat ]] || continue
 			delete compute routers nats delete "$nat" --router="$name" --region="$region" --quiet
