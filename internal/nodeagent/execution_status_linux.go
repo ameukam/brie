@@ -54,9 +54,6 @@ func (e *executor) publishPodStatus(ctx context.Context, expected *corev1.Pod, s
 				ready = sandboxReady && e.healthy.Load()
 			}
 		}
-		if reason != "" {
-			pod.Status.Phase = corev1.PodFailed
-		}
 		if len(pod.Spec.Containers) == 1 {
 			spec := pod.Spec.Containers[0]
 			observed := corev1.ContainerStatus{
@@ -68,7 +65,7 @@ func (e *executor) publishPodStatus(ctx context.Context, expected *corev1.Pod, s
 				switch container.State {
 				case runtimeapi.ContainerState_CONTAINER_RUNNING:
 					pod.Status.Phase = corev1.PodRunning
-					observed.Ready = ready
+					observed.Ready = ready && e.probeReady(pod)
 					started := true
 					observed.Started = &started
 					observed.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: criTime(container.StartedAt)}}
@@ -87,13 +84,19 @@ func (e *executor) publishPodStatus(ctx context.Context, expected *corev1.Pod, s
 					observed.State.Waiting.Reason = "RuntimeStateUnknown"
 				}
 			}
-			if reason != "" {
-				observed.State.Waiting = &corev1.ContainerStateWaiting{Reason: reason, Message: message}
+			if reason != "" && observed.State.Terminated == nil {
+				observed.Ready = false
+				observed.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message}}
 			}
 			pod.Status.ContainerStatuses = []corev1.ContainerStatus{observed}
 			ready = observed.Ready
 		} else {
 			ready = false
+		}
+		// A reason fails the Pod whatever its container reported, such as an
+		// exit code 0 after a liveness stop.
+		if reason != "" {
+			pod.Status.Phase = corev1.PodFailed
 		}
 		for _, kind := range []corev1.PodConditionType{corev1.PodInitialized, corev1.PodReadyToStartContainers, corev1.PodReady, corev1.ContainersReady} {
 			condition := corev1.PodCondition{
@@ -138,10 +141,12 @@ func (e *executor) publishPodStatus(ctx context.Context, expected *corev1.Pod, s
 // ready. Publishing a runtime status for the Pod removes the condition.
 const executionBlocked corev1.PodConditionType = "brie.dev/ExecutionBlocked"
 
-// publishPodBlocked sets the executionBlocked condition with a stable reason.
+// publishPodBlocked sets the executionBlocked condition with a stable reason
+// and reports it once it is newly published.
 func (e *executor) publishPodBlocked(ctx context.Context, expected *corev1.Pod, reason, message string) error {
 	pods := e.api.CoreV1().Pods(expected.Namespace)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	published := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		pod, err := pods.Get(ctx, expected.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -168,12 +173,18 @@ func (e *executor) publishPodBlocked(ctx context.Context, expected *corev1.Pod, 
 			}
 			pod.Status.Conditions[i] = condition
 			_, err = pods.UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+			published = err == nil
 			return err
 		}
 		pod.Status.Conditions = append(pod.Status.Conditions, condition)
 		_, err = pods.UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+		published = err == nil
 		return err
 	})
+	if published {
+		e.hooks.executionBlocked(expected, reason, message)
+	}
+	return err
 }
 
 func criTime(nanoseconds int64) metav1.Time {

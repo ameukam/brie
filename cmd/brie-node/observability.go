@@ -20,6 +20,7 @@ import (
 	"github.com/ameukam/brie/internal/metrics"
 	"github.com/ameukam/brie/internal/nodeagent"
 	"github.com/ameukam/brie/internal/serving"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 )
@@ -141,6 +142,42 @@ func (b *barrierTracker) observe(state nodeagent.HealthState) {
 	b.recorder.BarrierRaised(string(cause))
 }
 
+// addPodHooks feeds executor decisions to the metrics registry and Events
+// recorder; either may be nil. Events carry stable reasons, published status
+// messages, and gRPC codes, never image references, environment, commands,
+// or arguments.
+func addPodHooks(hooks *nodeagent.ExecutionHooks, registry *metrics.Metrics, recorder *events.Recorder) {
+	hooks.Admission = func(pod *corev1.Pod, reason, message string) {
+		if registry != nil {
+			registry.AdmissionDecision(reason)
+		}
+		if recorder != nil && reason != nodeagent.AdmissionAdmitted {
+			recorder.PodRefused(pod, reason, message)
+		}
+	}
+	if registry != nil {
+		hooks.Journal = func(state nodeagent.JournalState) {
+			registry.SetReservations(state.ReservedCPUMillicores, state.ReservedMemoryBytes, state.ReservedExecutions)
+			registry.SetJournal(state.Records, state.Bytes)
+			registry.SetPendingStages(state.PendingSince)
+		}
+		hooks.ProbeResult = registry.ProbeResult
+	}
+	if recorder == nil {
+		return
+	}
+	hooks.ImagePullFailed = func(pod *corev1.Pod, backoff bool, code string) {
+		if backoff {
+			recorder.ImagePullBackOff(pod, "Back-off pulling the container image after gRPC code "+code)
+			return
+		}
+		recorder.ImagePullFailed(pod, "Failed to pull the container image with gRPC code "+code)
+	}
+	hooks.ExecutionBlocked = recorder.ExecutionBlocked
+	hooks.CleanupBlocked = recorder.CleanupBlocked
+	hooks.LivenessFailed = func(pod *corev1.Pod, message string) { recorder.ProbeFailed(pod, true, message) }
+}
+
 func budgetMillicoresAndBytes(execution nodeagent.ExecutionConfig) (int64, int64) {
 	cpu, cpuErr := resource.ParseQuantity(execution.CPU)
 	memory, memoryErr := resource.ParseQuantity(execution.Memory)
@@ -235,6 +272,7 @@ func runExecution(ctx context.Context, node nodeagent.Config, execution nodeagen
 	}
 	if tracker.metrics != nil || tracker.recorder != nil {
 		hooks.Health = tracker.observe
+		addPodHooks(&hooks, registry, tracker.recorder)
 	}
 	if o.logMaxSize != "" {
 		runtime, err := cri.New(node.RuntimeSocket, 30*time.Second)

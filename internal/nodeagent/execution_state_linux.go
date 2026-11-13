@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/ameukam/brie/internal/cri"
 )
@@ -51,6 +52,31 @@ type executionRecord struct {
 	// never removes an image that an unfinished record names, and refuses to
 	// run while an unfinished record lacks it. Older journals omit it.
 	Image string `json:",omitempty"`
+	// PendingStage and PendingSince record when the record entered its
+	// current pending stage, stamped by the save that commits the stage
+	// before its CRI call. A pending record read without them keeps
+	// PendingStage with a zero PendingSince: its entry time is unknown, never
+	// assumed. Older journals omit them.
+	PendingStage string    `json:",omitempty"`
+	PendingSince time.Time `json:",omitzero"`
+}
+
+// pendingStage reports whether stage is committed before a CRI call.
+func pendingStage(stage string) bool {
+	return stage == "reserved" || stage == "sandbox-pending" || stage == "container-pending" || stage == "start-pending"
+}
+
+// stampPending records the entry time of each record that entered a pending
+// stage since the last save and clears it for records that left one.
+func (j *executionJournal) stampPending(now time.Time) {
+	for _, record := range j.Records {
+		switch {
+		case !pendingStage(record.Stage):
+			record.PendingStage, record.PendingSince = "", time.Time{}
+		case record.PendingStage != record.Stage:
+			record.PendingStage, record.PendingSince = record.Stage, now
+		}
+	}
 }
 
 type executionJournal struct {
@@ -62,6 +88,8 @@ type executionJournal struct {
 	Records                     map[string]*executionRecord
 	dir                         string
 	lock                        *os.File
+	// saved, when set, receives the encoded size after each durable save.
+	saved func(bytes int)
 }
 
 func openExecutionJournal(dir, node string, config ExecutionConfig) (_ *executionJournal, retErr error) {
@@ -173,6 +201,13 @@ func (j *executionJournal) decode(data []byte, node string, config ExecutionConf
 		if (record.Stage == "created" || record.Stage == "start-pending" || record.Stage == "running") && record.ContainerID == "" {
 			return errors.New("execution journal lost container identity")
 		}
+		if record.PendingStage != "" && (record.PendingStage != record.Stage || !pendingStage(record.Stage)) ||
+			record.PendingStage == "" && !record.PendingSince.IsZero() {
+			return errors.New("invalid execution journal pending stage time")
+		}
+		if record.PendingStage == "" && pendingStage(record.Stage) {
+			record.PendingStage = record.Stage
+		}
 	}
 	j.Version = executionJournalVersion
 	return nil
@@ -181,6 +216,7 @@ func (j *executionJournal) decode(data []byte, node string, config ExecutionConf
 func (j *executionJournal) close() error { return j.lock.Close() }
 
 func (j *executionJournal) save() (retErr error) {
+	j.stampPending(time.Now().UTC())
 	data, err := json.Marshal(j)
 	if err != nil {
 		return fmt.Errorf("encode execution journal: %w", err)
@@ -220,5 +256,11 @@ func (j *executionJournal) save() (retErr error) {
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	if err := errors.Join(dir.Sync(), dir.Close()); err != nil {
+		return err
+	}
+	if j.saved != nil {
+		j.saved(len(data))
+	}
+	return nil
 }

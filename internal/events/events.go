@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package events records the node agent's Kubernetes Events (DESIGN 12.3):
-// admission refusals, image pull failures, admission barrier entry and exit,
-// and cleanup blocked on missing deletion evidence. Events supplement Pod and
+// admission refusals, image pull failures and backoff, admission barrier entry
+// and exit, Pods whose execution is blocked, liveness failures, and cleanup
+// blocked on missing deletion evidence. Events supplement Pod and
 // Node status; they never replace it.
 //
 // Identical Events are deduplicated locally for a window, a token bucket
@@ -32,6 +33,7 @@ import (
 // reason, such as UnsupportedPod or InsufficientResources.
 const (
 	ReasonImagePullFailed      = "ImagePullFailed"
+	ReasonImagePullBackOff     = "ImagePullBackOff"
 	ReasonBarrierRaised        = "AdmissionBarrierRaised"
 	ReasonBarrierLowered       = "AdmissionBarrierLowered"
 	ReasonCleanupBlocked       = "CleanupBlocked"
@@ -118,6 +120,17 @@ func (r *Recorder) PodRefused(pod *corev1.Pod, reason, message string) {
 // ImagePullFailed records a failed image pull for a Pod.
 func (r *Recorder) ImagePullFailed(pod *corev1.Pod, message string) {
 	r.emit(podReference(pod), corev1.EventTypeWarning, ReasonImagePullFailed, message)
+}
+
+// ImagePullBackOff records that a Pod's image pull backs off after a failure.
+func (r *Recorder) ImagePullBackOff(pod *corev1.Pod, message string) {
+	r.emit(podReference(pod), corev1.EventTypeWarning, ReasonImagePullBackOff, message)
+}
+
+// ExecutionBlocked records the stable reason of a Pod's ExecutionBlocked
+// condition, such as ExecutionConfigChanged.
+func (r *Recorder) ExecutionBlocked(pod *corev1.Pod, reason, message string) {
+	r.emit(podReference(pod), corev1.EventTypeWarning, reason, message)
 }
 
 // CleanupBlocked records that cleanup waits for positive deletion evidence.

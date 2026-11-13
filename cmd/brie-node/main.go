@@ -54,10 +54,12 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	flags.StringVar(&execution.LogDir, "pod-log-dir", "", "Dedicated host directory for CRI container logs")
 	flags.StringVar(&execution.ImageGCThreshold, "image-gc-threshold", "",
 		"Remove unreferenced images through CRI while image filesystem usage exceeds this many bytes, such as 50Gi (default disabled)")
+	flags.BoolVar(&execution.Probes, "enable-probes", false,
+		"Accept readiness and liveness probes, gate Pod readiness on them, and fail a Pod whose liveness probe fails (requires --enable-workloads)")
 	executionFlags := map[string]bool{
 		"runtime-class": true, "runtime-handler": true, "allocatable-cpu": true, "allocatable-memory": true,
 		"max-pods": true, "node-ip": true, "cluster-dns": true, "cluster-domain": true, "state-dir": true, "pod-log-dir": true,
-		"image-gc-threshold": true,
+		"image-gc-threshold": true, "enable-probes": true,
 	}
 	observability := &observabilityOptions{}
 	observability.register(flags)
