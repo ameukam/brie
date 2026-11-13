@@ -27,7 +27,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
   retention references. No checkpoint is produced yet.
 - A standard-library Cloud Storage JSON API checkpoint store with immutable
   `ifGenerationMatch=0` uploads, CRC32C/MD5, size, and generation read-back
-  verification, manifest publication only after every artifact verifies,
+  verification, artifact verification that downloads each object generation
+  and recomputes its size, CRC32C, and SHA-256, manifest publication and
+  reads only after every artifact verifies,
   strict manifest reads, errors that name only the HTTP status and a known
   storage reason, a redacting GCE metadata-server token source, refused
   redirects, and bounded retries with per-attempt deadlines. It is tested only

@@ -5,8 +5,10 @@
 // Storage through its JSON API, using only the standard library.
 //
 // Uploads are immutable (ifGenerationMatch=0) and verified by size, CRC32C,
-// MD5, and object generation read back from the store. A manifest is
-// published last, after every artifact it references verifies. The package
+// MD5, and object generation read back from the store. Verifying an artifact
+// downloads its generation and recomputes its size, CRC32C, and SHA-256. A
+// manifest is published last, after every artifact it references verifies,
+// and a read manifest is returned only after the same verification. The package
 // is tested only against an in-process fake; it has not been run against a
 // real bucket.
 package gcs
@@ -354,7 +356,10 @@ func (s *Store) objectRequest(ctx context.Context, bucket, name string, generati
 }
 
 // VerifyArtifact checks that the artifact's object generation exists with
-// the recorded size and CRC32C.
+// the recorded size and CRC32C, then downloads that generation and checks
+// that its bytes have the recorded size, CRC32C, and SHA-256. The service
+// reports no SHA-256, so only the download binds the manifest digest to the
+// stored bytes.
 func (s *Store) VerifyArtifact(ctx context.Context, artifact checkpoint.Artifact) error {
 	if err := artifact.Object.Validate(); err != nil {
 		return err
@@ -365,6 +370,40 @@ func (s *Store) VerifyArtifact(ctx context.Context, artifact checkpoint.Artifact
 	}
 	if object.Size != artifact.SizeBytes || object.CRC32C != artifact.CRC32C {
 		return fmt.Errorf("verify artifact %s: %w", artifact.Object.Name, ErrIntegrity)
+	}
+	if err := s.retry(ctx, func(ctx context.Context) error { return s.digestOnce(ctx, artifact) }); err != nil {
+		return fmt.Errorf("verify artifact %s: %w", artifact.Object.Name, err)
+	}
+	return nil
+}
+
+// digestOnce streams one artifact generation through SHA-256 and CRC32C
+// without buffering it.
+func (s *Store) digestOnce(ctx context.Context, artifact checkpoint.Artifact) error {
+	ref := artifact.Object
+	response, err := s.do(ctx, func(ctx context.Context) (*http.Request, error) {
+		return s.objectRequest(ctx, ref.Bucket, ref.Name, ref.Generation, true)
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxMetadataBytes))
+		if err != nil {
+			return retryableError{fmt.Errorf("read storage response: %w", err)}
+		}
+		return statusError("download", response.StatusCode, body)
+	}
+	sha := sha256.New()
+	crc := crc32.New(castagnoli)
+	n, err := io.Copy(io.MultiWriter(sha, crc), io.LimitReader(response.Body, artifact.SizeBytes+1))
+	if err != nil {
+		return retryableError{fmt.Errorf("download: %w", err)}
+	}
+	if n != artifact.SizeBytes || hex.EncodeToString(sha.Sum(nil)) != artifact.SHA256 ||
+		encodeCRC32C(crc.Sum32()) != artifact.CRC32C {
+		return fmt.Errorf("downloaded bytes: %w", ErrIntegrity)
 	}
 	return nil
 }
@@ -483,23 +522,32 @@ func (s *Store) retry(ctx context.Context, attempt func(context.Context) error) 
 	return fmt.Errorf("giving up after %d attempts: %w", s.maxAttempts, err)
 }
 
-// send authorizes and runs one request and reads at most limit body bytes.
+// do authorizes and runs one request; the caller closes the response body.
 // Transport failures are transient. The token is set only as a header and
 // never appears in returned errors.
-func (s *Store) send(ctx context.Context, build func(context.Context) (*http.Request, error), limit int64) (int, []byte, error) {
+func (s *Store) do(ctx context.Context, build func(context.Context) (*http.Request, error)) (*http.Response, error) {
 	token, err := s.tokens.Token(ctx)
 	if err != nil {
-		return 0, nil, retryableError{fmt.Errorf("obtain storage access token: %w", err)}
+		return nil, retryableError{fmt.Errorf("obtain storage access token: %w", err)}
 	}
 	request, err := build(ctx)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+token.value)
 	request.Header.Set("User-Agent", "brie-checkpoint")
 	response, err := s.client.Do(request)
 	if err != nil {
-		return 0, nil, retryableError{fmt.Errorf("storage request: %w", err)}
+		return nil, retryableError{fmt.Errorf("storage request: %w", err)}
+	}
+	return response, nil
+}
+
+// send runs one request through do and reads at most limit body bytes.
+func (s *Store) send(ctx context.Context, build func(context.Context) (*http.Request, error), limit int64) (int, []byte, error) {
+	response, err := s.do(ctx, build)
+	if err != nil {
+		return 0, nil, err
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
