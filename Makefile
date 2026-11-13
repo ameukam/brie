@@ -49,6 +49,8 @@ fuzz:
 	$(GO) test ./internal/checkpoint -run='^$$' -fuzz='^FuzzDecodeManifest$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/checkpoint/gcs -run='^$$' -fuzz='^FuzzDecodeObjectMetadata$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/checkpoint/gcs -run='^$$' -fuzz='^FuzzDecodeMetadataToken$$' -fuzztime=10s -parallel=2
+	$(GO) test ./tests/hw -run='^$$' -fuzz='^FuzzChecksumsFile$$' -fuzztime=10s -parallel=2
+	$(GO) test ./tests/hw -run='^$$' -fuzz='^FuzzPriceTable$$' -fuzztime=10s -parallel=2
 
 e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e
