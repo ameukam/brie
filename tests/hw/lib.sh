@@ -153,27 +153,35 @@ hw_load_prices() {
 		[[ $value =~ $HW_USD_PATTERN ]] || hw_die "price for $key is not a USD amount: $value"
 	done
 	HW_COMMITTED_USD_PER_HOUR=0
+	HW_BUDGET_HOURS=$PLANNED_HOURS
 }
 
 hw_price() {
 	awk -v k="$1" '$1 == k { print $2 }' "$PRICE_TABLE"
 }
 
-# hw_projected_usd prints the spend projected over PLANNED_HOURS for an hourly
-# rate.
+# hw_projected_usd prints, rounded up to the cent, the spend projected over
+# HW_BUDGET_HOURS for an hourly rate. It is for display; decisions use
+# hw_over_ceiling on unrounded values.
 hw_projected_usd() {
-	awk -v r="$1" -v h="$PLANNED_HOURS" 'BEGIN { printf "%.2f", r * h }'
+	awk -v r="$1" -v h="$HW_BUDGET_HOURS" 'BEGIN { c = r * h * 100; i = int(c); if (i < c) i++; printf "%.2f", i / 100 }'
+}
+
+# hw_over_ceiling succeeds when an hourly rate held for HW_BUDGET_HOURS
+# exceeds SPEND_CEILING_USD, comparing unrounded amounts.
+hw_over_ceiling() {
+	awk -v r="$1" -v h="$HW_BUDGET_HOURS" -v c="$SPEND_CEILING_USD" 'BEGIN { exit !(r * h > c + 0) }'
 }
 
 # hw_budget_reserve refuses a create when the committed hourly rate plus this
-# resource, held for PLANNED_HOURS, would exceed SPEND_CEILING_USD.
+# resource, held for HW_BUDGET_HOURS, would exceed SPEND_CEILING_USD.
 hw_budget_reserve() {
 	local key=$1 units=$2 what=$3 rate projected
 	rate=$(awk -v c="$HW_COMMITTED_USD_PER_HOUR" -v p="$(hw_price "$key")" -v u="$units" \
-		'BEGIN { printf "%.6f", c + p * u }')
+		'BEGIN { printf "%.17g", c + p * u }')
 	projected=$(hw_projected_usd "$rate")
-	if hw_greater "$projected" "$SPEND_CEILING_USD"; then
-		hw_die "refusing to create $what: projected spend $projected USD over $PLANNED_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
+	if hw_over_ceiling "$rate"; then
+		hw_die "refusing to create $what: projected spend $projected USD over $HW_BUDGET_HOURS h exceeds ceiling $SPEND_CEILING_USD USD"
 	fi
 	HW_COMMITTED_USD_PER_HOUR=$rate
 	hw_log budget "$what key=$key units=$units projected_usd=$projected"
