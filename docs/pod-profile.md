@@ -148,11 +148,21 @@ unsupported.
 
 ## Lifecycle and failure behavior
 
-Assigned Pods are listed with a node field selector and bounded pagination on a
-two-second poll. After each complete read, at most one operation per Pod UID runs
+Assigned Pods are read through a node-scoped watch. A complete,
+quorum-consistent list with a node field selector and bounded pagination seeds
+the view; a watch with bookmarks, scoped by the same selector, then continues
+from the list's resource version. A closed stream resumes from the latest event
+or bookmark version. An expired resource version (HTTP 410), a watch error
+event, or an event the view cannot apply triggers a full relist with bounded
+exponential backoff (one to thirty seconds with jitter), and a full relist also
+runs every five minutes as a safety net. While the view is not synchronized,
+passes mutate nothing and the Node stays unready. WatchList streaming is not
+used. A pass runs when the view changes and at least every two seconds, reading
+the watched view and the complete local CRI inventory; it makes no API list
+request. After each complete read, at most one operation per Pod UID runs
 on bounded workers: four for deletion, cleanup, and status work, and two for
 admitted creation, each pool with its own CRI client. A Pod with an operation in
-flight is skipped until it ends, and a full pool defers work to the next poll
+flight is skipped until it ends, and a full pool defers work to the next pass
 without delaying other Pods. Admission still runs in Pod creation order. Lease
 renewal runs independently of the five-second health/status loop and the
 workload RPC queues. Workload RPCs have a two-minute timeout; health RPCs retain
@@ -198,16 +208,17 @@ A Pod that disappears before cleanup finishes, including a terminal Pod deleted
 right after its exit is reported, a force-deleted running Pod, and terminated-Pod
 garbage collection, is cleaned up only on positive deletion evidence: a
 successful, complete, quorum-consistent node-scoped Pod list with a resource
-version that omits the Pod UID. The execution must be this agent's own: its
+version that omits the Pod UID, or a watch `DELETED` event for that UID received
+on a stream that continues such a list without a gap. The execution must be this agent's own: its
 journal record, sandbox metadata UID, and owner labels agree. The agent journals
-that list resource version as `DeletionObserved` before the first destructive
-step; the durable record then authorizes the idempotent stop/remove steps across
+the `DELETED` event's resource version, or otherwise the view's resource
+version, as `DeletionObserved` before the first destructive step; the durable record then authorizes the idempotent stop/remove steps across
 restarts without a Pod read, which the Node authorizer rejects once the Pod is
 gone. The container is stopped with zero grace. A failed, forbidden, truncated,
 or version-less list, a `NotFound` or `Forbidden` Pod read, a foreign or
 ambiguous runtime object, an unresolved sandbox creation, and a recorded deletion
 contradicted by a listed Pod are not evidence; they preserve the execution and
-block admission. There is no watch yet, so watch `DELETED` events are not used.
+block admission.
 
 API/runtime outages, foreign or orphan executions without deletion evidence,
 ambiguous associations, missing known IDs, and over-budget reconstructed
@@ -224,9 +235,9 @@ one removed by an operator or finished under the version 1 journal schema. The
 journal schema is now version 2; version 1 journals are read and rewritten as
 version 2, and older agents refuse version 2. The journal stays bounded to
 10,000 records and 4 MiB; retained records still need reviewed operator
-maintenance before those limits are reached. Polling, startup latency, host/guest
-resource enforcement, and real scheduler-to-Kata execution still require runtime
-qualification before deploying this mode.
+maintenance before those limits are reached. Watch and pass intervals, startup
+latency, host/guest resource enforcement, and real scheduler-to-Kata execution
+still require runtime qualification before deploying this mode.
 
 ## C4A hardware smoke (2026-10-30)
 

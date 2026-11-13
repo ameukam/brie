@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- With `--enable-workloads`, assigned Pods are read through a node-scoped watch
+  with bookmarks instead of a two-second API list. An expired resource version
+  or a watch error triggers a full relist with bounded backoff, and a full
+  relist runs every five minutes. A watch `DELETED` event for an execution the
+  agent created is journaled as deletion evidence before cleanup. Passes still
+  read the complete CRI inventory at least every two seconds.
 - With `--enable-workloads`, finished execution journal records are compacted
   once `RemovePodSandbox` succeeded, the Pod is gone from the complete
   assigned-Pod view, and a complete CRI inventory shows none of the record's
