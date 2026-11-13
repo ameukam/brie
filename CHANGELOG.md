@@ -41,7 +41,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
   authorization using kubelet's node subresource mapping, `/healthz`,
   `/metrics`, bounded `/containerLogs`, and `/exec`, `/attach`, and
-  `/portForward` proxied to CRI streaming URLs. Review errors refuse requests,
+  `/portForward` proxied to CRI streaming URLs. `/exec` and `/attach` take
+  kubelet's `input`, `output`, `error`, `tty`, and `command` parameters. Review errors refuse requests,
   and a sandbox in a lifecycle-extension state other than running is refused
   without being resumed. CRI `Exec`, `Attach`, `PortForward`, `ExecSync`, and
   `ReopenContainerLog` client calls support it. Not yet wired into the agent;
