@@ -29,8 +29,13 @@ versioning. Dated nightly prereleases are development builds, not stable release
   with prepare, resume, and abort messages, length-limited canonical JSON, and
   a `brie-guestctl` relay. The supervisor listens only on a Unix socket inside
   the workload container; the host reaches it through CRI ExecSync, so Kata
-  stays the only guest-control channel. Nothing in the node agent calls it,
-  and it is tested only against fakes and local sockets, not on Kata.
+  stays the only guest-control channel. Nothing in the node agent calls it, and
+  it is tested only against fakes and local sockets, not on Kata. After an
+  invalid safe point whose cleanup abort failed, the supervisor refuses other
+  requests until an abort of that operation succeeds. A resume retry is refused
+  once a later epoch has been seen. The supervisor holds an exclusive lock on
+  `<socket>.lock` while it listens and replaces a leftover socket only when
+  connecting to it is refused.
 - A credential-free sample cooperative workload, `brie-counter`, with an
   unbuilt `scratch` image Dockerfile in `examples/counter`. It fsyncs every
   acknowledged increment to a state file, stops admitting work at prepare,
@@ -40,19 +45,25 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - A versioned checkpoint manifest schema (`brie.checkpoint/v1alpha1`) with
   strict canonical JSON decoding and validation of identity, epoch, operation,
   generation, VM-state, memory, and disk artifacts by object generation, size,
-  SHA-256, and CRC32C, the restore compatibility tuple, device layout, resume
+  SHA-256, and CRC32C, the restore compatibility tuple (including the guest
+  agent version and security profile), device layout, resume
   protocol, safe point, watermark, creation time, and encryption, access, and
   retention references. No checkpoint is produced yet.
 - A standard-library Cloud Storage JSON API checkpoint store with immutable
   `ifGenerationMatch=0` uploads, CRC32C/MD5, size, and generation read-back
-  verification, manifest publication only after every artifact verifies,
-  strict manifest reads, a redacting GCE metadata-server token source, refused
+  verification, artifact verification that downloads each object generation
+  and recomputes its size, CRC32C, and SHA-256, manifest publication and
+  reads only after every artifact verifies,
+  strict manifest reads, errors that name only the HTTP status and a known
+  storage reason, a redacting GCE metadata-server token source, refused
   redirects, and bounded retries with per-attempt deadlines. It is tested only
   against an in-process fake server; no real bucket has been used.
 - A conditional checkpoint-reference commit helper. It updates a Sandbox's
   committed-checkpoint reference only with UID and resource-version
   preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
-  older generations, and is idempotent after a lost reply. It is an interface
+  older generations, and is idempotent after a lost reply only while the
+  Sandbox is not being deleted, is still at the reference's placement epoch,
+  and still requests suspension by its operation. It is an interface
   tested against a fake; the Sandbox controller implementation is separate.
 - Opt-in `brie-node` flags, all off by default: `--log-format=json`;
   `--enable-serving` with `--serving-address`, `--tls-cert-file`,

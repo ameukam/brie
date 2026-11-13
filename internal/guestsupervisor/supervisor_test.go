@@ -20,8 +20,10 @@ type fakeWorkload struct {
 	prepareErr error
 	resumeErr  error
 	abortErr   error
-	block      chan struct{}
-	resumed    []ResumeRequest
+	// abortFailures fails that many aborts before abortErr applies.
+	abortFailures int
+	block         chan struct{}
+	resumed       []ResumeRequest
 }
 
 func (w *fakeWorkload) Prepare(ctx context.Context, request PrepareRequest) (SafePoint, error) {
@@ -46,6 +48,12 @@ func (w *fakeWorkload) Resume(_ context.Context, request ResumeRequest) error {
 
 func (w *fakeWorkload) Abort(_ context.Context, operationID string) error {
 	w.record("abort " + operationID)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.abortFailures > 0 {
+		w.abortFailures--
+		return errors.New("stuck")
+	}
 	return w.abortErr
 }
 
@@ -193,8 +201,52 @@ func TestSupervisorTransitions(t *testing.T) {
 		{
 			name:     "invalid safe point and failed abort",
 			workload: &fakeWorkload{point: SafePoint{ID: "not valid"}, abortErr: errors.New("stuck")},
-			steps:    []step{{request: prepareRequest("op-1", 1, deadline), outcome: OutcomeRefusal, reason: "abort failed"}},
-			calls:    "prepare op-1,abort op-1",
+			steps: []step{
+				{request: prepareRequest("op-1", 1, deadline), outcome: OutcomeRefusal, reason: "abort failed"},
+				{request: abortRequest("op-1"), outcome: OutcomeRefusal, reason: "workload failed"},
+				{request: abortRequest("op-1"), outcome: OutcomeRefusal, reason: "workload failed"},
+				{request: abortRequest("op-2"), outcome: OutcomeRefusal, reason: "awaits a successful abort"},
+				{request: resumeRequest("op-1", 1, testTime), outcome: OutcomeRefusal, reason: "awaits a successful abort"},
+				{request: prepareRequest("op-1", 1, deadline), outcome: OutcomeRefusal, reason: "awaits a successful abort"},
+				{request: prepareRequest("op-2", 1, deadline), outcome: OutcomeRefusal, reason: "awaits a successful abort"},
+			},
+			calls: "prepare op-1,abort op-1,abort op-1,abort op-1",
+		},
+		{
+			name:     "failed cleanup abort is retried until it succeeds",
+			workload: &fakeWorkload{point: SafePoint{ID: "not valid"}, abortFailures: 2},
+			steps: []step{
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeRefusal, reason: "abort failed"},
+				{request: abortRequest("op-1"), outcome: OutcomeRefusal, reason: "workload failed"},
+				{request: abortRequest("op-1"), outcome: OutcomeAborted},
+				{request: abortRequest("op-1"), outcome: OutcomeAborted},
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeRefusal, reason: "already completed"},
+				{request: prepareRequest("op-2", 1, deadline), outcome: OutcomeRefusal, reason: "stale epoch"},
+			},
+			calls: "prepare op-1,abort op-1,abort op-1,abort op-1",
+		},
+		{
+			name:     "resume replay after a later epoch is stale",
+			workload: &fakeWorkload{point: point},
+			steps: []step{
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeReady},
+				{request: prepareRequest("op-2", 3, deadline), outcome: OutcomeSafePoint},
+				{request: abortRequest("op-2"), outcome: OutcomeAborted},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeRefusal, reason: "stale epoch"},
+			},
+			calls: "prepare op-1,resume op-1,prepare op-2,abort op-2",
+		},
+		{
+			name:     "resume replay while a later epoch is prepared is stale",
+			workload: &fakeWorkload{point: point},
+			steps: []step{
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeReady},
+				{request: prepareRequest("op-2", 3, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeRefusal, reason: "stale epoch"},
+			},
+			calls: "prepare op-1,resume op-1,prepare op-2",
 		},
 		{
 			name:     "failed resume stays prepared",
