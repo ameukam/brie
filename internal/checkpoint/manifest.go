@@ -106,7 +106,10 @@ type Device struct {
 }
 
 // Compatibility is the restore compatibility tuple of DESIGN 3.3 and 9.3.
-// CPUTemplate is "none" when no template is applied.
+// CPUTemplate is "none" when no template is applied. GuestAgentVersion is the
+// in-guest runtime agent's version and SecurityProfile names the qualified
+// host and guest security profile; both are required because a different
+// agent or security configuration is a different compatibility class.
 type Compatibility struct {
 	HostKernel            string   `json:"host_kernel"`
 	CPUModel              string   `json:"cpu_model"`
@@ -114,6 +117,8 @@ type Compatibility struct {
 	FirecrackerVersion    string   `json:"firecracker_version"`
 	SnapshotFormatVersion string   `json:"snapshot_format_version"`
 	KataVersion           string   `json:"kata_version"`
+	GuestAgentVersion     string   `json:"guest_agent_version"`
+	SecurityProfile       string   `json:"security_profile"`
 	GuestKernel           string   `json:"guest_kernel"`
 	CPUTemplate           string   `json:"cpu_template"`
 	ImageDigests          []string `json:"image_digests"`
@@ -187,6 +192,8 @@ func (c Compatibility) validate() error {
 		{"firecracker_version", c.FirecrackerVersion},
 		{"snapshot_format_version", c.SnapshotFormatVersion},
 		{"kata_version", c.KataVersion},
+		{"guest_agent_version", c.GuestAgentVersion},
+		{"security_profile", c.SecurityProfile},
 		{"guest_kernel", c.GuestKernel},
 		{"cpu_template", c.CPUTemplate},
 	} {
