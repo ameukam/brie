@@ -221,14 +221,21 @@ hold in one pass:
 
 - The CRI image filesystem, image, sandbox, and container lists all succeeded.
   A failed or partial list removes nothing.
-- The last reconciliation pass completed and no execution is unresolved.
-- The runtime does not pin the image. The sandbox inventory does not name the
-  sandbox image, so collection refuses to run while sandboxes exist and no
-  listed image is pinned.
-- No container names it by ID, reference, or digest, and no unfinished journal
-  record names its reference. A digest also matches the same digest in another
-  repository. Collection refuses to run while an unfinished record written by
-  an earlier agent has no image reference.
+- The last reconciliation pass completed, no execution is unresolved, and no
+  image pull is running. No pull starts while a collection pass runs.
+- No sandbox exists. CRI does not name the image a sandbox uses, and a pinned
+  image is not known to be that image, so collection refuses to run while any
+  sandbox exists. This keeps collection from running on a node with running
+  executions.
+- The runtime does not pin the image.
+- Every listed container's image ID or image reference matches a listed image;
+  a container without one stops the pass.
+- No container names it by ID, reference, or digest; no image pull for a Pod
+  still waiting to start returned its ID; and no retained journal record names
+  its reference. A finished record stays retained until `RemovePodSandbox`
+  succeeded for the sandbox it names. A digest also matches the same digest in
+  another repository. Collection refuses to run while a retained record written
+  by an earlier agent has no image reference.
 - The image was already unreferenced at a pass at least five minutes earlier.
 
 The reported usage is the runtime's view of its image store, not a measurement
