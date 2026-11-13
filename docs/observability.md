@@ -74,9 +74,13 @@ Endpoints:
   loopback IP addresses, and strips `Authorization`, `Cookie`,
   `Impersonate-*`, and `X-Remote-*` headers.
 
-A Pod is served only from a sandbox labeled `brie.dev/execution-owner` that
-uses the configured runtime handler. When several match a namespace and name,
-the newest is used. The log file must be the runtime-reported log path, a
+A Pod is served only through the execution inventory the executor publishes
+after each pass that reads the runtime (`ExecutionHooks.Inventory`). It lists
+only executions whose journal record, owner labels, and runtime objects agree.
+The served sandbox and container must have exactly the verified IDs, Pod UID,
+names, and runtime handler; an owner label alone never qualifies. A Pod name
+with several verified executions is refused with HTTP 409 rather than resolved
+by age, and requests before the first published inventory get HTTP 503. The log file must be the runtime-reported log path, a
 plain regular file directly inside the Pod's own log directory
 (`<pod-log-dir>/<sha256(pod UID)>`); other paths and symlinks are refused.
 
@@ -182,9 +186,9 @@ or stored.
 
 ## Container log rotation
 
-`internal/logrotation` checks every running container of an owned sandbox
-(label `brie.dev/execution-owner`, configured runtime handler) every ten
-seconds. When the runtime-reported log file, which must be a regular file
+`internal/logrotation` checks every ten seconds each running container whose
+ID, sandbox ID, and Pod UID match an execution in the executor's verified
+inventory, in a sandbox of the configured runtime handler. When the runtime-reported log file, which must be a regular file
 directly inside the Pod's log directory, exceeds the maximum size (1 MiB to
 10 GiB), it removes the oldest rotated files so that at most `max files`
 remain including the current one (2 to 100), renames the log to

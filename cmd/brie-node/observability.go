@@ -16,6 +16,7 @@ import (
 	"github.com/ameukam/brie/internal/agentlog"
 	"github.com/ameukam/brie/internal/cri"
 	"github.com/ameukam/brie/internal/events"
+	"github.com/ameukam/brie/internal/execinventory"
 	"github.com/ameukam/brie/internal/logrotation"
 	"github.com/ameukam/brie/internal/metrics"
 	"github.com/ameukam/brie/internal/nodeagent"
@@ -185,6 +186,9 @@ func runExecution(ctx context.Context, node nodeagent.Config, execution nodeagen
 	defer cancel()
 	var hooks nodeagent.ExecutionHooks
 	var services []func(context.Context) error
+	// Serving and rotation act only on executions the executor verified.
+	executions := &execinventory.Store{}
+	hooks.Inventory = executions.Set
 	tracker := &barrierTracker{}
 	var registry *metrics.Metrics
 	if o.serving {
@@ -214,7 +218,7 @@ func runExecution(ctx context.Context, node nodeagent.Config, execution nodeagen
 			NodeName: node.NodeName, RuntimeHandler: execution.RuntimeHandler, LogDir: execution.LogDir,
 		}
 		server, err := serving.New(config, serving.Dependencies{
-			API: api, Runtime: runtime, Gatherer: registry.Gatherer(), Logger: logger,
+			API: api, Runtime: runtime, Executions: executions, Gatherer: registry.Gatherer(), Logger: logger,
 		})
 		if err != nil {
 			return fmt.Errorf("configure serving: %w", err)
@@ -252,7 +256,7 @@ func runExecution(ctx context.Context, node nodeagent.Config, execution nodeagen
 		rotator, err := logrotation.New(logrotation.Config{
 			LogDir: execution.LogDir, RuntimeHandler: execution.RuntimeHandler,
 			MaxSize: o.maxSizeBytes, MaxFiles: o.logMaxFiles,
-		}, runtime, nil, observe)
+		}, runtime, executions, nil, observe)
 		if err != nil {
 			return fmt.Errorf("configure log rotation: %w", err)
 		}

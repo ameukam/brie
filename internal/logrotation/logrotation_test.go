@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ameukam/brie/internal/execinventory"
 	"github.com/ameukam/brie/internal/podlog"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -57,18 +58,19 @@ func (f *fakeRuntime) ReopenContainerLog(_ context.Context, id string) error {
 func sandbox(id, uid string, owned bool, handlerName string) *runtimeapi.PodSandbox {
 	labels := map[string]string{}
 	if owned {
-		labels[executionOwnerLabel] = "owner"
+		labels["brie.dev/execution-owner"] = "owner"
 	}
 	return &runtimeapi.PodSandbox{Id: id, Metadata: &runtimeapi.PodSandboxMetadata{Uid: uid, Name: id, Namespace: "ns"},
 		Labels: labels, RuntimeHandler: handlerName}
 }
 
 type setup struct {
-	root    string
-	runtime *fakeRuntime
-	rotator *Rotator
-	logFile string
-	results []string
+	root       string
+	runtime    *fakeRuntime
+	executions *execinventory.Store
+	rotator    *Rotator
+	logFile    string
+	results    []string
 }
 
 func newSetup(t *testing.T, size int, maxFiles int) *setup {
@@ -96,7 +98,9 @@ func newSetup(t *testing.T, size int, maxFiles int) *setup {
 			t.Error(err)
 		}
 	}
-	rotator, err := New(Config{LogDir: s.root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: maxFiles}, s.runtime, nil,
+	s.executions = &execinventory.Store{}
+	s.executions.Set([]execinventory.Execution{{PodUID: "uid-1", Namespace: "ns", Name: "s1", SandboxID: "s1", ContainerName: "app", ContainerID: "c1"}})
+	rotator, err := New(Config{LogDir: s.root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: maxFiles}, s.runtime, s.executions, nil,
 		func(result string) { s.results = append(s.results, result) })
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +243,53 @@ func TestReopenFailure(t *testing.T) {
 	}
 }
 
+// TestRotationRequiresVerifiedExecution is a regression test: a container in
+// an owner-labeled sandbox is rotated, and its rotated logs pruned, only when
+// its IDs and Pod UID match an execution the executor verified.
+func TestRotationRequiresVerifiedExecution(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name       string
+		executions []execinventory.Execution
+		unset      bool
+		reopened   []string
+		err        string
+	}{
+		{name: "verified", reopened: []string{"c1"},
+			executions: []execinventory.Execution{{PodUID: "uid-1", SandboxID: "s1", ContainerID: "c1"}}},
+		{name: "owner label only", executions: []execinventory.Execution{}},
+		{name: "container of another sandbox",
+			executions: []execinventory.Execution{{PodUID: "uid-1", SandboxID: "s1", ContainerID: "c2"}}},
+		{name: "sandbox of another Pod",
+			executions: []execinventory.Execution{{PodUID: "uid-2", SandboxID: "s1", ContainerID: "c1"}}},
+		{name: "sandbox not verified yet",
+			executions: []execinventory.Execution{{PodUID: "uid-1", SandboxID: "s1"}}},
+		{name: "inventory unavailable", unset: true, err: "verified executions"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := newSetup(t, MinMaxSize+1, 2)
+			// Another owner's sandbox for the same Pod log directory.
+			s.runtime.sandboxes = append(s.runtime.sandboxes, sandbox("rogue", "uid-1", true, handler))
+			s.runtime.containers = append(s.runtime.containers,
+				&runtimeapi.Container{Id: "c3", PodSandboxId: "rogue", State: runtimeapi.ContainerState_CONTAINER_RUNNING})
+			s.runtime.logPaths["c3"] = s.logFile
+			store := &execinventory.Store{}
+			if !tt.unset {
+				store.Set(tt.executions)
+			}
+			s.rotator.executions = store
+			err := s.rotator.RotateOnce(context.Background())
+			if tt.err != "" && (err == nil || !strings.Contains(err.Error(), tt.err)) || tt.err == "" && err != nil {
+				t.Fatalf("error = %v, want %q", err, tt.err)
+			}
+			if !slices.Equal(s.runtime.reopened, tt.reopened) {
+				t.Fatalf("reopened = %v, want %v", s.runtime.reopened, tt.reopened)
+			}
+		})
+	}
+}
+
 func TestRotationRefusals(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
@@ -316,7 +367,7 @@ func TestCleanupOnlyFinishedPods(t *testing.T) {
 	finished := func(context.Context) ([]string, error) {
 		return []string{"finished", "still-present", "never-existed", "linked", ""}, nil
 	}
-	rotator, err := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime, finished, nil)
+	rotator, err := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime, &execinventory.Store{}, finished, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,11 +384,11 @@ func TestCleanupOnlyFinishedPods(t *testing.T) {
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatal("symlink target removed")
 	}
-	disabled, err := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime, nil, nil)
+	disabled, err := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime, &execinventory.Store{}, nil, nil)
 	if err != nil || disabled.CleanupOnce(context.Background()) != nil {
 		t.Fatal("cleanup without a finished source must do nothing")
 	}
-	failing, _ := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime,
+	failing, _ := New(Config{LogDir: root, RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}, runtime, &execinventory.Store{},
 		func(context.Context) ([]string, error) { return nil, errors.New("journal locked") }, nil)
 	if err := failing.CleanupOnce(context.Background()); err == nil {
 		t.Fatal("finished-source error ignored")
@@ -352,7 +403,8 @@ func TestNewAndParse(t *testing.T) {
 	t.Parallel()
 	runtime := &fakeRuntime{}
 	valid := Config{LogDir: "/var/log/brie", RuntimeHandler: handler, MaxSize: MinMaxSize, MaxFiles: 2}
-	rotator, err := New(valid, runtime, nil, nil)
+	executions := &execinventory.Store{}
+	rotator, err := New(valid, runtime, executions, nil, nil)
 	if err != nil || rotator.config.Interval != 10*time.Second {
 		t.Fatalf("New = %v", err)
 	}
@@ -366,12 +418,15 @@ func TestNewAndParse(t *testing.T) {
 	} {
 		config := valid
 		change(&config)
-		if _, err := New(config, runtime, nil, nil); err == nil {
+		if _, err := New(config, runtime, executions, nil, nil); err == nil {
 			t.Errorf("accepted %+v", config)
 		}
 	}
-	if _, err := New(valid, nil, nil, nil); err == nil {
+	if _, err := New(valid, nil, executions, nil, nil); err == nil {
 		t.Fatal("accepted nil runtime")
+	}
+	if _, err := New(valid, runtime, nil, nil, nil); err == nil {
+		t.Fatal("accepted a nil execution inventory")
 	}
 	for value, want := range map[string]int64{"10Mi": 10 << 20, "1Mi": MinMaxSize, "10Gi": MaxMaxSize} {
 		if got, err := ParseMaxSize(value); err != nil || got != want {

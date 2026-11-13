@@ -12,6 +12,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/ameukam/brie/internal/execinventory"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +24,28 @@ import (
 type podInventory struct {
 	sandbox   *runtimeapi.PodSandbox
 	container *runtimeapi.Container
+}
+
+// verifiedInventory lists the executions whose sandbox, and container when
+// present, passed the ownership checks of this pass, sorted by Pod UID.
+func verifiedInventory(records map[string]*executionRecord, inventories map[string]*podInventory,
+	ambiguous map[string]bool) []execinventory.Execution {
+	verified := make([]execinventory.Execution, 0, len(inventories))
+	for uid, inventory := range inventories {
+		record := records[uid]
+		if ambiguous[uid] || record == nil || inventory.sandbox == nil {
+			continue
+		}
+		execution := execinventory.Execution{
+			PodUID: uid, Namespace: record.Namespace, Name: record.Name, SandboxID: inventory.sandbox.Id,
+		}
+		if inventory.container != nil {
+			execution.ContainerName, execution.ContainerID = inventory.container.Metadata.Name, inventory.container.Id
+		}
+		verified = append(verified, execution)
+	}
+	sort.Slice(verified, func(i, j int) bool { return verified[i].PodUID < verified[j].PodUID })
+	return verified
 }
 
 // assignedPods returns every Pod bound to this node and the resource version of
@@ -161,6 +184,7 @@ func (e *executor) reconcile(ctx context.Context) (retErr error) {
 		}
 	}
 	e.recovery.Store(blocked)
+	e.hooks.inventoryVerified(verifiedInventory(e.journal.Records, inventories, ambiguous))
 	// A complete read barrier precedes all mutations. Calls are serialized and
 	// reconcile at most one create/start transition per Pod on each pass.
 	var podErrors []error

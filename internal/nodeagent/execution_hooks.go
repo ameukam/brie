@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	"k8s.io/client-go/rest"
 )
 
@@ -21,6 +22,10 @@ type ExecutionHooks struct {
 	Pass func(err error, at time.Time)
 	// Health receives the inputs of the Node readiness gate after each health update.
 	Health func(HealthState)
+	// Inventory receives, after each pass that read the runtime, the
+	// executions whose journal record, owner labels, and runtime objects agree.
+	// Foreign and ambiguous executions are omitted.
+	Inventory func([]execinventory.Execution)
 }
 
 // HealthState is the admission barrier input: new Pods are admitted and
@@ -48,6 +53,12 @@ func (h ExecutionHooks) leaseRenewed(err error) {
 func (h ExecutionHooks) passFinished(err error) {
 	if h.Pass != nil {
 		h.Pass(err, time.Now())
+	}
+}
+
+func (h ExecutionHooks) inventoryVerified(executions []execinventory.Execution) {
+	if h.Inventory != nil {
+		h.Inventory(executions)
 	}
 }
 
