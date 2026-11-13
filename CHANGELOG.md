@@ -17,9 +17,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
   Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
   and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
-  sums. Steps needing features Brie lacks are reported as
-  `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock `gcloud` and
-  `kubectl`.
+  sums. It creates its namespace exclusively, refuses an existing one, and
+  removes only the incarnation it created. Steps needing features Brie lacks
+  are reported as `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock
+  `gcloud` and `kubectl`.
 - `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
   control plane with the Node authorizer, NodeRestriction, bridge CNI, and
   kube-proxy in iptables mode; `kubeadm init` withholds the bootstrap token
