@@ -15,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/ameukam/brie/internal/cri"
 )
 
 // maxResourceVersion bounds the opaque list resource version kept as deletion
@@ -29,6 +31,11 @@ type executionRecord struct {
 	// list that proved the Pod deleted. Once set, it authorizes cleanup
 	// without a live Pod read. Older journals omit it.
 	DeletionObserved string `json:",omitempty"`
+	// CreateRejected is the gRPC status code with which the runtime refused
+	// the create call of the current pending stage. It is journaled before
+	// the inventory that proves nothing was created is read, and it stays set
+	// after that proof so the create is never retried. Older journals omit it.
+	CreateRejected string `json:",omitempty"`
 }
 
 type executionJournal struct {
@@ -123,6 +130,10 @@ func openExecutionJournal(dir, node string, config ExecutionConfig) (_ *executio
 		case "reserved", "sandbox-pending", "sandbox", "container-pending", "created", "start-pending", "running", "finished":
 		default:
 			return nil, errors.New("unknown execution journal stage")
+		}
+		if record.CreateRejected != "" && (!cri.IsRejectionCode(record.CreateRejected) ||
+			record.Stage == "created" || record.Stage == "start-pending" || record.Stage == "running") {
+			return nil, errors.New("invalid execution journal creation evidence")
 		}
 		if record.Stage != "reserved" && record.Stage != "sandbox-pending" && record.Stage != "finished" && record.SandboxID == "" {
 			return nil, errors.New("execution journal lost sandbox identity")

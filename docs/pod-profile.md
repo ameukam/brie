@@ -67,7 +67,7 @@ unready, exited, and `CONTAINER_UNKNOWN` objects are not filtered out or claimed
 Container status has no sandbox ID: retain its list association, never join by
 name alone, and recheck identity before any future action.
 
-Each RPC shares the existing serialized slot, timeout (including queueing and
+Each RPC shares the client's bounded call slots, timeout (including queueing and
 connection setup), cancellation, and 64-KiB send/receive bounds. CRI lists have
 no pagination here; an oversized response fails rather than returning a truncated
 inventory. Malformed identities, missing metadata, unknown enum values, invalid
@@ -148,10 +148,15 @@ unsupported.
 
 ## Lifecycle and failure behavior
 
-Assigned Pods are listed with a node field selector and bounded pagination, then
-reconciled serially on a two-second poll. Lease renewal runs independently of the
-five-second health/status loop and the workload RPC queue. Workload RPCs have a
-two-minute timeout; health RPCs retain ten-second deadlines.
+Assigned Pods are listed with a node field selector and bounded pagination on a
+two-second poll. After each complete read, at most one operation per Pod UID runs
+on bounded workers: four for deletion, cleanup, and status work, and two for
+admitted creation, each pool with its own CRI client. A Pod with an operation in
+flight is skipped until it ends, and a full pool defers work to the next poll
+without delaying other Pods. Admission still runs in Pod creation order. Lease
+renewal runs independently of the five-second health/status loop and the
+workload RPC queues. Workload RPCs have a two-minute timeout; health RPCs retain
+ten-second deadlines.
 
 The agent observes/pulls immutable public images, runs a sandbox with the explicit
 handler, creates the container, then starts it. Security settings, CPU/memory
@@ -165,6 +170,22 @@ checksum, exclusive lock, and write/fsync/rename/directory-fsync commit sequence
 Each create/start intent is committed before the RPC. Lost replies are recovered
 only from matching observations, including across restart. An uncertain absent
 result blocks admission rather than triggering another create or start.
+A sandbox or container create is proven to have created nothing only when the
+runtime answered with a definite rejection (`InvalidArgument`, `NotFound`,
+`FailedPrecondition`, `PermissionDenied`, or `OutOfRange`, codes grpc-go never
+generates itself), the code is journaled, and a later complete sandbox and
+container inventory holds no object claiming the Pod. The Pod then fails with
+`SandboxCreateRejected` or `ContainerCreateRejected` and its reservation is
+released through normal cleanup; the create is never retried. Unavailable,
+deadline, cancellation, `Unknown`, and other codes remain unresolved.
+
+Faults confined to one Pod's inputs do not change Node readiness or other
+admissions. A spec change to an admitted Pod sets the Pod condition
+`brie.dev/ExecutionBlocked` with reason `ExecutionConfigChanged` and leaves the
+execution untouched until the Pod is deleted. A failed image observation or pull
+sets the same condition with reason `ImagePullFailed`, keeps the Pod `Pending`
+with its reservation, and retries with exponential backoff and jitter from ten
+seconds up to five minutes.
 
 Pod status reports observed pending/running/unknown/exited state, IP, readiness,
 exit code, and runtime identity; restartPolicy Never never restarts an exit.

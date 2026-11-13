@@ -7,6 +7,18 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- With `--enable-workloads`, a sandbox or container create that the runtime
+  definitely rejected, and that a later complete CRI inventory shows created
+  nothing, now fails its Pod with `SandboxCreateRejected` or
+  `ContainerCreateRejected` and releases the reservation instead of blocking
+  admission. Lost or interrupted replies still block admission.
+- With `--enable-workloads`, a spec change to an admitted Pod or a failed image
+  pull is published on that Pod as the `brie.dev/ExecutionBlocked` condition
+  (`ExecutionConfigChanged` or `ImagePullFailed`) and no longer withholds Node
+  readiness or other admissions. Failed pulls retry with backoff.
+- With `--enable-workloads`, Pods are reconciled by bounded workers with at most
+  one operation per Pod, and deletion, cleanup, and status work has its own
+  workers and CRI client, so a slow create or pull no longer delays other Pods.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
