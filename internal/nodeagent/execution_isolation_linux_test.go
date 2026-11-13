@@ -5,6 +5,7 @@ package nodeagent
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -178,6 +179,129 @@ func TestExecutionCreationEvidence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// failJournal makes every later journal save fail until the returned
+// function restores the journal directory.
+func failJournal(e *executor) func() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	dir := e.journal.dir
+	e.journal.dir = filepath.Join(dir, "missing")
+	return func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.journal.dir = dir
+	}
+}
+
+// TestExecutionCreationEvidenceJournalFailure is a regression test: a create
+// rejection, or its resolution, whose journal save failed must not be used.
+// The execution stays unresolved, unpublished, and untouched until a save
+// succeeds.
+func TestExecutionCreationEvidenceJournalFailure(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		// failRecording fails the save of the rejection itself; otherwise
+		// the save of its resolution fails.
+		failRecording bool
+	}{
+		{name: "rejection-recording", failRecording: true},
+		{name: "rejection-resolution"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newExecutor(t, executionPod("app"))
+			service.reject = map[string]codes.Code{"CreateContainer": codes.InvalidArgument}
+			var restore func()
+			failed := make(chan func(), 1)
+			if test.failRecording {
+				var once sync.Once
+				service.beforeCreate = func(method string) {
+					if method == "CreateContainer" {
+						once.Do(func() { failed <- failJournal(e) })
+					}
+				}
+			}
+			rejected := false
+			for range 8 {
+				if err := e.reconcile(t.Context()); status.Code(err) == codes.InvalidArgument {
+					rejected = true
+					break
+				}
+			}
+			if !rejected {
+				t.Fatal("container create was not rejected")
+			}
+			if test.failRecording {
+				restore = <-failed
+			} else {
+				if record := e.record("app-uid"); record.CreateRejected != "InvalidArgument" {
+					t.Fatalf("rejection not journaled: %+v", record)
+				}
+				restore = failJournal(e)
+			}
+			for range 3 {
+				if err := e.reconcile(t.Context()); err == nil {
+					t.Fatal("pass succeeded without a journal")
+				}
+				e.mu.Lock()
+				record := *e.journal.Records["app-uid"]
+				e.mu.Unlock()
+				if record.Stage != "container-pending" ||
+					test.failRecording && record.CreateRejected != "" {
+					t.Fatalf("unjournaled creation evidence used: %+v", record)
+				}
+				pod, err := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
+				if err != nil || terminalPod(pod) || countCalls(service, "StopPodSandbox") != 0 ||
+					countCalls(service, "RemovePodSandbox") != 0 || !e.recovery.Load() {
+					t.Fatalf("execution progressed without a journaled rejection: %v %+v", err, pod.Status)
+				}
+			}
+			restore()
+			if test.failRecording {
+				// The unjournaled rejection is lost, so the create stays
+				// unresolved rather than failing the Pod.
+				for range 3 {
+					_ = e.reconcile(t.Context())
+				}
+				if record := e.record("app-uid"); record.Stage != "container-pending" || countCalls(service, "StopPodSandbox") != 0 {
+					t.Fatalf("unjournaled rejection resolved the create: %+v", record)
+				}
+				return
+			}
+			reconcilePasses(t, e, 3)
+			pod, err := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
+			if err != nil || pod.Status.Phase != corev1.PodFailed || e.record("app-uid").Stage != "finished" {
+				t.Fatalf("journaled resolution did not complete: %v %+v", err, pod.Status)
+			}
+			if calls := countCalls(service, "CreateContainer"); calls != 1 {
+				t.Fatalf("CreateContainer issued %d times", calls)
+			}
+		})
+	}
+}
+
+// TestExecutionAdmissionJournalFailure is a regression test: a reservation
+// whose journal save failed is dropped, and admission retries it later.
+func TestExecutionAdmissionJournalFailure(t *testing.T) {
+	t.Parallel()
+	e, _ := newExecutor(t, executionPod("app"))
+	restore := failJournal(e)
+	// The first pass synchronizes the inventory; admission runs after it.
+	_ = e.reconcile(t.Context())
+	if err := e.reconcile(t.Context()); err == nil || !strings.Contains(err.Error(), "execution journal") {
+		t.Fatalf("admission without a journal = %v", err)
+	}
+	if record := e.record("app-uid"); record != nil {
+		t.Fatalf("unjournaled reservation kept: %+v", record)
+	}
+	restore()
+	reconcilePasses(t, e, 6)
+	if record := e.record("app-uid"); record == nil || record.Stage != "running" {
+		t.Fatalf("admission not retried after the journal recovered: %+v", record)
 	}
 }
 
