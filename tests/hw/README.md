@@ -186,6 +186,12 @@ Pod manifests and status, versions, and host observations, never the
 kubeconfig. The harness assumes `brie-node` already runs on the host as
 `AGENT_UNIT`.
 
+After preflight the harness creates the `brie-m1-$RUN_ID` namespace with
+`kubectl create` (never `apply`) and the `brie-hw-run=$RUN_ID` label, and
+records its UID. It refuses to run if the namespace already exists. On exit it
+removes the namespace only if the UID and label still match, through a raw
+API call with a UID precondition; a failed preflight touches no namespace.
+
 ## Node Conformance (G1)
 
 `node-conformance.sh CHECKSUMS` runs as root on the control-plane host with
