@@ -321,6 +321,8 @@ func TestTeardown(t *testing.T) {
 		name     string
 		extra    []mockResource
 		modify   func([]mockResource)
+		fail     []string
+		messages []string
 		code     int
 		refused  []string
 		retained []string
@@ -355,6 +357,20 @@ func TestTeardown(t *testing.T) {
 			retained: []string{"networks/" + testPrefix + "-net"},
 		},
 		{
+			name:     "failed instance list",
+			fail:     []string{"compute instances list"},
+			messages: []string{"teardown: FAILED to list: compute instances list", "verify-empty: instances: list failed"},
+			code:     1,
+			retained: []string{"instances/" + testPrefix + "-metal-1"},
+		},
+		{
+			name:     "failed disk delete",
+			fail:     []string{"compute disks delete"},
+			messages: []string{"teardown: FAILED compute disks delete " + testPrefix + "-metal-1-data"},
+			code:     1,
+			retained: []string{"disks/" + testPrefix + "-metal-1-data"},
+		},
+		{
 			name:     "router with another marker keeps its NAT",
 			modify:   func(rs []mockResource) { rs[4].Description = "brie-hw-run=r20261112" },
 			code:     1,
@@ -367,10 +383,15 @@ func TestTeardown(t *testing.T) {
 			if tt.modify != nil {
 				tt.modify(resources)
 			}
-			l := newLab(t, mockState{Resources: append(resources, tt.extra...)})
+			l := newLab(t, mockState{Resources: append(resources, tt.extra...), Fail: tt.fail})
 			r := l.run("teardown.sh")
 			if r.code != tt.code {
 				t.Fatalf("exit=%d, want %d; stdout=%q stderr=%q", r.code, tt.code, r.stdout, r.stderr)
+			}
+			for _, message := range tt.messages {
+				if !strings.Contains(r.stderr, message) {
+					t.Errorf("stderr=%q; want %q", r.stderr, message)
+				}
 			}
 			for _, refused := range tt.refused {
 				if !strings.Contains(r.stderr, "REFUSED "+refused) {
@@ -444,10 +465,12 @@ func TestVerifyEmpty(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
 		resources []mockResource
+		fail      []string
 		code      int
 		stderr    string
 	}{
 		{name: "empty", resources: []mockResource{{Kind: "networks", Name: "default"}}},
+		{name: "bucket list fails", fail: []string{"storage buckets list"}, code: 1, stderr: "buckets: list failed; cannot verify"},
 		{
 			name:      "labelled disk remains",
 			resources: []mockResource{{Kind: "disks", Name: "renamed-disk", Zone: testZone, Labels: runLabels()}},
@@ -465,7 +488,7 @@ func TestVerifyEmpty(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			l := newLab(t, mockState{Resources: tt.resources})
+			l := newLab(t, mockState{Resources: tt.resources, Fail: tt.fail})
 			r := l.run("verify-empty.sh")
 			if r.code != tt.code || !strings.Contains(r.stderr, tt.stderr) {
 				t.Fatalf("exit=%d stderr=%q; want exit=%d containing %q", r.code, r.stderr, tt.code, tt.stderr)
@@ -859,4 +882,37 @@ func (l *lab) clock() int64 {
 		l.t.Fatal(err)
 	}
 	return now
+}
+
+func TestProvisionFailureTearsDown(t *testing.T) {
+	bucket := testPrefix + "-" + testProject
+	for _, tt := range []struct {
+		fail     string
+		retained []string
+		stderr   string
+	}{
+		{fail: "compute routers nats create"},
+		{fail: "compute instances attach-disk"},
+		// The bucket is labelled only after creation, so a failed label
+		// update leaves an unmarked bucket that teardown must refuse.
+		{fail: "storage buckets update", retained: []string{"buckets/" + bucket}, stderr: "REFUSED bucket gs://" + bucket},
+	} {
+		t.Run(tt.fail, func(t *testing.T) {
+			l := provisionLab(t, mockState{Fail: []string{tt.fail}})
+			r := l.run("provision.sh")
+			if r.code == 0 || !strings.Contains(r.stderr, "provision: failed; running teardown") {
+				t.Fatalf("exit=%d stderr=%q; want a failed provision that tears down", r.code, r.stderr)
+			}
+			if tt.retained != nil && (!strings.Contains(r.stderr, tt.stderr) || !strings.Contains(r.stderr, "TEARDOWN INCOMPLETE")) {
+				t.Errorf("stderr=%q; want %q and an incomplete teardown", r.stderr, tt.stderr)
+			}
+			var left []string
+			for _, res := range l.state().Resources {
+				left = append(left, res.Kind+"/"+res.Name)
+			}
+			if strings.Join(left, ",") != strings.Join(tt.retained, ",") {
+				t.Fatalf("resources left after failed provision: %v, want %v", left, tt.retained)
+			}
+		})
+	}
 }
