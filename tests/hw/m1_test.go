@@ -9,6 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ameukam/brie/internal/nodeagent"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
 const testNamespaceUID = "0b6c9f9e-1111-4222-8333-444455556666"
@@ -320,6 +325,47 @@ func TestM1HarnessInputs(t *testing.T) {
 				if call.Tool == "kubectl" || indexOf([]string{strings.Join(call.Args, " ")}, `compute ssh`) >= 0 {
 					t.Fatalf("refused harness ran %s %q", call.Tool, call.Args)
 				}
+			}
+		})
+	}
+}
+
+// TestM1HarnessManifestsFitProfile is a regression test: the probes step's
+// Pod used a tcpSocket port the container did not declare, and Brie's
+// validator refused it on hardware. Every manifest the harness applies must
+// pass the profile it is meant to exercise.
+func TestM1HarnessManifestsFitProfile(t *testing.T) {
+	l := m1Lab(t, mockState{Kubectl: m1Kubectl(), SSH: m1SSH()})
+	l.env["M1_FEATURES"] = "probes"
+	if r := l.run("m1-harness.sh"); r.code != 2 {
+		t.Fatalf("exit=%d, want 2; stdout=%q stderr=%q", r.code, r.stdout, r.stderr)
+	}
+	_, dir := m1Results(t, l)
+	for _, tt := range []struct {
+		manifest string
+		features []nodeagent.ProfileFeature
+	}{
+		{manifest: "m1-web.yaml"},
+		{manifest: "m1-probe.yaml", features: []nodeagent.ProfileFeature{nodeagent.ProfileProbes}},
+	} {
+		t.Run(tt.manifest, func(t *testing.T) {
+			file, err := os.Open(filepath.Join(dir, tt.manifest))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = file.Close() }()
+			var pod corev1.Pod
+			if err := yaml.NewYAMLOrJSONDecoder(file, 4096).Decode(&pod); err != nil {
+				t.Fatal(err)
+			}
+			// The API server and the scheduler set these fields, including the
+			// probe defaults the harness leaves unset.
+			pod.UID, pod.Spec.NodeName = types.UID("uid-"+pod.Name), l.env["NODE_NAME"]
+			if probe := pod.Spec.Containers[0].ReadinessProbe; probe != nil {
+				probe.TimeoutSeconds, probe.SuccessThreshold, probe.FailureThreshold = 1, 1, 3
+			}
+			if err := nodeagent.ValidatePodProfile(&pod, l.env["NODE_NAME"], "kata-fc", tt.features...); err != nil {
+				t.Fatalf("%s does not fit the profile: %v", tt.manifest, err)
 			}
 		})
 	}

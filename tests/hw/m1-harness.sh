@@ -200,7 +200,12 @@ fi
 record service-and-dns NOT-RUN "the harness has no Service or in-guest DNS step"
 
 if has_feature probes; then
-	probe='      readinessProbe:
+	# Brie refuses a probe on an undeclared port, and its base profile refuses
+	# declared ports, so only the probe Pod declares one.
+	probe='      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
         tcpSocket:
           port: 8080
         periodSeconds: 2'
