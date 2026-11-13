@@ -57,6 +57,9 @@ type mockState struct {
 	SSH     []mockResponse `json:"ssh,omitempty"`
 	Kubectl []mockResponse `json:"kubectl,omitempty"`
 	NextID  int            `json:"nextID"`
+	// Fail makes any gcloud call whose joined arguments contain one of these
+	// substrings exit 1 without side effects.
+	Fail []string `json:"fail,omitempty"`
 }
 
 // mockResponse answers the first call containing Match. A positive Times
@@ -192,6 +195,13 @@ func runMockGcloud(args []string) int {
 	if project != state.Project {
 		fmt.Fprintf(os.Stderr, "mock gcloud: unexpected project %q\n", project)
 		return exitMissingProject
+	}
+	joined := strings.Join(args, " ")
+	for _, f := range state.Fail {
+		if strings.Contains(joined, f) {
+			fmt.Fprintf(os.Stderr, "ERROR: (gcloud) simulated failure for %q\n", f)
+			return 1
+		}
 	}
 	code := state.handle(cmd)
 	if err := saveMockState(statePath, state); err != nil {
