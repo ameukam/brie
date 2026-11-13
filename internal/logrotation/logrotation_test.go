@@ -29,6 +29,9 @@ type fakeRuntime struct {
 	statusErr  error
 	reopened   []string
 	onReopen   func(id string)
+	// reopenLost runs onReopen and still returns reopenErr: the runtime
+	// reopened the log but its reply was lost.
+	reopenLost bool
 }
 
 func (f *fakeRuntime) ListPodSandbox(context.Context) ([]*runtimeapi.PodSandbox, error) {
@@ -45,7 +48,7 @@ func (f *fakeRuntime) ContainerStatus(_ context.Context, id string) (*runtimeapi
 
 func (f *fakeRuntime) ReopenContainerLog(_ context.Context, id string) error {
 	f.reopened = append(f.reopened, id)
-	if f.reopenErr == nil && f.onReopen != nil {
+	if (f.reopenErr == nil || f.reopenLost) && f.onReopen != nil {
 		f.onReopen(id)
 	}
 	return f.reopenErr
@@ -164,22 +167,75 @@ func TestRotateBySize(t *testing.T) {
 	}
 }
 
-func TestReopenFailureRestoresName(t *testing.T) {
+// TestReopenFailure covers both outcomes a reopen error can hide. The current
+// log written by the runtime must never be replaced or unlinked.
+func TestReopenFailure(t *testing.T) {
 	t.Parallel()
-	s := newSetup(t, MinMaxSize+1, 2)
-	s.runtime.reopenErr = errors.New("CRI ReopenContainerLog: unavailable")
-	if err := s.rotator.RotateOnce(context.Background()); err == nil {
-		t.Fatal("reopen failure not reported")
-	}
-	info, err := os.Stat(s.logFile)
-	if err != nil || info.Size() != MinMaxSize+1 {
-		t.Fatalf("log not restored: %v %v", info, err)
-	}
-	if got := rotatedFiles(t, filepath.Dir(s.logFile)); len(got) != 0 {
-		t.Fatalf("rotated files left behind: %v", got)
-	}
-	if !slices.Contains(s.results, "reopen_failed") {
-		t.Fatalf("results = %v", s.results)
+	for _, tt := range []struct {
+		name        string
+		reopenLost  bool
+		wantCurrent func(*testing.T, *setup, os.FileInfo)
+		wantRotated int
+		wantErr     string
+	}{
+		{name: "reopen did not happen", wantRotated: 0, wantErr: "unavailable",
+			wantCurrent: func(t *testing.T, _ *setup, info os.FileInfo) {
+				if info.Size() != MinMaxSize+1 {
+					t.Fatalf("current log size = %d; the original name was not restored", info.Size())
+				}
+			}},
+		{name: "reopen happened and its reply was lost", reopenLost: true, wantRotated: 1, wantErr: "both files were kept",
+			wantCurrent: func(t *testing.T, s *setup, _ os.FileInfo) {
+				content, err := os.ReadFile(s.logFile)
+				if err != nil || string(content) != "new output\n" {
+					t.Fatalf("current log = %q, %v; the runtime's new log was replaced", content, err)
+				}
+			}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := newSetup(t, MinMaxSize+1, 2)
+			s.runtime.reopenErr = errors.New("CRI ReopenContainerLog: unavailable")
+			s.runtime.reopenLost = tt.reopenLost
+			var runtimeFile *os.File
+			s.runtime.onReopen = func(string) {
+				file, err := os.OpenFile(s.logFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				runtimeFile = file
+			}
+			err := s.rotator.RotateOnce(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tt.wantErr)
+			}
+			if runtimeFile != nil {
+				defer func() { _ = runtimeFile.Close() }()
+				if _, err := runtimeFile.WriteString("new output\n"); err != nil {
+					t.Fatal(err)
+				}
+				held, err := runtimeFile.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				current, err := os.Lstat(s.logFile)
+				if err != nil || !os.SameFile(held, current) {
+					t.Fatalf("the runtime's open log is no longer at the current path: %v", err)
+				}
+			}
+			info, err := os.Lstat(s.logFile)
+			if err != nil {
+				t.Fatalf("current log missing: %v", err)
+			}
+			tt.wantCurrent(t, s, info)
+			if got := rotatedFiles(t, filepath.Dir(s.logFile)); len(got) != tt.wantRotated {
+				t.Fatalf("rotated files = %v, want %d", got, tt.wantRotated)
+			}
+			if !slices.Contains(s.results, "reopen_failed") {
+				t.Fatalf("results = %v", s.results)
+			}
+		})
 	}
 }
 
