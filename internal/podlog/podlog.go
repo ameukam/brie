@@ -113,6 +113,10 @@ func Open(dir, base string) (*os.File, error) {
 	return file, nil
 }
 
+// ErrTailScanBound reports that the requested tail lines start further back
+// than the scan bound allows.
+var ErrTailScanBound = errors.New("tail exceeds the log scan bound")
+
 // TailOffset returns the offset of the last n lines of file, scanning at most
 // maxScan bytes back from the end. A negative n selects the whole file.
 func TailOffset(file io.ReaderAt, size int64, n int64, maxScan int64) (int64, error) {
@@ -151,7 +155,7 @@ func TailOffset(file io.ReaderAt, size int64, n int64, maxScan int64) (int64, er
 		end = start
 	}
 	if end > 0 {
-		return 0, errors.New("tail exceeds the log scan bound")
+		return 0, ErrTailScanBound
 	}
 	return 0, nil
 }

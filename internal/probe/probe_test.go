@@ -164,7 +164,7 @@ func TestSuspendPreservesEvidence(t *testing.T) {
 	calls := execer.callCount()
 	execer.set(1, nil)
 	time.Sleep(50 * time.Millisecond)
-	if got := execer.callCount(); got > calls+2 {
+	if got := execer.callCount(); got != calls {
 		t.Fatalf("probes kept running while suspended: %d -> %d", calls, got)
 	}
 	if current, _ := m.Status("uid"); current.LivenessFailed || current.Ready {
@@ -178,6 +178,225 @@ func TestSuspendPreservesEvidence(t *testing.T) {
 		if err == nil {
 			t.Fatal("invalid suspension accepted")
 		}
+	}
+}
+
+// gatedExecer blocks ExecSync for containers in blocked until release is
+// closed, then answers with exit code 0 for a container's first call and
+// laterExitCode afterwards. Cancellation ends a blocked call only when
+// honorCancel is set.
+type gatedExecer struct {
+	blocked       map[string]bool
+	honorCancel   bool
+	laterExitCode int32
+	release       chan struct{}
+	started       chan string
+
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func newGatedExecer(honorCancel bool, blocked ...string) *gatedExecer {
+	g := &gatedExecer{
+		blocked: map[string]bool{}, honorCancel: honorCancel, release: make(chan struct{}),
+		started: make(chan string, 64), calls: map[string]int{},
+	}
+	for _, id := range blocked {
+		g.blocked[id] = true
+	}
+	return g
+}
+
+func (g *gatedExecer) ExecSync(ctx context.Context, containerID string, _ []string, _ int64) (*cri.ExecSyncResult, error) {
+	g.mu.Lock()
+	g.calls[containerID]++
+	first := g.calls[containerID] == 1
+	g.mu.Unlock()
+	select {
+	case g.started <- containerID:
+	default:
+	}
+	if g.blocked[containerID] {
+		cancelled := ctx.Done()
+		if !g.honorCancel {
+			cancelled = nil
+		}
+		select {
+		case <-g.release:
+		case <-cancelled:
+			return nil, ctx.Err()
+		}
+	}
+	if !first {
+		return &cri.ExecSyncResult{ExitCode: g.laterExitCode}, nil
+	}
+	return &cri.ExecSyncResult{}, nil
+}
+
+func (g *gatedExecer) callCount(containerID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls[containerID]
+}
+
+func (g *gatedExecer) awaitStart(t *testing.T, containerID string) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case id := <-g.started:
+			if id == containerID {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("no probe started in %s", containerID)
+		}
+	}
+}
+
+// slowSpec keeps probe timeouts far beyond the test so only cancellation
+// ends a blocked probe.
+func slowSpec() *corev1.Probe {
+	spec := probeSpec(execHandler(), 1, 1)
+	spec.TimeoutSeconds = 60000
+	return spec
+}
+
+// TestConcurrentAddLeavesNoUntrackedWorkers is a regression test: concurrent
+// Adds for one UID must stop every replaced worker set, so no probe runs after
+// Close.
+func TestConcurrentAddLeavesNoUntrackedWorkers(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		adds  int
+		round int
+	}{
+		{name: "two adds", adds: 2, round: 50},
+		{name: "many adds", adds: 16, round: 10},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for range tt.round {
+				execer := &fakeExecer{}
+				m := fastManager(execer, Options{})
+				start := make(chan struct{})
+				var group sync.WaitGroup
+				for i := range tt.adds {
+					group.Add(1)
+					go func() {
+						defer group.Done()
+						<-start
+						spec := probeSpec(execHandler(), 1, 1)
+						if err := m.Add(Target{PodUID: "uid", ContainerID: "c" + strconv.Itoa(i), Readiness: spec, Liveness: spec}); err != nil {
+							t.Error(err)
+						}
+					}()
+				}
+				close(start)
+				group.Wait()
+				m.Close()
+				calls := execer.callCount()
+				time.Sleep(20 * time.Millisecond)
+				if got := execer.callCount(); got != calls {
+					t.Fatalf("probes ran after Close: %d -> %d calls", calls, got)
+				}
+			}
+		})
+	}
+}
+
+// TestSuspendQuiescesProbes is a regression test: after Suspend returns, a
+// probe queued for a concurrency slot never starts, and an in-flight probe
+// result never changes the Pod's status.
+func TestSuspendQuiescesProbes(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{name: "queued for a slot", run: func(t *testing.T) {
+			execer := newGatedExecer(true, "holder")
+			m := fastManager(execer, Options{MaxConcurrent: 1})
+			defer m.Close()
+			if err := m.Add(Target{PodUID: "holder", ContainerID: "holder", Readiness: slowSpec()}); err != nil {
+				t.Fatal(err)
+			}
+			execer.awaitStart(t, "holder")
+			if err := m.Add(Target{PodUID: "queued", ContainerID: "queued", Readiness: probeSpec(execHandler(), 1, 1)}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(20 * time.Millisecond) // let the queued probe wait for the slot
+			if err := m.Suspend("queued", "Paused"); err != nil {
+				t.Fatal(err)
+			}
+			close(execer.release)
+			time.Sleep(50 * time.Millisecond)
+			if got := execer.callCount("queued"); got != 0 {
+				t.Fatalf("queued probe ran %d times after Suspend", got)
+			}
+			if current, _ := m.Status("queued"); current.Ready {
+				t.Fatalf("suspended status = %+v", current)
+			}
+		}},
+		{name: "in flight", run: func(t *testing.T) {
+			execer := newGatedExecer(true, "c1")
+			m := fastManager(execer, Options{})
+			defer m.Close()
+			if err := m.Add(Target{PodUID: "uid", ContainerID: "c1", Readiness: slowSpec()}); err != nil {
+				t.Fatal(err)
+			}
+			execer.awaitStart(t, "c1")
+			if err := m.Suspend("uid", "Paused"); err != nil {
+				t.Fatal(err)
+			}
+			calls := execer.callCount("c1")
+			close(execer.release)
+			time.Sleep(50 * time.Millisecond)
+			if got := execer.callCount("c1"); got != calls {
+				t.Fatalf("probes ran after Suspend: %d -> %d", calls, got)
+			}
+			if current, _ := m.Status("uid"); current.Ready || current.Suspended != "Paused" {
+				t.Fatalf("in-flight result changed suspended status: %+v", current)
+			}
+		}},
+		{name: "stale result after resume", run: func(t *testing.T) {
+			execer := newGatedExecer(false, "c1")
+			execer.laterExitCode = 1
+			var m *Manager
+			var everReady atomic.Bool
+			m = fastManager(execer, Options{Notify: func(uid string) {
+				if current, _ := m.Status(uid); current.Ready {
+					everReady.Store(true)
+				}
+			}})
+			defer m.Close()
+			if err := m.Add(Target{PodUID: "uid", ContainerID: "c1", Readiness: slowSpec()}); err != nil {
+				t.Fatal(err)
+			}
+			execer.awaitStart(t, "c1")
+			suspended := make(chan error, 1)
+			go func() { suspended <- m.Suspend("uid", "Paused") }()
+			waitStatus(t, m, "uid", func(s Status) bool { return s.Suspended == "Paused" })
+			if err := m.Resume("uid"); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-suspended; err != nil {
+				t.Fatal(err)
+			}
+			// The pre-suspension probe now succeeds; later probes fail. The
+			// stale success must be discarded.
+			close(execer.release)
+			time.Sleep(30 * time.Millisecond)
+			if current, _ := m.Status("uid"); current.Ready || everReady.Load() {
+				t.Fatalf("pre-suspension result made the resumed Pod ready: %+v", current)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
 	}
 }
 

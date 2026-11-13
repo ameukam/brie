@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,28 @@ type podInventory struct {
 	// createRejected is set when the creation-evidence rule proves that the
 	// pending create call created nothing (createRejectionProven).
 	createRejected bool
+}
+
+// verifiedInventory lists the executions whose sandbox, and container when
+// present, passed the ownership checks of this pass, sorted by Pod UID.
+func verifiedInventory(records map[string]*executionRecord, inventories map[string]*podInventory,
+	ambiguous map[string]bool) []execinventory.Execution {
+	verified := make([]execinventory.Execution, 0, len(inventories))
+	for uid, inventory := range inventories {
+		record := records[uid]
+		if ambiguous[uid] || record == nil || inventory.sandbox == nil {
+			continue
+		}
+		execution := execinventory.Execution{
+			PodUID: uid, Namespace: record.Namespace, Name: record.Name, SandboxID: inventory.sandbox.Id,
+		}
+		if inventory.container != nil {
+			execution.ContainerName, execution.ContainerID = inventory.container.Metadata.Name, inventory.container.Id
+		}
+		verified = append(verified, execution)
+	}
+	sort.Slice(verified, func(i, j int) bool { return verified[i].PodUID < verified[j].PodUID })
+	return verified
 }
 
 // assignedPods returns every Pod bound to this node and the resource version of
@@ -240,6 +263,7 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		return byUID[uid] != nil && records[uid] != nil && records[uid].Stage == "reserved" || busy[uid]
 	})
 	e.recovery.Store(blocked || faulted)
+	e.hooks.inventoryVerified(verifiedInventory(records, inventories, ambiguous))
 	admit := !blocked && !faulted
 
 	var pass sync.WaitGroup

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ameukam/brie/internal/execinventory"
 	"github.com/ameukam/brie/internal/podlog"
 	"k8s.io/apimachinery/pkg/api/resource"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -33,9 +34,6 @@ const (
 	// timestampFormat suffixes rotated files, as kubelet does.
 	timestampFormat = "20060102-150405"
 )
-
-// executionOwnerLabel marks sandboxes the node agent created.
-const executionOwnerLabel = "brie.dev/execution-owner"
 
 // ParseMaxSize parses a size such as "10Mi" and checks its bounds.
 func ParseMaxSize(value string) (int64, error) {
@@ -58,6 +56,12 @@ type Runtime interface {
 	ReopenContainerLog(context.Context, string) error
 }
 
+// Executions reports the executor-verified executions.
+// *execinventory.Store implements it.
+type Executions interface {
+	Executions() ([]execinventory.Execution, error)
+}
+
 // FinishedPods reports UIDs whose journal records are finished: their
 // sandboxes were removed through CRI. Only these log directories are removed.
 type FinishedPods func(context.Context) ([]string, error)
@@ -74,18 +78,21 @@ type Config struct {
 	Interval time.Duration
 }
 
-// Rotator applies the policy to running containers of owned sandboxes.
+// Rotator applies the policy to the running containers of executor-verified
+// executions.
 type Rotator struct {
-	config   Config
-	runtime  Runtime
-	finished FinishedPods
-	observe  func(string)
-	now      func() time.Time
+	config     Config
+	runtime    Runtime
+	executions Executions
+	finished   FinishedPods
+	observe    func(string)
+	now        func() time.Time
 }
 
-// New validates the policy. finished may be nil, which disables directory
-// cleanup. observe receives "rotated", "reopen_failed", or "failed".
-func New(config Config, runtime Runtime, finished FinishedPods, observe func(string)) (*Rotator, error) {
+// New validates the policy. Only containers in executions are rotated.
+// finished may be nil, which disables directory cleanup. observe receives
+// "rotated", "reopen_failed", or "failed".
+func New(config Config, runtime Runtime, executions Executions, finished FinishedPods, observe func(string)) (*Rotator, error) {
 	if !filepath.IsAbs(config.LogDir) || filepath.Clean(config.LogDir) == "/" || config.RuntimeHandler == "" {
 		return nil, errors.New("log rotation requires an absolute non-root log directory and a runtime handler")
 	}
@@ -95,8 +102,8 @@ func New(config Config, runtime Runtime, finished FinishedPods, observe func(str
 	if config.MaxFiles < MinMaxFiles || config.MaxFiles > MaxMaxFiles {
 		return nil, fmt.Errorf("container log max files must be between %d and %d", MinMaxFiles, MaxMaxFiles)
 	}
-	if runtime == nil {
-		return nil, errors.New("log rotation requires a runtime client")
+	if runtime == nil || executions == nil {
+		return nil, errors.New("log rotation requires a runtime client and the verified execution inventory")
 	}
 	if config.Interval <= 0 {
 		config.Interval = 10 * time.Second
@@ -104,7 +111,7 @@ func New(config Config, runtime Runtime, finished FinishedPods, observe func(str
 	if observe == nil {
 		observe = func(string) {}
 	}
-	return &Rotator{config: config, runtime: runtime, finished: finished, observe: observe, now: time.Now}, nil
+	return &Rotator{config: config, runtime: runtime, executions: executions, finished: finished, observe: observe, now: time.Now}, nil
 }
 
 // Run rotates and cleans up every interval until ctx is cancelled. Pass
@@ -124,25 +131,32 @@ func (r *Rotator) Run(ctx context.Context, report func(error)) error {
 	}
 }
 
-func (r *Rotator) ownedSandboxes(ctx context.Context) (map[string]*runtimeapi.PodSandbox, error) {
-	sandboxes, err := r.runtime.ListPodSandbox(ctx)
+// RotateOnce rotates the log of every running verified container above
+// MaxSize. A container is rotated only when its ID, sandbox, and Pod UID match
+// an execution the executor verified; owner labels alone never qualify.
+func (r *Rotator) RotateOnce(ctx context.Context) error {
+	executions, err := r.executions.Executions()
 	if err != nil {
-		return nil, fmt.Errorf("list sandboxes: %w", err)
+		return fmt.Errorf("read verified executions: %w", err)
 	}
-	owned := make(map[string]*runtimeapi.PodSandbox)
-	for _, sandbox := range sandboxes {
-		if sandbox.GetLabels()[executionOwnerLabel] != "" && sandbox.GetRuntimeHandler() == r.config.RuntimeHandler {
-			owned[sandbox.GetId()] = sandbox
+	verified := make(map[string]execinventory.Execution, len(executions))
+	for _, execution := range executions {
+		if execution.ContainerID != "" {
+			verified[execution.ContainerID] = execution
 		}
 	}
-	return owned, nil
-}
-
-// RotateOnce rotates the log of every running owned container above MaxSize.
-func (r *Rotator) RotateOnce(ctx context.Context) error {
-	owned, err := r.ownedSandboxes(ctx)
+	if len(verified) == 0 {
+		return nil
+	}
+	sandboxes, err := r.runtime.ListPodSandbox(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("list sandboxes: %w", err)
+	}
+	sandboxUIDs := make(map[string]string)
+	for _, sandbox := range sandboxes {
+		if sandbox.GetRuntimeHandler() == r.config.RuntimeHandler {
+			sandboxUIDs[sandbox.GetId()] = sandbox.GetMetadata().GetUid()
+		}
 	}
 	containers, err := r.runtime.ListContainers(ctx)
 	if err != nil {
@@ -150,11 +164,13 @@ func (r *Rotator) RotateOnce(ctx context.Context) error {
 	}
 	var failures []error
 	for _, container := range containers {
-		sandbox, found := owned[container.GetPodSandboxId()]
-		if !found || container.GetState() != runtimeapi.ContainerState_CONTAINER_RUNNING {
+		execution, found := verified[container.GetId()]
+		if !found || container.GetPodSandboxId() != execution.SandboxID ||
+			sandboxUIDs[execution.SandboxID] != execution.PodUID || execution.PodUID == "" ||
+			container.GetState() != runtimeapi.ContainerState_CONTAINER_RUNNING {
 			continue
 		}
-		if err := r.rotateContainer(ctx, sandbox.GetMetadata().GetUid(), container.GetId()); err != nil {
+		if err := r.rotateContainer(ctx, execution.PodUID, container.GetId()); err != nil {
 			failures = append(failures, fmt.Errorf("container %s: %w", container.GetId(), err))
 		}
 	}
@@ -205,13 +221,27 @@ func (r *Rotator) rotateContainer(ctx context.Context, podUID, containerID strin
 	}
 	if err := r.runtime.ReopenContainerLog(ctx, containerID); err != nil {
 		r.observe("reopen_failed")
-		// The runtime still writes to the renamed file; restore its name.
-		if restoreErr := root.Rename(rotated, base); restoreErr != nil {
-			return errors.Join(err, fmt.Errorf("restore container log name: %w", restoreErr))
-		}
-		return err
+		return errors.Join(err, restoreName(root, rotated, base))
 	}
 	r.observe("rotated")
+	return nil
+}
+
+// restoreName gives the rotated file its original name again after a failed
+// reopen. A reopen error is ambiguous: the runtime may have reopened the log
+// and lost the reply. The name is therefore restored with a hard link, which
+// never replaces an existing file; when the runtime already created a new
+// current file, both files are kept.
+func restoreName(root *os.Root, rotated, base string) error {
+	if err := root.Link(rotated, base); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errors.New("the runtime created a new container log despite the reopen error; both files were kept")
+		}
+		return fmt.Errorf("restore container log name: %w", err)
+	}
+	if err := root.Remove(rotated); err != nil {
+		return fmt.Errorf("remove rotated container log link: %w", err)
+	}
 	return nil
 }
 

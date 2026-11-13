@@ -70,17 +70,23 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
   `--container-log-max-size` with `--container-log-max-files`. Serving, Events,
   and rotation require `--enable-workloads`. The executor now exposes
-  observation hooks for CRI calls, Lease renewals, reconciliation passes, and
-  barrier inputs; see [docs/observability.md](docs/observability.md). Tested
+  observation hooks for CRI calls, Lease renewals, reconciliation passes,
+  barrier inputs, and its verified execution inventory. Serving and log
+  rotation act only on runtime objects in that inventory, never on a sandbox
+  merely because it carries an owner label, and refuse a Pod name with several
+  verified executions; see [docs/observability.md](docs/observability.md). Tested
   only against fakes.
 - Size-based container log rotation (`internal/logrotation`) through CRI
   `ReopenContainerLog`, with bounded max size and max files, restoring the log
-  name when the runtime cannot reopen it, and removal of Pod log directories
+  name after a reopen error without ever replacing a current log the runtime
+  may already have created, and removal of Pod log directories
   only for journal-finished Pods with no remaining sandbox. Symlinks and paths
   outside the Pod log directory are refused.
 - A probe manager (`internal/probe`) for readiness and liveness probes: exec
   through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
-  Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
+  Pod UID and suspendable for a recorded extension state. Suspension cancels
+  queued and in-flight probes and discards their results, and concurrent
+  `Add` calls for one Pod never leave untracked probe workers. `ValidatePodProfile`
   accepts bounded probes and declared TCP ports only with the new
   `ProfileProbes` feature, which execution mode passes only with
   `--enable-probes`.
@@ -93,12 +99,18 @@ versioning. Dated nightly prereleases are development builds, not stable release
   pending stage age, CRI latency and errors by method, image pulls, journal
   bounds, Lease renewal failures, probes, log rotation, and Events, with
   bounded label values and no tenant data in labels. CRI clients accept a call
-  observer. A gauge that was never set is not exported.
+  observer. A gauge that was never set is not exported, so unreported state
+  is never exported as zero.
 - A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
   1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
   authorization using kubelet's node subresource mapping, `/healthz`,
   `/metrics`, bounded `/containerLogs`, and `/exec`, `/attach`, and
-  `/portForward` proxied to CRI streaming URLs. Review errors refuse requests,
+  `/portForward` proxied to CRI streaming URLs. `/exec` and `/attach` take
+  kubelet's `input`, `output`, `error`, `tty`, and `command` parameters.
+  A `tailLines` request whose start lies beyond the 64 MiB scan bound is
+  refused with HTTP 422 before any output, not answered with an empty 200.
+  Failed requests are logged with an operation name and a bounded error code,
+  never the text of runtime, streaming proxy, or review errors. Review errors refuse requests,
   and a sandbox in a lifecycle-extension state other than running is refused
   without being resumed. CRI `Exec`, `Attach`, `PortForward`, `ExecSync`, and
   `ReopenContainerLog` client calls support it. Not yet wired into the agent;

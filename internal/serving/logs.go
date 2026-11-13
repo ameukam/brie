@@ -126,15 +126,22 @@ func (s *Server) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	file, err := s.openContainerLog(r.Context(), namespace, pod, container)
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "container log open", err)
 		return
 	}
 	defer func() { _ = file.Close() }()
+	// Every failure that can precede output is reported before the status is
+	// committed, so a failed tail is never sent as an empty success.
+	if err := seekLogStart(file, options.TailLines); err != nil {
+		s.fail(w, r, "container log seek", err)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	if err := s.copyLogs(r.Context(), w, file, options); err != nil && r.Context().Err() == nil {
-		s.logger.WarnContext(r.Context(), "container log stream ended", "error", err.Error())
+		s.logger.WarnContext(r.Context(), "container log stream ended",
+			"operation", "container log stream", "code", errorCode(err))
 	}
 }
 
@@ -185,22 +192,32 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// copyLogs writes the selected records as kubelet does: content only, or
-// prefixed by the record's RFC 3339 timestamp. Follow polls for growth and
-// reopens the current file after rotation until the client leaves or the
-// byte limit is reached.
-func (s *Server) copyLogs(ctx context.Context, w http.ResponseWriter, file *os.File, options LogOptions) error {
+// seekLogStart positions file at the first of its last tailLines lines, or at
+// the start when tailLines is negative. A tail beyond the scan bound is refused.
+func seekLogStart(file *os.File, tailLines int64) error {
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat container log: %w", err)
 	}
-	offset, err := podlog.TailOffset(file, info.Size(), options.TailLines, maxTailScan)
+	offset, err := podlog.TailOffset(file, info.Size(), tailLines, maxTailScan)
+	if errors.Is(err, podlog.ErrTailScanBound) {
+		return refuse(http.StatusUnprocessableEntity,
+			"tailLines=%d reaches further back than the %d-byte log scan bound; request fewer lines", tailLines, maxTailScan)
+	}
 	if err != nil {
 		return err
 	}
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek container log: %w", err)
 	}
+	return nil
+}
+
+// copyLogs writes the selected records from file's current offset as kubelet
+// does: content only, or prefixed by the record's RFC 3339 timestamp. Follow
+// polls for growth and reopens the current file after rotation until the
+// client leaves or the byte limit is reached.
+func (s *Server) copyLogs(ctx context.Context, w http.ResponseWriter, file *os.File, options LogOptions) error {
 	out := &limitedWriter{w: w, remaining: options.LimitBytes}
 	flusher, _ := w.(http.Flusher)
 	current := file
@@ -297,10 +314,12 @@ func writeRecord(w io.Writer, line podlog.Line, timestamps bool) error {
 	return err
 }
 
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+// fail answers a refused or failed request. Unexpected failures are logged by
+// operation name and bounded error code only.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, operation string, err error) {
 	status, message := errorStatus(err)
 	if status == http.StatusInternalServerError {
-		s.logger.WarnContext(r.Context(), "serving request failed", "error", err.Error())
+		s.logger.WarnContext(r.Context(), "serving request failed", "operation", operation, "code", errorCode(err))
 	}
 	http.Error(w, message, status)
 }

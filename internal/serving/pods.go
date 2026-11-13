@@ -11,6 +11,7 @@ import (
 	"net/url"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -37,9 +38,11 @@ type ExtensionStates interface {
 	ExtensionState(ctx context.Context, podUID string) (ExtensionState, error)
 }
 
-// executionOwnerLabel marks sandboxes the node agent created. It matches the
-// executor's label; only labeled sandboxes of the configured handler are served.
-const executionOwnerLabel = "brie.dev/execution-owner"
+// Executions reports the executor-verified execution of a Pod.
+// *execinventory.Store implements it.
+type Executions interface {
+	Lookup(namespace, name string) (execinventory.Execution, error)
+}
 
 // requestError carries an explicit HTTP status for a refused request.
 type requestError struct {
@@ -67,10 +70,21 @@ type target struct {
 	container *runtimeapi.Container
 }
 
-// locate finds the newest owned sandbox for namespace/pod and, when container
-// is not empty, its newest container with that name. It then refuses any
-// sandbox whose recorded extension state is not Running; it never resumes one.
+// locate finds the executor-verified execution of namespace/pod and its
+// sandbox and, when container is not empty, its container, matching runtime
+// objects by the verified IDs. A Pod name with several verified executions is
+// refused, never resolved by age. It then refuses any sandbox whose recorded
+// extension state is not Running; it never resumes one.
 func (s *Server) locate(ctx context.Context, namespace, pod, container string) (*target, error) {
+	execution, err := s.executions.Lookup(namespace, pod)
+	switch {
+	case errors.Is(err, execinventory.ErrNotFound):
+		return nil, refuse(http.StatusNotFound, "pod %s/%s not found on this node", namespace, pod)
+	case errors.Is(err, execinventory.ErrAmbiguous):
+		return nil, refuse(http.StatusConflict, "pod %s/%s has several executions on this node; refusing to choose one", namespace, pod)
+	case err != nil:
+		return nil, refuse(http.StatusServiceUnavailable, "pod %s/%s execution inventory is unavailable", namespace, pod)
+	}
 	sandboxes, err := s.runtime.ListPodSandbox(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list sandboxes: %w", err)
@@ -78,18 +92,15 @@ func (s *Server) locate(ctx context.Context, namespace, pod, container string) (
 	var found *runtimeapi.PodSandbox
 	for _, sandbox := range sandboxes {
 		metadata := sandbox.GetMetadata()
-		if metadata.GetNamespace() != namespace || metadata.GetName() != pod ||
-			sandbox.GetLabels()[executionOwnerLabel] == "" || sandbox.GetRuntimeHandler() != s.config.RuntimeHandler {
-			continue
-		}
-		if found == nil || sandbox.GetCreatedAt() > found.GetCreatedAt() {
+		if sandbox.GetId() == execution.SandboxID && metadata.GetNamespace() == namespace && metadata.GetName() == pod &&
+			metadata.GetUid() == execution.PodUID && sandbox.GetRuntimeHandler() == s.config.RuntimeHandler {
 			found = sandbox
 		}
 	}
 	if found == nil {
 		return nil, refuse(http.StatusNotFound, "pod %s/%s not found on this node", namespace, pod)
 	}
-	result := &target{podUID: found.GetMetadata().GetUid(), sandbox: found}
+	result := &target{podUID: execution.PodUID, sandbox: found}
 	if s.states != nil {
 		state, err := s.states.ExtensionState(ctx, result.podUID)
 		if err != nil {
@@ -103,15 +114,16 @@ func (s *Server) locate(ctx context.Context, namespace, pod, container string) (
 	if container == "" {
 		return result, nil
 	}
+	if execution.ContainerID == "" || execution.ContainerName != container {
+		return nil, refuse(http.StatusNotFound, "container %s not found in pod %s/%s", container, namespace, pod)
+	}
 	containers, err := s.runtime.ListContainers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
 	for _, candidate := range containers {
-		if candidate.GetPodSandboxId() != found.GetId() || candidate.GetMetadata().GetName() != container {
-			continue
-		}
-		if result.container == nil || candidate.GetCreatedAt() > result.container.GetCreatedAt() {
+		if candidate.GetId() == execution.ContainerID && candidate.GetPodSandboxId() == found.GetId() &&
+			candidate.GetMetadata().GetName() == container {
 			result.container = candidate
 		}
 	}

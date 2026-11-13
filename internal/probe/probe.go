@@ -111,12 +111,24 @@ type Manager struct {
 }
 
 type podProbes struct {
-	target    Target
-	cancel    context.CancelFunc
-	done      sync.WaitGroup
-	status    Status
-	suspended bool
-	counters  map[Kind]*counter
+	target Target
+	// ctx and cancel bound the Pod's probe workers until Remove or Close.
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   sync.WaitGroup
+	status Status
+	// The fields below are guarded by Manager.mu. generation changes on every
+	// Suspend and Resume; a result from an earlier generation is discarded.
+	// attempt bounds the probes of the current generation; Suspend cancels it.
+	suspended     bool
+	generation    uint64
+	attempt       context.Context
+	cancelAttempt context.CancelFunc
+	// active counts probes started and not yet finished; idle is signalled
+	// when it drops to zero.
+	active   int
+	idle     *sync.Cond
+	counters map[Kind]*counter
 }
 
 type counter struct{ successes, failures int32 }
@@ -170,18 +182,23 @@ func (m *Manager) Add(target Target) error {
 	if target.StartedAt.IsZero() {
 		target.StartedAt = time.Now()
 	}
-	m.Remove(target.PodUID)
+	// The tracked entry is replaced atomically, so concurrent Adds for one UID
+	// leave exactly one entry and every replaced entry is stopped below.
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return errors.New("probe manager closed")
 	}
-	if len(m.pods) >= m.options.MaxPods {
+	previous := m.pods[target.PodUID]
+	if previous == nil && len(m.pods) >= m.options.MaxPods {
+		m.mu.Unlock()
 		return fmt.Errorf("probe manager tracks at most %d Pods", m.options.MaxPods)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	attempt, cancelAttempt := context.WithCancel(ctx)
 	pod := &podProbes{
-		target: target, cancel: cancel, counters: map[Kind]*counter{Readiness: {}, Liveness: {}},
+		target: target, ctx: ctx, cancel: cancel, attempt: attempt, cancelAttempt: cancelAttempt,
+		idle: sync.NewCond(&m.mu), counters: map[Kind]*counter{Readiness: {}, Liveness: {}},
 		status: Status{HasReadiness: target.Readiness != nil},
 	}
 	m.pods[target.PodUID] = pod
@@ -190,9 +207,19 @@ func (m *Manager) Add(target Target) error {
 			continue
 		}
 		pod.done.Add(1)
-		go m.run(ctx, pod, kind, spec)
+		go m.run(pod, kind, spec)
 	}
+	m.mu.Unlock()
+	stop(previous)
 	return nil
+}
+
+// stop cancels a Pod's probe workers and waits for them to exit.
+func stop(pod *podProbes) {
+	if pod != nil {
+		pod.cancel()
+		pod.done.Wait()
+	}
 }
 
 func needsAddress(target Target) bool {
@@ -210,10 +237,7 @@ func (m *Manager) Remove(podUID string) {
 	pod := m.pods[podUID]
 	delete(m.pods, podUID)
 	m.mu.Unlock()
-	if pod != nil {
-		pod.cancel()
-		pod.done.Wait()
-	}
+	stop(pod)
 }
 
 // Close stops every probe.
@@ -231,7 +255,10 @@ func (m *Manager) Close() {
 }
 
 // Suspend stops running a Pod's probes while state is the recorded extension
-// state. Readiness becomes false; liveness evidence is preserved, not reset.
+// state. It cancels probes that are queued for a concurrency slot or running
+// and returns once they have finished, unless a Resume intervenes; their
+// results are discarded. Readiness becomes false; liveness evidence is
+// preserved, not reset.
 func (m *Manager) Suspend(podUID, state string) error {
 	if state == "" {
 		return errors.New("suspension requires a recorded extension state")
@@ -243,8 +270,13 @@ func (m *Manager) Suspend(podUID, state string) error {
 		return errors.New("pod is not probed")
 	}
 	pod.suspended = true
+	pod.generation++
+	pod.cancelAttempt()
 	pod.status.Suspended, pod.status.Ready = state, false
 	pod.counters[Readiness].successes = 0
+	for generation := pod.generation; pod.active > 0 && pod.generation == generation; {
+		pod.idle.Wait()
+	}
 	m.mu.Unlock()
 	m.options.Notify(podUID)
 	return nil
@@ -257,6 +289,12 @@ func (m *Manager) Resume(podUID string) error {
 	if !found {
 		m.mu.Unlock()
 		return errors.New("pod is not probed")
+	}
+	if pod.suspended {
+		pod.generation++
+		pod.attempt, pod.cancelAttempt = context.WithCancel(pod.ctx)
+		// A Suspend still waiting for the previous generation returns now.
+		pod.idle.Broadcast()
 	}
 	pod.suspended, pod.status.Suspended = false, ""
 	m.mu.Unlock()
@@ -275,7 +313,7 @@ func (m *Manager) Status(podUID string) (Status, bool) {
 	return pod.status, true
 }
 
-func (m *Manager) run(ctx context.Context, pod *podProbes, kind Kind, spec *corev1.Probe) {
+func (m *Manager) run(pod *podProbes, kind Kind, spec *corev1.Probe) {
 	defer pod.done.Done()
 	delay := time.Until(pod.target.StartedAt.Add(time.Duration(spec.InitialDelaySeconds) * m.second))
 	period := time.Duration(max(1, spec.PeriodSeconds)) * m.second
@@ -283,28 +321,41 @@ func (m *Manager) run(ctx context.Context, pod *podProbes, kind Kind, spec *core
 	defer timer.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-pod.ctx.Done():
 			return
 		case <-timer.C:
 		}
 		m.mu.Lock()
-		suspended := pod.suspended
+		suspended, generation, attempt := pod.suspended, pod.generation, pod.attempt
+		if !suspended {
+			pod.active++
+		}
 		m.mu.Unlock()
 		if !suspended {
-			result, message := m.probeOnce(ctx, pod.target, spec)
-			if ctx.Err() != nil {
+			result, message := m.probeOnce(attempt, pod.target, spec)
+			m.mu.Lock()
+			pod.active--
+			if pod.active == 0 {
+				pod.idle.Broadcast()
+			}
+			m.mu.Unlock()
+			if pod.ctx.Err() != nil {
 				return
 			}
-			m.options.Observe(kind, handlerName(spec), result)
-			m.record(pod, kind, spec, result, message)
+			if attempt.Err() == nil {
+				m.options.Observe(kind, handlerName(spec), result)
+				m.record(pod, generation, kind, spec, result, message)
+			}
 		}
 		timer.Reset(period)
 	}
 }
 
-func (m *Manager) record(pod *podProbes, kind Kind, spec *corev1.Probe, result Result, message string) {
+// record applies a result unless the Pod was suspended or resumed since the
+// probe started.
+func (m *Manager) record(pod *podProbes, generation uint64, kind Kind, spec *corev1.Probe, result Result, message string) {
 	m.mu.Lock()
-	if pod.suspended {
+	if pod.suspended || pod.generation != generation {
 		m.mu.Unlock()
 		return
 	}

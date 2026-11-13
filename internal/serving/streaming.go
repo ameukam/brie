@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ameukam/brie/internal/cri"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // maxForwardedPorts bounds the ports of one port-forward request.
@@ -25,13 +26,14 @@ type ExecRequest struct {
 	Options cri.ExecOptions
 }
 
-// ParseExecQuery parses kubelet's stdin, stdout, stderr, tty, and repeated
-// command parameters. Attach takes no command.
+// ParseExecQuery parses kubelet's input, output, error, tty, and repeated
+// command parameters, the wire names the API server sends. Attach takes no
+// command.
 func ParseExecQuery(query url.Values, needCommand bool) (ExecRequest, error) {
 	var request ExecRequest
 	for name, target := range map[string]*bool{
-		"stdin": &request.Options.Stdin, "stdout": &request.Options.Stdout,
-		"stderr": &request.Options.Stderr, "tty": &request.Options.TTY,
+		corev1.ExecStdinParam: &request.Options.Stdin, corev1.ExecStdoutParam: &request.Options.Stdout,
+		corev1.ExecStderrParam: &request.Options.Stderr, corev1.ExecTTYParam: &request.Options.TTY,
 	} {
 		value := query.Get(name)
 		if value == "" {
@@ -44,12 +46,12 @@ func ParseExecQuery(query url.Values, needCommand bool) (ExecRequest, error) {
 		*target = parsed
 	}
 	if !request.Options.Stdin && !request.Options.Stdout && !request.Options.Stderr {
-		return ExecRequest{}, errors.New("at least one of stdin, stdout, and stderr is required")
+		return ExecRequest{}, errors.New("at least one of input, output, and error is required")
 	}
 	if request.Options.TTY && request.Options.Stderr {
-		return ExecRequest{}, errors.New("stderr cannot be separate from a TTY")
+		return ExecRequest{}, errors.New("error cannot be separate from a TTY")
 	}
-	request.Command = query["command"]
+	request.Command = query[corev1.ExecCommandParam]
 	if needCommand && len(request.Command) == 0 {
 		return ExecRequest{}, errors.New("command is required")
 	}
@@ -99,12 +101,16 @@ func (s *Server) streamContainer(w http.ResponseWriter, r *http.Request, exec bo
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	operation := "attach"
+	if exec {
+		operation = "exec"
+	}
 	t, err := s.locate(r.Context(), namespace, pod, container)
 	if err == nil {
 		err = requireRunningContainer(t)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, operation+" locate", err)
 		return
 	}
 	var target *url.URL
@@ -114,7 +120,7 @@ func (s *Server) streamContainer(w http.ResponseWriter, r *http.Request, exec bo
 		target, err = s.runtime.Attach(r.Context(), t.container.GetId(), request.Options)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, operation, err)
 		return
 	}
 	s.proxyStream(w, r, target)
@@ -136,12 +142,12 @@ func (s *Server) portForward(w http.ResponseWriter, r *http.Request) {
 		err = requireReadySandbox(t)
 	}
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "port forward locate", err)
 		return
 	}
 	target, err := s.runtime.PortForward(r.Context(), t.sandbox.GetId(), ports)
 	if err != nil {
-		s.fail(w, r, err)
+		s.fail(w, r, "port forward", err)
 		return
 	}
 	s.proxyStream(w, r, target)
@@ -155,7 +161,7 @@ func (s *Server) proxyStream(w http.ResponseWriter, r *http.Request, target *url
 	host := target.Hostname()
 	address, err := netip.ParseAddr(host)
 	if err != nil || !address.IsLoopback() {
-		s.fail(w, r, errors.New("runtime streaming URL is not a loopback address"))
+		s.fail(w, r, "streaming URL check", errors.New("runtime streaming URL is not a loopback address"))
 		return
 	}
 	proxy := &httputil.ReverseProxy{
@@ -176,7 +182,8 @@ func (s *Server) proxyStream(w http.ResponseWriter, r *http.Request, target *url
 		},
 		Transport: s.streamTransport, FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			s.logger.WarnContext(r.Context(), "runtime streaming proxy failed", "error", err.Error())
+			s.logger.WarnContext(r.Context(), "runtime streaming proxy failed",
+				"operation", "streaming proxy", "code", errorCode(err))
 			http.Error(w, "runtime streaming failed", http.StatusBadGateway)
 		},
 	}

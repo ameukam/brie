@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,12 +19,17 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	"github.com/ameukam/brie/internal/podlog"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -37,6 +43,9 @@ type harness struct {
 	base    string
 	address string
 	stream  *streamBackend
+	logs    *syncBuffer
+	// executions is the verified inventory; it names sandbox-1 and container-1.
+	executions *execinventory.Store
 }
 
 type stateSource struct {
@@ -50,7 +59,7 @@ func (s stateSource) ExtensionState(context.Context, string) (ExtensionState, er
 
 func newHarness(t *testing.T, modify func(*Config, *Dependencies)) *harness {
 	t.Helper()
-	h := &harness{pki: newTestPKI(t), logDir: t.TempDir()}
+	h := &harness{pki: newTestPKI(t), logDir: t.TempDir(), logs: &syncBuffer{}}
 	h.api = &fakeAPI{
 		tokens: map[string]authenticationv1.UserInfo{
 			"good-token": {Username: "alice", UID: "u-1", Groups: []string{"dev", authenticatedGroup}, Extra: map[string]authenticationv1.ExtraValue{"scope": {"a"}}},
@@ -81,8 +90,12 @@ func newHarness(t *testing.T, modify func(*Config, *Dependencies)) *harness {
 		Address: "127.0.0.1:0", CertFile: h.pki.certFile, KeyFile: h.pki.keyFile, ClientCAFile: h.pki.caFile,
 		NodeName: testNode, RuntimeHandler: testHandler, LogDir: h.logDir,
 	}
-	deps := Dependencies{API: newAPIClient(t, h.api), Runtime: h.runtime, Gatherer: registry,
-		Logger: slog.New(slog.NewTextHandler(testWriter{t}, nil))}
+	h.executions = &execinventory.Store{}
+	h.executions.Set([]execinventory.Execution{{
+		PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1",
+	}})
+	deps := Dependencies{API: newAPIClient(t, h.api), Runtime: h.runtime, Executions: h.executions, Gatherer: registry,
+		Logger: slog.New(slog.NewTextHandler(io.MultiWriter(testWriter{t}, h.logs), nil))}
 	if modify != nil {
 		modify(&config, &deps)
 	}
@@ -288,10 +301,10 @@ func TestAuthorization(t *testing.T) {
 	if status, _ := h.do(t, plain, http.MethodGet, "/metrics", "reader"); status != http.StatusOK {
 		t.Fatalf("reader metrics status = %d", status)
 	}
-	if status, _ := h.do(t, plain, http.MethodPost, "/exec/team/web/app?command=id&stdout=1", "reader"); status != http.StatusForbidden {
+	if status, _ := h.do(t, plain, http.MethodPost, "/exec/team/web/app?command=id&output=1", "reader"); status != http.StatusForbidden {
 		t.Fatalf("reader exec status = %d, want 403", status)
 	}
-	if status, _ := h.do(t, plain, http.MethodGet, "/exec/team/web/app?command=id&stdout=1", "reader"); status != http.StatusForbidden {
+	if status, _ := h.do(t, plain, http.MethodGet, "/exec/team/web/app?command=id&output=1", "reader"); status != http.StatusForbidden {
 		t.Fatalf("reader WebSocket-style GET exec status = %d, want 403", status)
 	}
 	reviews := h.api.lastReviews()
@@ -361,7 +374,7 @@ func TestRequestRejections(t *testing.T) {
 		{http.MethodGet, "/containerLogs/team/web%2Fx/app", http.StatusBadRequest},
 		{http.MethodGet, "/unknown", http.StatusNotFound},
 		{http.MethodGet, "/containerLogs/Team/web/app", http.StatusBadRequest},
-		{http.MethodGet, "/exec/team/web/APP?command=x&stdout=1", http.StatusBadRequest},
+		{http.MethodGet, "/exec/team/web/APP?command=x&output=1", http.StatusBadRequest},
 		{http.MethodGet, "/portForward/team/-web", http.StatusBadRequest},
 	} {
 		request, err := http.NewRequest(tt.method, h.base+tt.path, nil)
@@ -386,7 +399,7 @@ func TestConcurrencyBound(t *testing.T) {
 	server, err := New(Config{
 		CertFile: "/c", KeyFile: "/k", ClientCAFile: "/ca", NodeName: testNode, RuntimeHandler: testHandler,
 		LogDir: "/var/log/brie", MaxConcurrent: 1,
-	}, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	}, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +423,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestNewValidation(t *testing.T) {
 	t.Parallel()
 	valid := Config{CertFile: "/c", KeyFile: "/k", ClientCAFile: "/ca", NodeName: testNode, RuntimeHandler: testHandler, LogDir: "/var/log/brie"}
-	deps := Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}}
+	deps := Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}}
 	server, err := New(valid, deps)
 	if err != nil || server.config.Address != DefaultAddress || server.config.MaxConcurrent != 64 {
 		t.Fatalf("defaults = %+v, %v", server, err)
@@ -428,6 +441,7 @@ func TestNewValidation(t *testing.T) {
 		{"log root", func(c *Config, _ *Dependencies) { c.LogDir = "/" }, "log directory"},
 		{"api", func(_ *Config, d *Dependencies) { d.API = nil }, "API and runtime"},
 		{"runtime", func(_ *Config, d *Dependencies) { d.Runtime = nil }, "API and runtime"},
+		{"executions", func(_ *Config, d *Dependencies) { d.Executions = nil }, "verified execution inventory"},
 	} {
 		config, deps := valid, deps
 		tt.change(&config, &deps)
@@ -479,7 +493,7 @@ func TestRun(t *testing.T) {
 		Address: "127.0.0.1:0", CertFile: pki.certFile, KeyFile: pki.keyFile, ClientCAFile: pki.caFile,
 		NodeName: testNode, RuntimeHandler: testHandler, LogDir: "/var/log/brie",
 	}
-	server, err := New(config, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Logger: slog.New(slog.DiscardHandler)})
+	server, err := New(config, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +507,7 @@ func TestRun(t *testing.T) {
 	}
 	bad := config
 	bad.KeyFile = filepath.Join(pki.dir, "absent")
-	server, err = New(bad, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	server, err = New(bad, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +521,7 @@ func TestRun(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 	busy := config
 	busy.Address = listener.Addr().String()
-	server, err = New(busy, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	server, err = New(busy, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,6 +576,34 @@ func TestContainerLogs(t *testing.T) {
 	}
 }
 
+// TestContainerLogTailBeyondScanBound is a regression test: a tail that
+// cannot be located within the scan bound must fail before HTTP 200 is sent.
+func TestContainerLogTailBeyondScanBound(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	line := "2026-11-13T10:00:00Z stdout F " + strings.Repeat("x", 994) + "\n"
+	lines := maxTailScan/len(line) + 16
+	logFile := filepath.Join(podlog.Directory(h.logDir, testUID), "0.log")
+	writeLog(t, logFile, strings.Repeat(line, lines))
+	for _, tt := range []struct {
+		name  string
+		query string
+		code  int
+		want  string
+	}{
+		{name: "beyond bound", query: "tailLines=" + strconv.Itoa(MaxTailLines), code: http.StatusUnprocessableEntity, want: "scan bound"},
+		{name: "beyond bound with follow", query: "follow=true&tailLines=" + strconv.Itoa(MaxTailLines), code: http.StatusUnprocessableEntity, want: "scan bound"},
+		{name: "within bound", query: "tailLines=2", code: http.StatusOK, want: strings.Repeat("x", 994) + "\n" + strings.Repeat("x", 994) + "\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			status, body := h.do(t, h.client(nil), http.MethodGet, "/containerLogs/team/web/app?"+tt.query, "good-token")
+			if status != tt.code || (tt.code == http.StatusOK && body != tt.want) || !strings.Contains(body, tt.want) {
+				t.Fatalf("status %d body %.80q, want %d %.80q", status, body, tt.code, tt.want)
+			}
+		})
+	}
+}
+
 func TestContainerLogRefusals(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
@@ -608,6 +650,67 @@ func TestContainerLogRefusals(t *testing.T) {
 	}
 }
 
+// TestServingRequiresVerifiedExecution is a regression test: a sandbox that
+// merely carries an owner label, even the newest one, is never served, and a
+// Pod name with several verified executions is refused.
+func TestServingRequiresVerifiedExecution(t *testing.T) {
+	t.Parallel()
+	paths := []string{
+		"/containerLogs/team/web/app", "/exec/team/web/app?command=id&output=1", "/attach/team/web/app?output=1", "/portForward/team/web?ports=80",
+	}
+	for _, tt := range []struct {
+		name       string
+		executions []execinventory.Execution
+		unset      bool
+		// containerOnly limits the check to container paths; port-forward
+		// needs only the verified sandbox.
+		containerOnly bool
+		code          int
+		want          string
+	}{
+		{name: "verified", code: http.StatusOK, executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"}}},
+		{name: "foreign owner only", code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{}},
+		{name: "unverified container", containerOnly: true, code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1"}}},
+		{name: "IDs of another Pod", code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{
+			{PodUID: "rogue-uid", Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"}}},
+		{name: "duplicate executions", code: http.StatusConflict, want: "several executions", executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"},
+			{PodUID: "rogue-uid", Namespace: "team", Name: "web", SandboxID: "rogue", ContainerName: "app", ContainerID: "rogue-container"}}},
+		{name: "inventory unavailable", unset: true, code: http.StatusServiceUnavailable, want: "inventory is unavailable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, func(_ *Config, d *Dependencies) {
+				store := &execinventory.Store{}
+				if !tt.unset {
+					store.Set(tt.executions)
+				}
+				d.Executions = store
+			})
+			for _, path := range paths {
+				method := http.MethodGet
+				if !strings.HasPrefix(path, "/containerLogs") {
+					method = http.MethodPost
+				}
+				if tt.containerOnly && strings.HasPrefix(path, "/portForward") {
+					continue
+				}
+				status, body := h.do(t, h.client(nil), method, path, "good-token")
+				if status != tt.code || !strings.Contains(body, tt.want) || strings.Contains(body, "rogue") {
+					t.Fatalf("%s: status %d body %q, want %d %q", path, status, body, tt.code, tt.want)
+				}
+			}
+			h.runtime.mu.Lock()
+			defer h.runtime.mu.Unlock()
+			if slices.Contains(h.runtime.lastIDs, "rogue") || slices.Contains(h.runtime.lastIDs, "rogue-container") {
+				t.Fatalf("rogue container reached: %v", h.runtime.lastIDs)
+			}
+		})
+	}
+}
+
 func TestExtensionStateRefusesWithoutResuming(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
@@ -625,7 +728,7 @@ func TestExtensionStateRefusesWithoutResuming(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t, func(_ *Config, d *Dependencies) { d.States = tt.state })
 			for _, path := range []string{
-				"/containerLogs/team/web/app", "/exec/team/web/app?command=id&stdout=1", "/attach/team/web/app?stdout=1", "/portForward/team/web?ports=80",
+				"/containerLogs/team/web/app", "/exec/team/web/app?command=id&output=1", "/attach/team/web/app?output=1", "/portForward/team/web?ports=80",
 			} {
 				method := http.MethodGet
 				if !strings.HasPrefix(path, "/containerLogs") {
@@ -744,7 +847,7 @@ func TestExecProxiesUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	_, err = fmt.Fprintf(conn, "GET /exec/team/web/app?command=sh&command=-c&command=id&stdin=1&stdout=1&tty=1 HTTP/1.1\r\n"+
+	_, err = fmt.Fprintf(conn, "GET /exec/team/web/app?command=sh&command=-c&command=id&input=1&output=1&tty=1 HTTP/1.1\r\n"+
 		"Host: %s\r\nAuthorization: Bearer good-token\r\nImpersonate-User: admin\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n", h.address)
 	if err != nil {
 		t.Fatal(err)
@@ -781,32 +884,32 @@ func TestStreamingEndpoints(t *testing.T) {
 		code   int
 		want   string
 	}{
-		{name: "exec", path: "/exec/team/web/app?command=id&stdout=true", code: http.StatusOK, want: "plain /exec/token"},
-		{name: "attach", path: "/attach/team/web/app?stdout=true", code: http.StatusOK, want: "plain /exec/token"},
+		{name: "exec", path: "/exec/team/web/app?command=id&output=true", code: http.StatusOK, want: "plain /exec/token"},
+		{name: "attach", path: "/attach/team/web/app?output=true", code: http.StatusOK, want: "plain /exec/token"},
 		{name: "port forward", path: "/portForward/team/web?ports=80,8080", code: http.StatusOK, want: "plain /exec/token"},
-		{name: "exec without command", path: "/exec/team/web/app?stdout=true", code: http.StatusBadRequest, want: "command"},
-		{name: "attach with command", path: "/attach/team/web/app?stdout=true&command=x", code: http.StatusBadRequest, want: "does not take"},
+		{name: "exec without command", path: "/exec/team/web/app?output=true", code: http.StatusBadRequest, want: "command"},
+		{name: "attach with command", path: "/attach/team/web/app?output=true&command=x", code: http.StatusBadRequest, want: "does not take"},
 		{name: "no streams", path: "/attach/team/web/app", code: http.StatusBadRequest, want: "at least one"},
 		{name: "bad port", path: "/portForward/team/web?port=70000", code: http.StatusBadRequest, want: "between 1"},
-		{name: "container not running", path: "/exec/team/web/app?command=id&stdout=1", modify: func(h *harness) {
+		{name: "container not running", path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
 			h.runtime.containers[0].State = runtimeapi.ContainerState_CONTAINER_EXITED
 		}, code: http.StatusConflict, want: "not running"},
 		{name: "sandbox not ready", path: "/portForward/team/web", modify: func(h *harness) {
 			h.runtime.sandboxes[1].State = runtimeapi.PodSandboxState_SANDBOX_NOTREADY
 		}, code: http.StatusConflict, want: "not ready"},
-		{name: "runtime error", path: "/exec/team/web/app?command=id&stdout=1", modify: func(h *harness) {
+		{name: "runtime error", path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
 			h.runtime.streamErr = errors.New("CRI Exec: unavailable")
 		}, code: http.StatusInternalServerError, want: "runtime observation failed"},
-		{name: "attach runtime error", path: "/attach/team/web/app?stdout=1", modify: func(h *harness) {
+		{name: "attach runtime error", path: "/attach/team/web/app?output=1", modify: func(h *harness) {
 			h.runtime.streamErr = errors.New("CRI Attach: unavailable")
 		}, code: http.StatusInternalServerError, want: "runtime observation failed"},
 		{name: "forward runtime error", path: "/portForward/team/web", modify: func(h *harness) {
 			h.runtime.streamErr = errors.New("CRI PortForward: unavailable")
 		}, code: http.StatusInternalServerError, want: "runtime observation failed"},
-		{name: "non-loopback streaming URL", path: "/exec/team/web/app?command=id&stdout=1", modify: func(h *harness) {
+		{name: "non-loopback streaming URL", path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
 			h.runtime.streamURL = "http://192.0.2.10:10010/exec/token"
 		}, code: http.StatusInternalServerError, want: "runtime observation failed"},
-		{name: "unreachable streaming server", path: "/exec/team/web/app?command=id&stdout=1", modify: func(h *harness) {
+		{name: "unreachable streaming server", path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
 			h.runtime.streamURL = "http://127.0.0.1:1/exec/token"
 		}, code: http.StatusBadGateway, want: "runtime streaming failed"},
 	} {
@@ -821,6 +924,80 @@ func TestStreamingEndpoints(t *testing.T) {
 				t.Fatalf("status %d body %q, want %d %q", status, body, tt.code, tt.want)
 			}
 		})
+	}
+}
+
+// TestBackendErrorsAreNotLogged is a regression test: runtime, streaming
+// proxy, and review errors that echo commands or credentials are logged by
+// operation and bounded code only.
+func TestBackendErrorsAreNotLogged(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		method   string
+		path     string
+		modify   func(*harness)
+		code     int
+		wantLogs []string
+	}{
+		{name: "runtime list", method: http.MethodGet, path: "/containerLogs/team/web/app", modify: func(h *harness) {
+			h.runtime.listErr = errors.New("list failed: echo " + canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=\"container log open\"", "code=Unknown"}},
+		{name: "exec", method: http.MethodPost, path: "/exec/team/web/app?command=sh&command=-c&command=" + canarySecret + "&output=1", modify: func(h *harness) {
+			h.runtime.streamErr = grpcstatus.Error(codes.Unavailable, "exec sh -c "+canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=exec", "code=Unavailable"}},
+		{name: "attach", method: http.MethodPost, path: "/attach/team/web/app?output=1", modify: func(h *harness) {
+			h.runtime.streamErr = fmt.Errorf("CRI Attach: %w", grpcstatus.Error(codes.Internal, canarySecret))
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=attach", "code=Internal"}},
+		{name: "port forward", method: http.MethodPost, path: "/portForward/team/web?ports=80", modify: func(h *harness) {
+			h.runtime.streamErr = errors.New(canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=\"port forward\"", "code=Unknown"}},
+		{name: "streaming proxy", method: http.MethodPost, path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
+			h.runtime.streamURL = "http://127.0.0.1:1/exec/" + canarySecret
+		}, code: http.StatusBadGateway, wantLogs: []string{"operation=\"streaming proxy\"", "code=NetworkError"}},
+		{name: "TokenReview", method: http.MethodGet, path: "/healthz", modify: func(h *harness) {
+			h.api.failTR = true
+		}, code: http.StatusUnauthorized, wantLogs: []string{"reason=\"TokenReview failed\"", "code=HTTP500"}},
+		{name: "SubjectAccessReview", method: http.MethodGet, path: "/healthz", modify: func(h *harness) {
+			h.api.failSAR["healthz"] = true
+		}, code: http.StatusForbidden, wantLogs: []string{"reason=\"SubjectAccessReview failed\"", "code=HTTP500"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, nil)
+			tt.modify(h)
+			status, body := h.do(t, h.client(nil), tt.method, tt.path, "good-token")
+			if status != tt.code || strings.Contains(body, canarySecret) {
+				t.Fatalf("status %d body %q, want %d without the canary", status, body, tt.code)
+			}
+			logs := h.logs.String()
+			if strings.Contains(logs, canarySecret) {
+				t.Fatalf("backend error text reached the logs: %s", logs)
+			}
+			for _, want := range tt.wantLogs {
+				if !strings.Contains(logs, want) {
+					t.Errorf("logs lack %s: %s", want, logs)
+				}
+			}
+		})
+	}
+}
+
+func TestErrorCode(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		err  error
+		want string
+	}{
+		{err: context.Canceled, want: "Canceled"},
+		{err: fmt.Errorf("wrapped: %w", context.DeadlineExceeded), want: "DeadlineExceeded"},
+		{err: &fs.PathError{Op: "open", Path: "/" + canarySecret, Err: fs.ErrNotExist}, want: "FileError"},
+		{err: grpcstatus.Error(codes.NotFound, canarySecret), want: "NotFound"},
+		{err: errors.New(canarySecret), want: "Unknown"},
+	} {
+		if got := errorCode(tt.err); got != tt.want {
+			t.Errorf("errorCode(%v) = %q, want %q", tt.err, got, tt.want)
+		}
 	}
 }
 
@@ -848,10 +1025,10 @@ func TestParseExecQuery(t *testing.T) {
 		exec  bool
 		want  string
 	}{
-		{query: "stdout=maybe&command=x", exec: true, want: "boolean"},
-		{query: "tty=1&stderr=1&command=x", exec: true, want: "TTY"},
-		{query: "stdout=1", exec: true, want: "command"},
-		{query: "stdout=1&command=x", exec: false, want: "does not take"},
+		{query: "output=maybe&command=x", exec: true, want: "boolean"},
+		{query: "tty=1&error=1&command=x", exec: true, want: "TTY"},
+		{query: "output=1", exec: true, want: "command"},
+		{query: "output=1&command=x", exec: false, want: "does not take"},
 	} {
 		values, err := url.ParseQuery(tt.query)
 		if err != nil {
@@ -860,6 +1037,46 @@ func TestParseExecQuery(t *testing.T) {
 		if _, err := ParseExecQuery(values, tt.exec); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%q: error = %v, want %q", tt.query, err, tt.want)
 		}
+	}
+}
+
+// TestParseExecQueryKubeletParameters uses the query an API server sends to
+// kubelet for kubectl exec and attach.
+func TestParseExecQueryKubeletParameters(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name  string
+		query string
+		exec  bool
+		want  ExecRequest
+		err   string
+	}{
+		{name: "exec", exec: true, query: "command=sh&command=-c&command=id&input=1&output=1&error=1",
+			want: ExecRequest{Command: []string{"sh", "-c", "id"}, Options: cri.ExecOptions{Stdin: true, Stdout: true, Stderr: true}}},
+		{name: "exec tty", exec: true, query: "command=sh&input=true&output=true&tty=true",
+			want: ExecRequest{Command: []string{"sh"}, Options: cri.ExecOptions{Stdin: true, Stdout: true, TTY: true}}},
+		{name: "attach", query: "input=1&output=1&error=1",
+			want: ExecRequest{Options: cri.ExecOptions{Stdin: true, Stdout: true, Stderr: true}}},
+		{name: "attach output only", query: "output=1", want: ExecRequest{Options: cri.ExecOptions{Stdout: true}}},
+		{name: "legacy names are not kubelet parameters", query: "stdin=1&stdout=1&stderr=1", err: "at least one of input"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			values, err := url.ParseQuery(tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ParseExecQuery(values, tt.exec)
+			if tt.err != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.err) {
+					t.Fatalf("error = %v, want %q", err, tt.err)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got.Command, tt.want.Command) || got.Options != tt.want.Options {
+				t.Fatalf("ParseExecQuery = %+v, %v, want %+v", got, err, tt.want)
+			}
+		})
 	}
 }
 
@@ -892,7 +1109,7 @@ func TestParseLogOptions(t *testing.T) {
 func FuzzServingQueries(f *testing.F) {
 	for _, seed := range []string{
 		"tailLines=10&follow=true", "limitBytes=1&timestamps=1", "sinceTime=2026-11-13T10:00:00Z",
-		"command=sh&command=-c&stdin=1&tty=1", "ports=80,443&port=8080", "%zz", "previous=true",
+		"command=sh&command=-c&input=1&tty=1", "ports=80,443&port=8080", "%zz", "previous=true",
 	} {
 		f.Add(seed)
 	}

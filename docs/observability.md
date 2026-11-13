@@ -59,21 +59,28 @@ Endpoints:
 - `GET /metrics` serves the agent's Prometheus registry.
 - `GET /containerLogs/{namespace}/{pod}/{container}` reads the current CRI
   log file. It supports `follow`, `tailLines` (at most 100,000), `limitBytes`,
-  `timestamps`, `sinceSeconds`, and `sinceTime`. Every response, including a
-  follow session, stops at 128 MiB. `previous=true` is refused because Brie
+  `timestamps`, `sinceSeconds`, and `sinceTime`. A `tailLines` start beyond
+  the 64 MiB backward scan bound is refused with HTTP 422 before any output.
+  Every response, including a follow session, stops at 128 MiB. `previous=true` is refused because Brie
   never restarts containers. Rotated files are not read, except that a follow
   session drains the file being rotated before switching to the new one.
 - `/exec/{namespace}/{pod}/{container}` and
-  `/attach/{namespace}/{pod}/{container}` call CRI `Exec` or `Attach`;
+  `/attach/{namespace}/{pod}/{container}` call CRI `Exec` or `Attach` with
+  kubelet's `input`, `output`, `error`, `tty`, and repeated `command` query
+  parameters;
   `/portForward/{namespace}/{pod}` calls CRI `PortForward` with optional
   `port`/`ports` parameters (at most 16). Brie proxies the session to the
   runtime's streaming URL instead of redirecting, refuses URLs that are not
   loopback IP addresses, and strips `Authorization`, `Cookie`,
   `Impersonate-*`, and `X-Remote-*` headers.
 
-A Pod is served only from a sandbox labeled `brie.dev/execution-owner` that
-uses the configured runtime handler. When several match a namespace and name,
-the newest is used. The log file must be the runtime-reported log path, a
+A Pod is served only through the execution inventory the executor publishes
+after each pass that reads the runtime (`ExecutionHooks.Inventory`). It lists
+only executions whose journal record, owner labels, and runtime objects agree.
+The served sandbox and container must have exactly the verified IDs, Pod UID,
+names, and runtime handler; an owner label alone never qualifies. A Pod name
+with several verified executions is refused with HTTP 409 rather than resolved
+by age, and requests before the first published inventory get HTTP 503. The log file must be the runtime-reported log path, a
 plain regular file directly inside the Pod's own log directory
 (`<pod-log-dir>/<sha256(pod UID)>`); other paths and symlinks are refused.
 
@@ -83,6 +90,12 @@ a sandbox in any recorded state other than `Running` is refused with HTTP 409
 and the state name, and an unavailable state is refused with HTTP 503. The
 server never resumes, pauses, or otherwise mutates a sandbox. Brie has no
 lifecycle extension yet, so no state source exists in this build.
+
+Server log records for failed requests carry an operation name and a bounded
+error code (a gRPC code, `HTTP<status>` for API server errors, `FileError`,
+`NetworkError`, `Canceled`, `DeadlineExceeded`, or `Unknown`), never the text of
+runtime, streaming proxy, or review errors, which can echo commands or
+credentials.
 
 Not implemented: `/stats`, `/logs`, `/pods`, `/configz`, `/checkpoint`, the
 UID forms of the streaming paths, serving certificate rotation, and caching of
@@ -174,21 +187,26 @@ failures; the manager never restarts or stops anything. A timeout or a non-zero
 exit is a failure. A probe that could not run (for example, CRI unavailable)
 counts against readiness but not against liveness, because it is not evidence
 about the application. `Suspend(uid, state)` stops a Pod's probes for a
-recorded extension state: readiness becomes false, liveness evidence is kept,
-and after `Resume` readiness must succeed again. Probe output is never logged
+recorded extension state: it cancels probes queued for a concurrency slot or
+running and returns once they finish, readiness becomes false, liveness
+evidence is kept, and after `Resume` readiness must succeed again. A result
+from a probe that started before a `Suspend` or `Resume` is discarded. `Add`
+for a UID already probed replaces its entry and stops the previous probes. Probe output is never logged
 or stored.
 
 ## Container log rotation
 
-`internal/logrotation` checks every running container of an owned sandbox
-(label `brie.dev/execution-owner`, configured runtime handler) every ten
-seconds. When the runtime-reported log file, which must be a regular file
+`internal/logrotation` checks every ten seconds each running container whose
+ID, sandbox ID, and Pod UID match an execution in the executor's verified
+inventory, in a sandbox of the configured runtime handler. When the runtime-reported log file, which must be a regular file
 directly inside the Pod's log directory, exceeds the maximum size (1 MiB to
 10 GiB), it removes the oldest rotated files so that at most `max files`
 remain including the current one (2 to 100), renames the log to
-`<name>.<UTC YYYYMMDD-HHMMSS>`, and calls CRI `ReopenContainerLog`. If the
-runtime cannot reopen the log, the rename is undone so the runtime keeps
-writing to the same name. Rotated files are not compressed. Exited containers
+`<name>.<UTC YYYYMMDD-HHMMSS>`, and calls CRI `ReopenContainerLog`. A reopen
+error is ambiguous, because the runtime may have reopened the log and lost the
+reply. Brie then restores the original name with a hard link, which never
+replaces an existing file: if the runtime already created a new current log,
+both files are kept; otherwise the runtime keeps writing to the same name. Rotated files are not compressed. Exited containers
 are not rotated.
 
 Directory cleanup removes `<pod-log-dir>/<sha256(UID)>` only for UIDs the
@@ -233,8 +251,9 @@ cleanup that waits for deletion or runtime evidence; and, with
 
 ## Executor hooks
 
-`nodeagent.ExecuteObserved` passes `ExecutionHooks` into the executor. Each
-hook observes a decision the executor already made and must not block:
+`nodeagent.ExecuteObserved` passes `ExecutionHooks` into the executor,
+including the verified execution inventory that serving and log rotation use.
+Each hook observes a decision the executor already made and must not block:
 
 | Hook | Call site | Fed to |
 | --- | --- | --- |
