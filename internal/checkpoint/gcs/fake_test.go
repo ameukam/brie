@@ -42,6 +42,8 @@ type fakeGCS struct {
 	corruptStore    int   // store flipped bytes; metadata describes them
 	mangleTransit   int   // flip bytes before the server's checksum check
 	staleReadBack   int   // report a different checksum on the next metadata read
+	mediaStatuses   []int // statuses returned before an object download
+	mangleMedia     int   // flip a byte of the next object download
 	uploadDelay     time.Duration
 }
 
@@ -242,7 +244,17 @@ func (f *fakeGCS) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if query.Get("alt") == "media" {
-		_, _ = w.Write(object.data)
+		if status := pop(&f.mediaStatuses); status != 0 {
+			writeError(w, status, "injected")
+			return
+		}
+		data := object.data
+		if f.mangleMedia > 0 {
+			f.mangleMedia--
+			data = bytes.Clone(data)
+			data[0] ^= 0xff
+		}
+		_, _ = w.Write(data)
 		return
 	}
 	metadata := f.metadata(bucket, name, object)
