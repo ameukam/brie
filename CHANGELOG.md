@@ -19,6 +19,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
   reports its count as the safe point and acknowledged-request watermark, and
   on resume verifies the state file, rebinds identity, and refreshes entropy
   before reopening. It does not hibernate anything by itself.
+- A versioned checkpoint manifest schema (`brie.checkpoint/v1alpha1`) with
+  strict canonical JSON decoding and validation of identity, epoch, operation,
+  generation, VM-state, memory, and disk artifacts by object generation, size,
+  SHA-256, and CRC32C, the restore compatibility tuple, device layout, resume
+  protocol, safe point, watermark, creation time, and encryption, access, and
+  retention references. No checkpoint is produced yet.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
