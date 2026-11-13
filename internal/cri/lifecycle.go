@@ -18,12 +18,14 @@ import (
 // handler can return and that mean the runtime refused the request. grpc-go
 // never generates them for transport, deadline, cancellation, or decoding
 // failures, which instead surface as Unavailable, DeadlineExceeded, Canceled,
-// Unknown, Internal, ResourceExhausted, Unimplemented, or Unauthenticated.
-// AlreadyExists, Aborted, and DataLoss are excluded because they can describe
-// an object that exists or a partially applied change.
+// Unknown, Internal, ResourceExhausted, Unimplemented, Unauthenticated, or
+// PermissionDenied. PermissionDenied is excluded because grpc-go also maps an
+// HTTP/2 INADEQUATE_SECURITY stream reset and an HTTP 403 response to it,
+// neither of which shows that the handler ran. AlreadyExists, Aborted, and
+// DataLoss are excluded because they can describe an object that exists or a
+// partially applied change.
 var rejectionCodes = map[codes.Code]bool{
-	codes.InvalidArgument: true, codes.NotFound: true, codes.FailedPrecondition: true,
-	codes.PermissionDenied: true, codes.OutOfRange: true,
+	codes.InvalidArgument: true, codes.NotFound: true, codes.FailedPrecondition: true, codes.OutOfRange: true,
 }
 
 // DefiniteRejection reports the status code of an error that a runtime
