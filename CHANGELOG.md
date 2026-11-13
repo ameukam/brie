@@ -7,6 +7,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- `tests/hw/fence.sh`, a provisional lab fence (D5) that stops only a host
+  labelled for the run, waits for the same incarnation to report TERMINATED,
+  detaches its data disk, and prints JSON evidence; it exits nonzero unless
+  every step is observed. Tested only against a mock `gcloud`.
 - `tests/hw/provision.sh` for a disposable C4A lab of at most four bare-metal
   and two standard hosts, with a dedicated VPC, NAT, and 7-day evidence bucket.
   It refuses plans that an operator-supplied price table projects over the
