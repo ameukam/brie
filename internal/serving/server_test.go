@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,6 +27,8 @@ import (
 	"github.com/ameukam/brie/internal/cri"
 	"github.com/ameukam/brie/internal/podlog"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -39,6 +42,7 @@ type harness struct {
 	base    string
 	address string
 	stream  *streamBackend
+	logs    *syncBuffer
 }
 
 type stateSource struct {
@@ -52,7 +56,7 @@ func (s stateSource) ExtensionState(context.Context, string) (ExtensionState, er
 
 func newHarness(t *testing.T, modify func(*Config, *Dependencies)) *harness {
 	t.Helper()
-	h := &harness{pki: newTestPKI(t), logDir: t.TempDir()}
+	h := &harness{pki: newTestPKI(t), logDir: t.TempDir(), logs: &syncBuffer{}}
 	h.api = &fakeAPI{
 		tokens: map[string]authenticationv1.UserInfo{
 			"good-token": {Username: "alice", UID: "u-1", Groups: []string{"dev", authenticatedGroup}, Extra: map[string]authenticationv1.ExtraValue{"scope": {"a"}}},
@@ -84,7 +88,7 @@ func newHarness(t *testing.T, modify func(*Config, *Dependencies)) *harness {
 		NodeName: testNode, RuntimeHandler: testHandler, LogDir: h.logDir,
 	}
 	deps := Dependencies{API: newAPIClient(t, h.api), Runtime: h.runtime, Gatherer: registry,
-		Logger: slog.New(slog.NewTextHandler(testWriter{t}, nil))}
+		Logger: slog.New(slog.NewTextHandler(io.MultiWriter(testWriter{t}, h.logs), nil))}
 	if modify != nil {
 		modify(&config, &deps)
 	}
@@ -851,6 +855,80 @@ func TestStreamingEndpoints(t *testing.T) {
 				t.Fatalf("status %d body %q, want %d %q", status, body, tt.code, tt.want)
 			}
 		})
+	}
+}
+
+// TestBackendErrorsAreNotLogged is a regression test: runtime, streaming
+// proxy, and review errors that echo commands or credentials are logged by
+// operation and bounded code only.
+func TestBackendErrorsAreNotLogged(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		method   string
+		path     string
+		modify   func(*harness)
+		code     int
+		wantLogs []string
+	}{
+		{name: "runtime list", method: http.MethodGet, path: "/containerLogs/team/web/app", modify: func(h *harness) {
+			h.runtime.listErr = errors.New("list failed: echo " + canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=\"container log open\"", "code=Unknown"}},
+		{name: "exec", method: http.MethodPost, path: "/exec/team/web/app?command=sh&command=-c&command=" + canarySecret + "&output=1", modify: func(h *harness) {
+			h.runtime.streamErr = grpcstatus.Error(codes.Unavailable, "exec sh -c "+canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=exec", "code=Unavailable"}},
+		{name: "attach", method: http.MethodPost, path: "/attach/team/web/app?output=1", modify: func(h *harness) {
+			h.runtime.streamErr = fmt.Errorf("CRI Attach: %w", grpcstatus.Error(codes.Internal, canarySecret))
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=attach", "code=Internal"}},
+		{name: "port forward", method: http.MethodPost, path: "/portForward/team/web?ports=80", modify: func(h *harness) {
+			h.runtime.streamErr = errors.New(canarySecret)
+		}, code: http.StatusInternalServerError, wantLogs: []string{"operation=\"port forward\"", "code=Unknown"}},
+		{name: "streaming proxy", method: http.MethodPost, path: "/exec/team/web/app?command=id&output=1", modify: func(h *harness) {
+			h.runtime.streamURL = "http://127.0.0.1:1/exec/" + canarySecret
+		}, code: http.StatusBadGateway, wantLogs: []string{"operation=\"streaming proxy\"", "code=NetworkError"}},
+		{name: "TokenReview", method: http.MethodGet, path: "/healthz", modify: func(h *harness) {
+			h.api.failTR = true
+		}, code: http.StatusUnauthorized, wantLogs: []string{"reason=\"TokenReview failed\"", "code=HTTP500"}},
+		{name: "SubjectAccessReview", method: http.MethodGet, path: "/healthz", modify: func(h *harness) {
+			h.api.failSAR["healthz"] = true
+		}, code: http.StatusForbidden, wantLogs: []string{"reason=\"SubjectAccessReview failed\"", "code=HTTP500"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, nil)
+			tt.modify(h)
+			status, body := h.do(t, h.client(nil), tt.method, tt.path, "good-token")
+			if status != tt.code || strings.Contains(body, canarySecret) {
+				t.Fatalf("status %d body %q, want %d without the canary", status, body, tt.code)
+			}
+			logs := h.logs.String()
+			if strings.Contains(logs, canarySecret) {
+				t.Fatalf("backend error text reached the logs: %s", logs)
+			}
+			for _, want := range tt.wantLogs {
+				if !strings.Contains(logs, want) {
+					t.Errorf("logs lack %s: %s", want, logs)
+				}
+			}
+		})
+	}
+}
+
+func TestErrorCode(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		err  error
+		want string
+	}{
+		{err: context.Canceled, want: "Canceled"},
+		{err: fmt.Errorf("wrapped: %w", context.DeadlineExceeded), want: "DeadlineExceeded"},
+		{err: &fs.PathError{Op: "open", Path: "/" + canarySecret, Err: fs.ErrNotExist}, want: "FileError"},
+		{err: grpcstatus.Error(codes.NotFound, canarySecret), want: "NotFound"},
+		{err: errors.New(canarySecret), want: "Unknown"},
+	} {
+		if got := errorCode(tt.err); got != tt.want {
+			t.Errorf("errorCode(%v) = %q, want %q", tt.err, got, tt.want)
+		}
 	}
 }
 
