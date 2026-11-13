@@ -5,6 +5,7 @@ package nodeagent
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,8 @@ func restartJournal(t *testing.T, e *executor) {
 	t.Cleanup(func() { _ = journal.close() })
 	e.journal = journal
 	e.workers = newPodWorkers()
+	e.pulls.wait()
+	e.pulls = newImagePuller(e.pulls.client)
 	e.synced.Store(false)
 }
 
@@ -214,7 +217,7 @@ func TestExecutionPodFaultIsolation(t *testing.T) {
 		first := executionPod("first")
 		first.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 		e, service := newExecutor(t, first)
-		reconcilePasses(t, e, 5)
+		reconcilePasses(t, e, 6)
 		pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
 		pod.Spec.Containers[0].Image = "registry.example/other@sha256:" + "1111111111111111111111111111111111111111111111111111111111111111"
 		if _, err := e.api.CoreV1().Pods("default").Update(t.Context(), pod, metav1.UpdateOptions{}); err != nil {
@@ -256,12 +259,20 @@ func TestExecutionPodFaultIsolation(t *testing.T) {
 		first := executionPod("first")
 		first.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 		e, service := newExecutor(t, first)
+		service.mu.Lock()
 		service.pullError = status.Error(codes.NotFound, "manifest unknown")
-		reconcilePasses(t, e, 3)
-		pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
-		condition := blockedCondition(pod)
-		if condition == nil || condition.Reason != "ImagePullFailed" || pod.Status.Phase != corev1.PodPending {
-			t.Fatalf("pull failure not published on its Pod: %+v", pod.Status)
+		service.mu.Unlock()
+		reconcilePasses(t, e, 1)
+		for _, want := range []string{reasonPulling, reasonErrPull, reasonPullBackOff, reasonPullBackOff} {
+			reconcilePasses(t, e, 1)
+			pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
+			waiting := containerWaiting(pod)
+			if waiting == nil || waiting.Reason != want || pod.Status.Phase != corev1.PodPending {
+				t.Fatalf("pull state not published as %s: %+v", want, pod.Status)
+			}
+			if want == reasonErrPull && !strings.Contains(waiting.Message, "manifest unknown") {
+				t.Fatalf("pull failure lost its cause: %q", waiting.Message)
+			}
 		}
 		if e.recovery.Load() || !nodeReady(t, e) || countCalls(service, "PullImage") != 1 {
 			t.Fatal("pull failure raised the node barrier or retried without backoff")
@@ -269,52 +280,134 @@ func TestExecutionPodFaultIsolation(t *testing.T) {
 		service.mu.Lock()
 		service.pullError = nil
 		service.mu.Unlock()
-		if _, err := e.api.CoreV1().Pods("default").Create(t.Context(), executionPod("second"), metav1.CreateOptions{}); err != nil {
-			t.Fatal(err)
+		// A Pod with the same image shares the failed pull's backoff; a Pod
+		// with another image is admitted and runs.
+		second, third := executionPod("second"), executionPod("third")
+		third.Spec.Containers[0].Image = "example.test/other@sha256:" + strings.Repeat("b", 64)
+		for _, pod := range []*corev1.Pod{second, third} {
+			if _, err := e.api.CoreV1().Pods("default").Create(t.Context(), pod, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
 		}
 		reconcilePasses(t, e, 5)
-		second, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "second", metav1.GetOptions{})
-		if second.Status.Phase != corev1.PodRunning || countCalls(service, "PullImage") != 2 ||
+		got, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "second", metav1.GetOptions{})
+		if waiting := containerWaiting(got); waiting == nil || waiting.Reason != reasonPullBackOff {
+			t.Fatalf("Pod with the failing image skipped its backoff: %+v", got.Status)
+		}
+		got, _ = e.api.CoreV1().Pods("default").Get(t.Context(), "third", metav1.GetOptions{})
+		if got.Status.Phase != corev1.PodRunning || countCalls(service, "PullImage") != 2 ||
 			countCalls(service, "RunPodSandbox") != 1 {
-			t.Fatalf("pull failure blocked another admission or retried early: %+v", second.Status)
+			t.Fatalf("pull failure blocked another admission or retried early: %+v", got.Status)
 		}
-		e.workers.mu.Lock()
-		backoff := e.workers.pulls["first-uid"]
-		backoff.next = time.Now().Add(-time.Second)
-		e.workers.pulls["first-uid"] = backoff
-		e.workers.mu.Unlock()
+		e.pulls.mu.Lock()
+		e.pulls.pulls[first.Spec.Containers[0].Image].next = time.Now().Add(-time.Second)
+		e.pulls.mu.Unlock()
 		reconcilePasses(t, e, 5)
-		pod, _ = e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
-		if pod.Status.Phase != corev1.PodRunning || blockedCondition(pod) != nil {
-			t.Fatalf("pull retry did not recover the Pod: %+v", pod.Status)
+		for _, name := range []string{"first", "second"} {
+			pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), name, metav1.GetOptions{})
+			if pod.Status.Phase != corev1.PodRunning || containerWaiting(pod) != nil || blockedCondition(pod) != nil {
+				t.Fatalf("pull retry did not recover %s: %+v", name, pod.Status)
+			}
+		}
+		if countCalls(service, "PullImage") != 3 {
+			t.Fatal("one retry per image reference expected after backoff")
 		}
 	})
 }
 
-func TestPodWorkersPullBackoff(t *testing.T) {
-	t.Parallel()
-	workers := newPodWorkers()
-	now := time.Now()
-	previous := time.Duration(0)
-	for failure := range 10 {
-		delay := workers.pullFailed("uid", now)
-		base := min(pullBackoffBase<<min(failure, 5), pullBackoffLimit)
-		if delay < base || delay > base+base/2 || delay < previous/2 {
-			t.Fatalf("failure %d: delay %s outside [%s, %s]", failure, delay, base, base+base/2)
-		}
-		if workers.pullAllowed("uid", now) || !workers.pullAllowed("uid", now.Add(delay)) {
-			t.Fatal("pull allowed during backoff or refused after it")
-		}
-		previous = delay
+func containerWaiting(pod *corev1.Pod) *corev1.ContainerStateWaiting {
+	if len(pod.Status.ContainerStatuses) != 1 {
+		return nil
 	}
-	workers.pullSucceeded("uid")
-	if !workers.pullAllowed("uid", now) {
-		t.Fatal("successful pull kept its backoff")
+	return pod.Status.ContainerStatuses[0].State.Waiting
+}
+
+// TestImagePullBackoff checks the jittered exponential pull backoff bounds.
+func TestImagePullBackoff(t *testing.T) {
+	t.Parallel()
+	for failures := range 10 {
+		base := min(pullBackoffBase<<min(failures, 5), pullBackoffLimit)
+		for range 20 {
+			if delay := pullBackoff(failures); delay < base || delay > base+base/2 {
+				t.Fatalf("failure %d: delay %s outside [%s, %s]", failures, delay, base, base+base/2)
+			}
+		}
+	}
+}
+
+// TestExecutionImagePullWorkers covers section 10.4 of DESIGN.md: pulls are
+// deduplicated by image reference, bounded by pullWorkers, and run outside the
+// creation workers, which return while the pull is in flight.
+func TestExecutionImagePullWorkers(t *testing.T) {
+	t.Parallel()
+	pods := make([]*corev1.Pod, 0, 4)
+	for i, name := range []string{"a", "b", "c", "d"} {
+		pod := executionPod(name)
+		pod.CreationTimestamp = metav1.NewTime(time.Now().Add(time.Duration(i-10) * time.Minute))
+		pod.Spec.Containers[0].Image = "example.test/" + map[string]string{"a": "x", "b": "x", "c": "y", "d": "z"}[name] +
+			"@sha256:" + strings.Repeat("c", 64)
+		pods = append(pods, pod)
+	}
+	e, service := newExecutor(t, pods...)
+	e.config.CPU = "8"
+	gate := make(chan struct{})
+	service.mu.Lock()
+	service.pullGate = gate
+	service.mu.Unlock()
+	released := false
+	defer func() {
+		if !released {
+			close(gate)
+		}
+		e.workers.running.Wait()
+		e.pulls.wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := e.reconcilePass(t.Context(), false); err != nil {
+			t.Fatal(err)
+		}
+		e.workers.running.Wait()
+		// c and d race for the last pull worker; the other one waits.
+		queued := false
+		for _, name := range []string{"c", "d"} {
+			pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), name, metav1.GetOptions{})
+			waiting := containerWaiting(pod)
+			queued = queued || waiting != nil && strings.Contains(waiting.Message, "Waiting for an image pull worker")
+		}
+		if countCalls(service, "PullImage") == pullWorkers && queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pulls not bounded and deduplicated: %d calls", countCalls(service, "PullImage"))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(e.workers.busySet()) != 0 || e.recovery.Load() {
+		t.Fatal("an image pull held a creation worker or raised the barrier")
+	}
+	close(gate)
+	released = true
+	e.pulls.wait()
+	reconcilePasses(t, e, 8)
+	for _, pod := range pods {
+		got, _ := e.api.CoreV1().Pods("default").Get(t.Context(), pod.Name, metav1.GetOptions{})
+		if got.Status.Phase != corev1.PodRunning {
+			t.Fatalf("Pod %s did not run after its pull: %+v", pod.Name, got.Status)
+		}
+	}
+	if countCalls(service, "PullImage") != 3 {
+		t.Fatalf("PullImage called %d times for three image references", countCalls(service, "PullImage"))
+	}
+	e.pulls.mu.Lock()
+	defer e.pulls.mu.Unlock()
+	if len(e.pulls.pulls) != 0 || len(e.pulls.ready) != 0 {
+		t.Fatal("pull state retained after every Pod started")
 	}
 }
 
 // TestExecutionWorkersPrioritizeCleanup covers section 6.4 item 4 of
-// DESIGN.md: a slow creation call holds only its own Pod, while deletion and
+// DESIGN.md: a slow image pull holds only its own Pod, while deletion and
 // status work for other Pods proceeds on separate workers and CRI slots.
 func TestExecutionWorkersPrioritizeCleanup(t *testing.T) {
 	t.Parallel()
@@ -334,6 +427,7 @@ func TestExecutionWorkersPrioritizeCleanup(t *testing.T) {
 			close(gate)
 		}
 		e.workers.running.Wait()
+		e.pulls.wait()
 	}()
 	waitFor := func(what string, done func() bool) {
 		t.Helper()
@@ -349,6 +443,9 @@ func TestExecutionWorkersPrioritizeCleanup(t *testing.T) {
 		}
 	}
 	waitFor("the slow pull", func() bool { return countCalls(service, "PullImage") == 2 })
+	// The fake API replaces whole objects on status updates, so no status
+	// operation may run between this read and the deletion update.
+	e.workers.running.Wait()
 	pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "done", metav1.GetOptions{})
 	now := metav1.Now()
 	pod.DeletionTimestamp = &now
@@ -359,8 +456,12 @@ func TestExecutionWorkersPrioritizeCleanup(t *testing.T) {
 		_, err := e.api.CoreV1().Pods("default").Get(t.Context(), "done", metav1.GetOptions{})
 		return apierrors.IsNotFound(err)
 	})
-	if countCalls(service, "PullImage") != 2 || !e.workers.busySet()["slow-uid"] {
-		t.Fatal("a Pod with an operation in flight was dispatched again")
+	e.pulls.mu.Lock()
+	inFlight := e.pulls.pulls[slow.Spec.Containers[0].Image]
+	pulling := inFlight != nil && inFlight.running
+	e.pulls.mu.Unlock()
+	if countCalls(service, "PullImage") != 2 || !pulling {
+		t.Fatal("an image pull in flight was dispatched again")
 	}
 	if record := e.record("done-uid"); record.Stage != "finished" {
 		t.Fatalf("cleanup incomplete: %+v", record)
@@ -368,6 +469,7 @@ func TestExecutionWorkersPrioritizeCleanup(t *testing.T) {
 	close(gate)
 	released = true
 	e.workers.running.Wait()
+	e.pulls.wait()
 	reconcilePasses(t, e, 5)
 	running, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "slow", metav1.GetOptions{})
 	if running.Status.Phase != corev1.PodRunning || countCalls(service, "PullImage") != 2 {
