@@ -173,8 +173,11 @@ failures; the manager never restarts or stops anything. A timeout or a non-zero
 exit is a failure. A probe that could not run (for example, CRI unavailable)
 counts against readiness but not against liveness, because it is not evidence
 about the application. `Suspend(uid, state)` stops a Pod's probes for a
-recorded extension state: readiness becomes false, liveness evidence is kept,
-and after `Resume` readiness must succeed again. Probe output is never logged
+recorded extension state: it cancels probes queued for a concurrency slot or
+running and returns once they finish, readiness becomes false, liveness
+evidence is kept, and after `Resume` readiness must succeed again. A result
+from a probe that started before a `Suspend` or `Resume` is discarded. `Add`
+for a UID already probed replaces its entry and stops the previous probes. Probe output is never logged
 or stored.
 
 ## Container log rotation
