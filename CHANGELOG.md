@@ -7,6 +7,11 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Size-based container log rotation (`internal/logrotation`) through CRI
+  `ReopenContainerLog`, with bounded max size and max files, restoring the log
+  name when the runtime cannot reopen it, and removal of Pod log directories
+  only for journal-finished Pods with no remaining sandbox. Symlinks and paths
+  outside the Pod log directory are refused.
 - A probe manager (`internal/probe`) for readiness and liveness probes: exec
   through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
   Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
