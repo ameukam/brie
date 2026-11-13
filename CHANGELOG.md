@@ -40,7 +40,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
   outside the Pod log directory are refused.
 - A probe manager (`internal/probe`) for readiness and liveness probes: exec
   through CRI `ExecSync`, and httpGet and tcpSocket against the Pod IP, keyed by
-  Pod UID and suspendable for a recorded extension state. `ValidatePodProfile`
+  Pod UID and suspendable for a recorded extension state. Suspension cancels
+  queued and in-flight probes and discards their results, and concurrent
+  `Add` calls for one Pod never leave untracked probe workers. `ValidatePodProfile`
   accepts bounded probes and declared TCP ports only with the new
   `ProfileProbes` feature, which execution mode passes only with
   `--enable-probes`.
