@@ -76,3 +76,21 @@ then both are retried after the retry interval. After 45 minutes of total
 stockout, or on any other failure after the first create, provisioning aborts
 and runs `teardown.sh`. The inventory is written to
 `$HW_LOG_DIR/inventory.tsv`; a second run with the same log directory refuses.
+
+## Fencing (D5)
+
+`fence.sh INSTANCE ZONE` is the provisional lab fence for DESIGN.md section
+5.3. It re-describes the instance and refuses unless it carries the run label.
+It records the instance id and creation timestamp as the incarnation, issues
+`gcloud compute instances stop`, and polls (`FENCE_POLL_SECONDS`, default 10)
+until the same incarnation reports `TERMINATED` (`FENCE_TIMEOUT_SECONDS`,
+default 600). It then checks the label on `INSTANCE-data`, detaches it, and
+verifies the disk no longer lists the instance as a user. It prints one JSON
+evidence object (`brie.hw.fence/v1`) and appends it to
+`$HW_LOG_DIR/fence-evidence.jsonl`. It exits zero only when `verified` is true.
+If the instance never reaches `TERMINATED`, the disk is left attached and the
+evidence records why the fence is unverified.
+
+The fence does not stop an authorized principal from starting the instance
+again; evidence describes one observed point in time. It has never been run
+against a real instance.
