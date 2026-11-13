@@ -176,6 +176,13 @@ version = 3
 
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata-fc.options]
   ConfigPath = '$KATA_FC_CONFIG'
+
+# The CRI image service unpacks a kata-fc image, including the pause image, only
+# for a platform listed with the runtime's snapshotter. Without this entry
+# RunPodSandbox fails with "no unpack platforms defined".
+[plugins.'io.containerd.cri.v1.images'.runtime_platforms.kata-fc]
+  platform = 'linux/arm64'
+  snapshotter = 'devmapper'
 TOML
 printf 'runtime-endpoint: unix:///run/containerd/containerd.sock\nimage-endpoint: unix:///run/containerd/containerd.sock\ntimeout: 10\n' >/etc/crictl.yaml
 
