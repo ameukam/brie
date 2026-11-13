@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A versioned cooperative guest supervisor protocol (`brie.guestsupervisor/v1`)
+  with prepare, resume, and abort messages, length-limited canonical JSON, and
+  a `brie-guestctl` relay. The supervisor listens only on a Unix socket inside
+  the workload container; the host reaches it through CRI ExecSync, so Kata
+  stays the only guest-control channel. Nothing in the node agent calls it,
+  and it is tested only against fakes and local sockets, not on Kata.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled

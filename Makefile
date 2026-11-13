@@ -5,6 +5,7 @@ GO ?= go
 build:
 	$(GO) build -trimpath -o bin/brie-node ./cmd/brie-node
 	$(GO) build -trimpath -o bin/brie-owner ./internal/runtime/cmd/brie-owner
+	$(GO) build -trimpath -o bin/brie-guestctl ./cmd/brie-guestctl
 
 fmt:
 	$(GO) fmt ./...
@@ -34,6 +35,8 @@ fuzz:
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzDecodeInfo$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzArtifactPath$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzVsockConfig$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/guestsupervisor -run='^$$' -fuzz='^FuzzDecodeRequest$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/guestsupervisor -run='^$$' -fuzz='^FuzzDecodeResponse$$' -fuzztime=10s -parallel=2
 
 e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=3m -v ./tests/e2e
