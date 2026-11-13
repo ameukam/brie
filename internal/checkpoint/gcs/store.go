@@ -32,7 +32,6 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/checkpoint"
-	"github.com/ameukam/brie/internal/lifecycleid"
 )
 
 // DefaultEndpoint is the Cloud Storage JSON API endpoint.
@@ -513,8 +512,25 @@ func (s *Store) send(ctx context.Context, build func(context.Context) (*http.Req
 	return response.StatusCode, body, nil
 }
 
-// statusError classifies a non-success status. It reports the status and
-// the service's machine-readable reason only, never the response text.
+// knownReasons lists the Cloud Storage error reasons an error may name. A
+// reason is reported only through this fixed table, so response text such as
+// a reflected credential or object data never reaches an error.
+var knownReasons = map[string]string{
+	"authError":               "authError",
+	"backendError":            "backendError",
+	"badRequest":              "badRequest",
+	"conditionNotMet":         "conditionNotMet",
+	"forbidden":               "forbidden",
+	"insufficientPermissions": "insufficientPermissions",
+	"invalid":                 "invalid",
+	"notFound":                "notFound",
+	"rateLimitExceeded":       "rateLimitExceeded",
+	"required":                "required",
+	"unauthorized":            "unauthorized",
+}
+
+// statusError classifies a non-success status. It reports the status and a
+// known machine-readable reason only, never the response text.
 func statusError(action string, status int, body []byte) error {
 	reason := ""
 	var parsed struct {
@@ -524,9 +540,10 @@ func statusError(action string, status int, body []byte) error {
 			} `json:"errors"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(body, &parsed) == nil && len(parsed.Error.Errors) > 0 &&
-		lifecycleid.Token("reason", parsed.Error.Errors[0].Reason) == nil {
-		reason = " (" + parsed.Error.Errors[0].Reason + ")"
+	if json.Unmarshal(body, &parsed) == nil && len(parsed.Error.Errors) > 0 {
+		if known, ok := knownReasons[parsed.Error.Errors[0].Reason]; ok {
+			reason = " (" + known + ")"
+		}
 	}
 	err := fmt.Errorf("%s: HTTP %d%s", action, status, reason)
 	switch {

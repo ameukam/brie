@@ -443,9 +443,23 @@ func FuzzDecodeObjectMetadata(f *testing.F) {
 }
 
 func TestStatusErrorOmitsResponseText(t *testing.T) {
-	body := []byte(`{"error":{"message":"` + fakeToken + `","errors":[{"reason":"bad reason with spaces"}]}}`)
-	err := statusError("read", 400, body)
-	if text := fmt.Sprint(err); strings.Contains(text, fakeToken) || strings.Contains(text, "spaces") || text != "read: HTTP 400" {
-		t.Fatalf("statusError = %q", text)
+	for _, tt := range []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "invalid reason", reason: "bad reason with spaces", want: "read: HTTP 400"},
+		{name: "token reason", reason: fakeToken, want: "read: HTTP 400"},
+		{name: "token-shaped identifier reason", reason: "ya29.tenant-object-name", want: "read: HTTP 400"},
+		{name: "unknown identifier reason", reason: "tenantSecret", want: "read: HTTP 400"},
+		{name: "known reason", reason: "invalid", want: "read: HTTP 400 (invalid)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(`{"error":{"message":"` + fakeToken + `","errors":[{"reason":"` + tt.reason + `"}]}}`)
+			text := fmt.Sprint(statusError("read", 400, body))
+			if strings.Contains(text, fakeToken) || strings.Contains(text, "SENTINEL") || text != tt.want {
+				t.Fatalf("statusError = %q, want %q", text, tt.want)
+			}
+		})
 	}
 }
