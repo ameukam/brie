@@ -438,9 +438,14 @@ func TestExecutionDeletionAndExit(t *testing.T) {
 			} else if err != nil || pod.Status.Phase != corev1.PodSucceeded {
 				t.Fatalf("exit not reported truthfully: %v, %v", pod.Status, err)
 			}
-			if len(service.sandboxes) != 0 || len(service.containers) != 0 ||
-				e.journal.Records["app-uid"].Stage != "finished" {
-				t.Fatal("runtime cleanup or reservation release incomplete")
+			if len(service.sandboxes) != 0 || len(service.containers) != 0 {
+				t.Fatal("runtime cleanup incomplete")
+			}
+			// A terminal Pod that is still listed keeps its finished record;
+			// a deleted Pod's record is compacted once nothing remains.
+			record := e.journal.Records["app-uid"]
+			if deleting && record != nil || !deleting && (record == nil || record.Stage != "finished" || !record.SandboxRemoved) {
+				t.Fatalf("reservation release or compaction incorrect: %+v", record)
 			}
 		})
 	}

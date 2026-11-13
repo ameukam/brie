@@ -7,6 +7,11 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- With `--enable-workloads`, finished execution journal records are compacted
+  once `RemovePodSandbox` succeeded, the Pod is gone from the complete
+  assigned-Pod view, and a complete CRI inventory shows none of the record's
+  objects. The journal schema moves to version 2; version 1 journals are
+  migrated on start, and older agents refuse version 2 journals.
 - With `--enable-workloads`, a sandbox or container create that the runtime
   definitely rejected, and that a later complete CRI inventory shows created
   nothing, now fails its Pod with `SandboxCreateRejected` or
