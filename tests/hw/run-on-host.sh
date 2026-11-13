@@ -42,14 +42,22 @@ for name in NODE_NAME POD_CIDR SERVICE_CIDR ADVERTISE_ADDRESS; do
 	fi
 done
 
-remote_dir=/tmp/brie-hw-$RUN_ID
+# The staging directory is created atomically by mktemp with a random suffix
+# and mode 0700, so a directory or symlink another local user prepared at a
+# predictable path is never reused. Root runs the scripts only after the
+# directory is confirmed to be a real directory owned by the SSH user with
+# mode 0700.
+remote_dir=$(hw_gcloud compute ssh "$INSTANCE" --zone="$HOST_ZONE" --tunnel-through-iap \
+	--command="mktemp -d /tmp/brie-hw-$RUN_ID.XXXXXXXXXX") ||
+	hw_die "could not create a private staging directory on $INSTANCE"
+remote_dir=${remote_dir%$'\r'}
+[[ $remote_dir =~ ^/tmp/brie-hw-$RUN_ID\.[A-Za-z0-9]{10}$ ]] ||
+	hw_die "mktemp on $INSTANCE returned an unexpected staging path"
 remote_args=()
 for file in "$@"; do
 	remote_args+=("$remote_dir/$(basename "$file")")
 done
-hw_gcloud compute ssh "$INSTANCE" --zone="$HOST_ZONE" --tunnel-through-iap \
-	--command="mkdir -p -m 0700 $remote_dir"
 hw_gcloud compute scp --zone="$HOST_ZONE" --tunnel-through-iap \
 	"$HW_DIR/$SCRIPT" "$HW_DIR/checksums.sh" "$@" "$INSTANCE:$remote_dir/"
 hw_gcloud compute ssh "$INSTANCE" --zone="$HOST_ZONE" --tunnel-through-iap \
-	--command="sudo env ${remote_env[*]} bash $remote_dir/$SCRIPT ${remote_args[*]}"
+	--command="test -d $remote_dir && test ! -L $remote_dir && test \"\$(stat -c %u:%a $remote_dir)\" = \"\$(id -u):700\" && sudo env ${remote_env[*]} bash $remote_dir/$SCRIPT ${remote_args[*]}"
