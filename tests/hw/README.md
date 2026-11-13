@@ -155,3 +155,25 @@ run. Evidence goes to `$HW_LOG_DIR/m1-<timestamp>/` with `SHA256SUMS`; it holds
 Pod manifests and status, versions, and host observations, never the
 kubeconfig. The harness assumes `brie-node` already runs on the host as
 `AGENT_UNIT`.
+
+## Node Conformance (G1)
+
+`node-conformance.sh CHECKSUMS` runs as root on the control-plane host with
+`NODE_NAME` set to the Brie node. It downloads the pinned
+`kubernetes-test-linux-arm64` 1.37 tarball, checks that the server version
+matches, that the Brie node carries its `brie.dev/runtime` taint, and that
+every other node keeps the kubeadm control-plane taint, so test Pods cannot
+silently run on a kubelet node. It then runs `e2e.test` with
+`--ginkgo.focus='\[NodeConformance\]'` and no skip filter.
+`--non-blocking-taints` includes the Brie taint only so the suite can start.
+
+Results go to `/var/lib/brie-hw/evidence/node-conformance-<timestamp>/`:
+JUnit reports, `e2e.log`, `summary.txt`, `failures.txt` listing every failed
+or errored test, and `SHA256SUMS`. Publish all of `failures.txt`. The script
+exits nonzero if any test failed or none ran. `--summarize DIR` regenerates the
+summary from existing JUnit files.
+
+These are the `[NodeConformance]`-tagged tests of the cluster e2e suite, not
+the kubelet-local `e2e_node` runner, which assumes a kubelet. The restricted
+Pod profile rejects most test Pods, so failures are expected; they are results
+to publish, not filters to add.

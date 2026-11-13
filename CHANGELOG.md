@@ -119,6 +119,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
   ID, and journal stage fields, key-based redaction of environment values,
   commands, arguments, request bodies, and credentials, and rate limiting of
   repeated warnings and errors. It is not yet the default agent log format.
+- `tests/hw/node-conformance.sh` runs the pinned upstream 1.37
+  `[NodeConformance]` tests against a lab cluster without skip filters and
+  writes every failure to `failures.txt`. It refuses to run if another node
+  could accept test Pods. Only its input checks and report summary are tested.
 - `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
   Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
   and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
