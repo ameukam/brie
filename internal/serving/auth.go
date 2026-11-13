@@ -87,7 +87,7 @@ type Access struct {
 // cannot reach exec, attach, or port-forward with read-only access.
 func RequestAccess(method, path string) (Access, error) {
 	verbs := map[string]string{
-		http.MethodGet: "get", http.MethodHead: "get", http.MethodPost: "create",
+		http.MethodGet: "get", http.MethodPost: "create",
 		http.MethodPut: "update", http.MethodPatch: "patch", http.MethodDelete: "delete",
 	}
 	verb, ok := verbs[method]
