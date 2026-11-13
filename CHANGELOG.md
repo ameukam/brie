@@ -7,6 +7,35 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A versioned cooperative guest supervisor protocol (`brie.guestsupervisor/v1`)
+  with prepare, resume, and abort messages, length-limited canonical JSON, and
+  a `brie-guestctl` relay. The supervisor listens only on a Unix socket inside
+  the workload container; the host reaches it through CRI ExecSync, so Kata
+  stays the only guest-control channel. Nothing in the node agent calls it,
+  and it is tested only against fakes and local sockets, not on Kata.
+- A credential-free sample cooperative workload, `brie-counter`, with an
+  unbuilt `scratch` image Dockerfile in `examples/counter`. It fsyncs every
+  acknowledged increment to a state file, stops admitting work at prepare,
+  reports its count as the safe point and acknowledged-request watermark, and
+  on resume verifies the state file, rebinds identity, and refreshes entropy
+  before reopening. It does not hibernate anything by itself.
+- A versioned checkpoint manifest schema (`brie.checkpoint/v1alpha1`) with
+  strict canonical JSON decoding and validation of identity, epoch, operation,
+  generation, VM-state, memory, and disk artifacts by object generation, size,
+  SHA-256, and CRC32C, the restore compatibility tuple, device layout, resume
+  protocol, safe point, watermark, creation time, and encryption, access, and
+  retention references. No checkpoint is produced yet.
+- A standard-library Cloud Storage JSON API checkpoint store with immutable
+  `ifGenerationMatch=0` uploads, CRC32C/MD5, size, and generation read-back
+  verification, manifest publication only after every artifact verifies,
+  strict manifest reads, a redacting GCE metadata-server token source, refused
+  redirects, and bounded retries with per-attempt deadlines. It is tested only
+  against an in-process fake server; no real bucket has been used.
+- A conditional checkpoint-reference commit helper. It updates a Sandbox's
+  committed-checkpoint reference only with UID and resource-version
+  preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
+  older generations, and is idempotent after a lost reply. It is an interface
+  tested against a fake; the Sandbox controller implementation is separate.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
