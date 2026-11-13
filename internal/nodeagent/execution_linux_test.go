@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +59,50 @@ type executionRuntime struct {
 	pullError      error
 	// pullGate, when set, holds PullImage until it is closed.
 	pullGate chan struct{}
+	// images, imageFsUsed, and removedImages back image collection;
+	// failImages names an image or list method that fails.
+	images        []*runtimeapi.Image
+	imageFsUsed   uint64
+	removedImages []string
+	failImages    string
+}
+
+func (s *executionRuntime) imageFailure(method string) error {
+	if s.failImages == method {
+		return status.Error(codes.Unavailable, method+" unavailable")
+	}
+	return nil
+}
+
+func (s *executionRuntime) ListImages(context.Context, *runtimeapi.ListImagesRequest) (*runtimeapi.ListImagesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	response := &runtimeapi.ListImagesResponse{}
+	for _, image := range s.images {
+		response.Images = append(response.Images, proto.Clone(image).(*runtimeapi.Image))
+	}
+	return response, s.imageFailure("ListImages")
+}
+
+func (s *executionRuntime) RemoveImage(_ context.Context, request *runtimeapi.RemoveImageRequest) (*runtimeapi.RemoveImageResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "RemoveImage")
+	if err := s.imageFailure("RemoveImage"); err != nil {
+		return nil, err
+	}
+	s.removedImages = append(s.removedImages, request.GetImage().GetImage())
+	s.images = slices.DeleteFunc(s.images, func(image *runtimeapi.Image) bool { return image.Id == request.GetImage().GetImage() })
+	return &runtimeapi.RemoveImageResponse{}, nil
+}
+
+func (s *executionRuntime) ImageFsInfo(context.Context, *runtimeapi.ImageFsInfoRequest) (*runtimeapi.ImageFsInfoResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &runtimeapi.ImageFsInfoResponse{ImageFilesystems: []*runtimeapi.FilesystemUsage{{
+		Timestamp: 1, FsId: &runtimeapi.FilesystemIdentifier{Mountpoint: "/var/lib/containerd"},
+		UsedBytes: &runtimeapi.UInt64Value{Value: s.imageFsUsed},
+	}}}, s.imageFailure("ImageFsInfo")
 }
 
 func (s *executionRuntime) Version(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -162,6 +207,9 @@ func (s *executionRuntime) ListPodSandbox(context.Context, *runtimeapi.ListPodSa
 	if s.listError {
 		return nil, status.Error(codes.Unavailable, "inventory unavailable")
 	}
+	if err := s.imageFailure("ListPodSandbox"); err != nil {
+		return nil, err
+	}
 	response := &runtimeapi.ListPodSandboxResponse{}
 	for _, sandbox := range s.sandboxes {
 		response.Items = append(response.Items, proto.Clone(sandbox).(*runtimeapi.PodSandbox))
@@ -172,6 +220,9 @@ func (s *executionRuntime) ListPodSandbox(context.Context, *runtimeapi.ListPodSa
 func (s *executionRuntime) ListContainers(context.Context, *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.imageFailure("ListContainers"); err != nil {
+		return nil, err
+	}
 	response := &runtimeapi.ListContainersResponse{}
 	for _, container := range s.containers {
 		response.Containers = append(response.Containers, proto.Clone(container).(*runtimeapi.Container))
@@ -551,6 +602,8 @@ func TestExecutionConfigurationAndJournal(t *testing.T) {
 		func(c *ExecutionConfig) { c.MaxPods = 10001 }, func(c *ExecutionConfig) { c.NodeIP = "127.0.0.1" },
 		func(c *ExecutionConfig) { c.ClusterDNS = "" }, func(c *ExecutionConfig) { c.ClusterDomain = ".." },
 		func(c *ExecutionConfig) { c.StateDir = "relative" }, func(c *ExecutionConfig) { c.LogDir = c.StateDir },
+		func(c *ExecutionConfig) { c.ImageGCThreshold = "0" }, func(c *ExecutionConfig) { c.ImageGCThreshold = "-1Gi" },
+		func(c *ExecutionConfig) { c.ImageGCThreshold = "0.5" }, func(c *ExecutionConfig) { c.ImageGCThreshold = "invalid" },
 	} {
 		config := executionConfig(t)
 		change(&config)

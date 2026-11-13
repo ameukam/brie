@@ -199,8 +199,10 @@ func pullMessage(err error) string {
 
 // imageReady reports whether the Pod's image is present or was pulled on the
 // Pod's behalf. Otherwise it publishes the container waiting reason and
-// returns false. An ImageStatus error leaves presence unknown and requests a
-// pull, which CRI defines as idempotent for a present image.
+// returns false. The caller holds e.imageGate for reading, so image collection
+// cannot remove an image between this observation and the journal record
+// that protects it. An ImageStatus error leaves presence unknown and requests
+// a pull, which CRI defines as idempotent for a present image.
 func (e *executor) imageReady(ctx context.Context, runtime *cri.Client, pod *corev1.Pod, image string, sandbox *runtimeapi.PodSandboxConfig) (bool, error) {
 	present, err := runtime.ImageStatus(ctx, image)
 	if err == nil && present != nil {

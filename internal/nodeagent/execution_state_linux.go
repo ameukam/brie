@@ -47,6 +47,10 @@ type executionRecord struct {
 	// execution's sandbox. Compaction requires it for a record that names a
 	// sandbox. Version 1 journals omit it.
 	SandboxRemoved bool `json:",omitempty"`
+	// Image is the admitted container image reference. Image collection
+	// never removes an image that an unfinished record names, and refuses to
+	// run while an unfinished record lacks it. Older journals omit it.
+	Image string `json:",omitempty"`
 }
 
 type executionJournal struct {
