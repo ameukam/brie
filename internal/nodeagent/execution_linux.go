@@ -40,6 +40,9 @@ type executor struct {
 	mu      sync.Mutex
 	journal *executionJournal
 	workers *podWorkers
+	// pulls runs image pulls outside Pod reconciliation (section 10.4 of
+	// DESIGN.md).
+	pulls *imagePuller
 	// watch, when set, serves the assigned-Pod view of each pass; run sets
 	// it. Without it, each pass lists the assigned Pods.
 	watch    *assignedPodWatch
@@ -98,9 +101,14 @@ func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfi
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, health.Close()) }()
+	pulls, err := cri.NewConcurrent(node.RuntimeSocket, imagePullDeadline, pullWorkers)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, pulls.Close()) }()
 	agent := &executor{
 		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
-		workers: newPodWorkers(), logger: log.New(stderr, "brie-node: ", 0),
+		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(stderr, "brie-node: ", 0),
 	}
 	if err := agent.initialize(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -196,6 +204,7 @@ func (e *executor) run(ctx context.Context) error {
 	// operations do not, because status operations finish on every pass.
 	wake := make(chan struct{}, 1)
 	e.watch = newAssignedPodWatch(wake)
+	e.pulls.wake = wake
 	go func() {
 		e.watchAssigned(ctx, e.watch)
 		done <- struct{}{}
@@ -211,6 +220,7 @@ func (e *executor) run(ctx context.Context) error {
 		<-done
 	}
 	e.workers.running.Wait()
+	e.pulls.wait()
 	return shutdownError(ctx.Err())
 }
 
