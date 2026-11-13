@@ -38,9 +38,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - `tests/hw/provision.sh` for a disposable C4A lab of at most four bare-metal
   and two standard hosts, with a dedicated VPC, NAT, and 7-day evidence bucket.
   It refuses plans that an operator-supplied price table projects over the
-  spend ceiling, falls back to a second zone on stockout, and tears down after
-  45 minutes of stockout or any failure once it has claimed the run by
-  creating its network. It refuses a run that already has resources and never
+  spend ceiling for `PLANNED_HOURS` plus the stockout retry allowance, using
+  unrounded comparisons, and creates every host with a GCE termination time
+  and DELETE action at that deadline; network, NAT, and bucket resources have
+  no cloud-side expiry. It falls back to a second zone on stockout, and tears
+  down after 45 minutes of stockout or any failure once it has claimed the run
+  by creating its network. It refuses a run that already has resources and never
   cleans up after a create it lost. Tested only against a mock `gcloud`.
 - A label-guarded hardware lab teardown in `tests/hw`: it deletes only
   resources carrying the run's label or description marker, refuses others
