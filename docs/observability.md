@@ -39,7 +39,7 @@ for `nodes/<subresource>` on the configured Node name, with kubelet's mapping:
 | `/exec`, `/attach`, `/portForward` | `proxy` | always `create` |
 | anything else, including `/containerLogs` | `proxy` | from method |
 
-The method maps GET and HEAD to `get`, POST to `create`, PUT to `update`,
+The method maps GET to `get`, POST to `create`, PUT to `update`,
 PATCH to `patch`, and DELETE to `delete`; other methods are refused. Streaming
 endpoints always need `create`, so a WebSocket GET with read-only access
 cannot open a session. A TokenReview or SubjectAccessReview error refuses the
@@ -115,3 +115,34 @@ Go runtime and process collectors are also registered. CRI latency, errors,
 and pull metrics come from an observer installed on a `cri.Client`
 (`SetObserver`); the other agent signals need executor hooks (see "Executor
 hooks" below).
+
+## Events
+
+`internal/events` records core/v1 Events through client-go's
+`record.EventBroadcaster` with source component `brie-node` and the node name
+as host. Reasons are stable:
+
+| Reason | Object | Type |
+| --- | --- | --- |
+| Published admission reason, such as `UnsupportedPod` or `InsufficientResources` | Pod | Warning |
+| `ImagePullFailed` | Pod | Warning |
+| `CleanupBlocked` | Pod | Warning |
+| `ReadinessProbeFailed`, `LivenessProbeFailed` | Pod | Warning |
+| `AdmissionBarrierRaised` | Node | Warning |
+| `AdmissionBarrierLowered` | Node | Normal |
+
+Bounds, in order: an identical Event (object, reason, and message) is
+suppressed for five minutes; a token bucket allows one Event per second with a
+burst of 25 for the whole agent; client-go's correlator then aggregates
+similar Events and spam-filters per object; messages are cut to 1,024 bytes.
+The deduplication cache holds at most 4,096 keys. Events supplement status:
+every refusal must still be published on the Pod or Node.
+
+Node Events are created in the `default` namespace and are readable by anyone
+who can read Events there, so barrier messages carry only the bounded cause,
+never a Pod name. Pod Events go to the Pod's namespace.
+
+RBAC: the Node authorizer's static node rules let a node identity
+(`system:node:<name>` in group `system:nodes`) `create`, `update`, and `patch`
+`events` in the core and `events.k8s.io` groups, in any namespace. Brie needs
+no additional role. NodeRestriction does not restrict Events.
