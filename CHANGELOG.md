@@ -7,6 +7,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- An agent Prometheus registry (`internal/metrics`) for admission decisions,
+  reservations against the budget, reconciliation pass age, barrier cause,
+  pending stage age, CRI latency and errors by method, image pulls, journal
+  bounds, Lease renewal failures, probes, log rotation, and Events, with
+  bounded label values and no tenant data in labels. CRI clients accept a call
+  observer. Only CRI metrics can be fed without further executor hooks.
 - A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
   1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
   authorization using kubelet's node subresource mapping, `/healthz`,
