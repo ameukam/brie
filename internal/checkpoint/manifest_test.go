@@ -39,6 +39,7 @@ func validManifest() Manifest {
 		Compatibility: Compatibility{
 			HostKernel: "6.8.0-1015-gcp", CPUModel: "Google Axion", GICVersion: "v3",
 			FirecrackerVersion: "1.17.0", SnapshotFormatVersion: "8.0.0", KataVersion: "4.3.1",
+			GuestAgentVersion: "4.3.1", SecurityProfile: "restricted-pod-v1",
 			GuestKernel: "6.18.56", CPUTemplate: "none",
 			ImageDigests: []string{"sha256:" + testSHA256},
 			VCPUCount:    2, MemoryMiB: 2048,
@@ -94,6 +95,8 @@ func TestManifestValidate(t *testing.T) {
 		{name: "firecracker", mutate: func(m *Manifest) { m.Compatibility.FirecrackerVersion = "" }, want: "firecracker_version"},
 		{name: "snapshot format", mutate: func(m *Manifest) { m.Compatibility.SnapshotFormatVersion = "" }, want: "snapshot_format_version"},
 		{name: "kata", mutate: func(m *Manifest) { m.Compatibility.KataVersion = "" }, want: "kata_version"},
+		{name: "guest agent", mutate: func(m *Manifest) { m.Compatibility.GuestAgentVersion = "" }, want: "guest_agent_version"},
+		{name: "security profile", mutate: func(m *Manifest) { m.Compatibility.SecurityProfile = "\t" }, want: "security_profile"},
 		{name: "guest kernel", mutate: func(m *Manifest) { m.Compatibility.GuestKernel = "" }, want: "guest_kernel"},
 		{name: "cpu template", mutate: func(m *Manifest) { m.Compatibility.CPUTemplate = "" }, want: "cpu_template"},
 		{name: "no images", mutate: func(m *Manifest) { m.Compatibility.ImageDigests = nil }, want: "image_digests must list"},
@@ -198,6 +201,8 @@ func TestDecodeManifestRejects(t *testing.T) {
 		{name: "duplicate key", data: strings.Replace(text, `"placement_epoch":3`, `"placement_epoch":4,"placement_epoch":3`, 1), want: "not canonically encoded"},
 		{name: "invalid field", data: strings.Replace(text, `"placement_epoch":3`, `"placement_epoch":0`, 1), want: "invalid manifest"},
 		{name: "string epoch", data: strings.Replace(text, `"placement_epoch":3`, `"placement_epoch":"3"`, 1), want: "decode manifest"},
+		{name: "missing guest agent version", data: strings.Replace(text, `"guest_agent_version":"4.3.1",`, ``, 1), want: "guest_agent_version"},
+		{name: "missing security profile", data: strings.Replace(text, `"security_profile":"restricted-pod-v1",`, ``, 1), want: "security_profile"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := DecodeManifest([]byte(tt.data))
