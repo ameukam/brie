@@ -36,7 +36,6 @@ versioning. Dated nightly prereleases are development builds, not stable release
   preconditions, rejects stale epochs, withdrawn suspensions, deletion, and
   older generations, and is idempotent after a lost reply. It is an interface
   tested against a fake; the Sandbox controller implementation is separate.
-||||||| a2365eb
 - Opt-in `brie-node` flags, all off by default: `--log-format=json`;
   `--enable-serving` with `--serving-address`, `--tls-cert-file`,
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
@@ -80,6 +79,38 @@ versioning. Dated nightly prereleases are development builds, not stable release
   ID, and journal stage fields, key-based redaction of environment values,
   commands, arguments, request bodies, and credentials, and rate limiting of
   repeated warnings and errors. It is not yet the default agent log format.
+- `tests/hw/node-conformance.sh` runs the pinned upstream 1.37
+  `[NodeConformance]` tests against a lab cluster without skip filters and
+  writes every failure to `failures.txt`. It refuses to run if another node
+  could accept test Pods. Only its input checks and report summary are tested.
+- `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
+  Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
+  and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
+  sums. Steps needing features Brie lacks are reported as
+  `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock `gcloud` and
+  `kubectl`.
+- `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
+  control plane with the Node authorizer, NodeRestriction, bridge CNI, and
+  kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
+  operator-filled checksums file that refuses placeholders, and the host
+  install verifies Kata, Firecracker, and jailer binaries against a node-local
+  digest manifest (D9). Only the input validation is tested; neither script has
+  run on a host.
+- `tests/hw/fence.sh`, a provisional lab fence (D5) that stops only a host
+  labelled for the run, waits for the same incarnation to report TERMINATED,
+  detaches its data disk, and prints JSON evidence; it exits nonzero unless
+  every step is observed. Tested only against a mock `gcloud`.
+- `tests/hw/provision.sh` for a disposable C4A lab of at most four bare-metal
+  and two standard hosts, with a dedicated VPC, NAT, and 7-day evidence bucket.
+  It refuses plans that an operator-supplied price table projects over the
+  spend ceiling, falls back to a second zone on stockout, and tears down after
+  45 minutes of stockout or any failure. Tested only against a mock `gcloud`.
+- A label-guarded hardware lab teardown in `tests/hw`: it deletes only
+  resources carrying the run's label or description marker, refuses others,
+  and verifies that nothing remains. It requires `APPROVE_COSTS=yes`, an
+  explicit project, zones, run id, and spend ceiling, and never reads gcloud
+  configuration. Tested only against a mock `gcloud`; it has not run against
+  Google Cloud.
 - With `--enable-workloads`, an execution whose Pod is absent from a complete,
   quorum-consistent node-scoped Pod list is now stopped with zero grace and
   removed, and its reservation released. The list resource version is journaled
