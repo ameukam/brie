@@ -7,6 +7,15 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- Opt-in `brie-node` flags, all off by default: `--log-format=json`;
+  `--enable-serving` with `--serving-address`, `--tls-cert-file`,
+  `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
+  `--container-log-max-size` with `--container-log-max-files`. Serving, Events,
+  and rotation require `--enable-workloads`. The executor now exposes
+  observation hooks for CRI calls, Lease renewals, reconciliation passes, and
+  barrier inputs. Probes, admission reason metrics, and Pod Events still need
+  executor hooks; see [docs/observability.md](docs/observability.md). Tested
+  only against fakes.
 - Size-based container log rotation (`internal/logrotation`) through CRI
   `ReopenContainerLog`, with bounded max size and max files, restoring the log
   name when the runtime cannot reopen it, and removal of Pod log directories

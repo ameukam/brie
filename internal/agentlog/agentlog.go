@@ -51,6 +51,9 @@ type Options struct {
 	RepeatBurst  int
 	// Now overrides the clock for tests.
 	Now func() time.Time
+	// Text selects slog's key=value text format instead of JSON, with the
+	// same redaction and rate limiting.
+	Text bool
 }
 
 // sensitiveTokens are key words whose attribute values are never logged.
@@ -115,7 +118,7 @@ func redact(groups []string, attr slog.Attr) slog.Attr {
 	return attr
 }
 
-// NewHandler returns a redacting, rate-limited JSON handler writing to w.
+// NewHandler returns a redacting, rate-limited JSON or text handler writing to w.
 func NewHandler(w io.Writer, options Options) slog.Handler {
 	level := options.Level
 	if level == nil {
@@ -131,7 +134,10 @@ func NewHandler(w io.Writer, options Options) slog.Handler {
 	if now == nil {
 		now = time.Now
 	}
-	encoder := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level, ReplaceAttr: redact})
+	var encoder slog.Handler = slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level, ReplaceAttr: redact})
+	if options.Text {
+		encoder = slog.NewTextHandler(w, &slog.HandlerOptions{Level: level, ReplaceAttr: redact})
+	}
 	return &limitHandler{next: encoder, limiter: &repeatLimiter{
 		window: window, burst: burst, now: now, entries: make(map[string]*repeatEntry),
 	}}
@@ -146,6 +152,27 @@ func New(w io.Writer, options Options) *slog.Logger {
 // errors through the standard log package. Each line becomes an error record.
 func NewErrorLogger(handler slog.Handler) *log.Logger {
 	return slog.NewLogLogger(handler, slog.LevelError)
+}
+
+// NewLineWriter adapts code that writes lines to an io.Writer, such as a
+// standard log.Logger, so that each line becomes one record at level. A
+// "brie-node: " prefix is removed. Partial lines are emitted as written.
+func NewLineWriter(handler slog.Handler, level slog.Level) io.Writer {
+	return &lineWriter{logger: slog.New(handler), level: level}
+}
+
+type lineWriter struct {
+	logger *slog.Logger
+	level  slog.Level
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if line = strings.TrimPrefix(line, "brie-node: "); line != "" {
+			w.logger.Log(context.Background(), w.level, line)
+		}
+	}
+	return len(p), nil
 }
 
 // maxRepeatKeys bounds the limiter's memory; when full, the oldest window is evicted.

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -55,6 +56,11 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 		"runtime-class": true, "runtime-handler": true, "allocatable-cpu": true, "allocatable-memory": true,
 		"max-pods": true, "node-ip": true, "cluster-dns": true, "cluster-domain": true, "state-dir": true, "pod-log-dir": true,
 	}
+	observability := &observabilityOptions{}
+	observability.register(flags)
+	for _, name := range observabilityWorkloadFlags {
+		executionFlags[name] = true
+	}
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -72,7 +78,7 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 		var hasAgentConfig bool
 		flags.Visit(func(f *flag.Flag) {
 			if f.Name == "node-name" || f.Name == "kubeconfig" || f.Name == "runtime-socket" ||
-				f.Name == "enable-workloads" || executionFlags[f.Name] {
+				f.Name == "enable-workloads" || f.Name == "log-format" || executionFlags[f.Name] {
 				hasAgentConfig = true
 			}
 		})
@@ -105,15 +111,21 @@ func run(ctx context.Context, args []string, buildVersion string, stdout, stderr
 	if executionOnlyOption && !*workloads {
 		return errors.New("execution configuration requires --enable-workloads")
 	}
+	visited := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	if err := observability.validate(visited); err != nil {
+		return err
+	}
 	if *runAgent {
 		config := nodeagent.Config{NodeName: *nodeName, RuntimeSocket: *runtimeSocket}
 		if *workloads {
-			return nodeagent.Execute(ctx, config, execution, *kubeconfig, stderr)
+			return runExecution(ctx, config, execution, *kubeconfig, stderr, observability)
 		}
+		output, _ := observability.agentOutput(stderr, slog.LevelInfo)
 		if *kubeconfig != "" {
-			return nodeagent.Register(ctx, config, *kubeconfig, stderr)
+			return nodeagent.Register(ctx, config, *kubeconfig, output)
 		}
-		return nodeagent.Run(ctx, config, stderr)
+		return nodeagent.Run(ctx, config, output)
 	}
 	if !*showVersion {
 		return errors.New("no mode selected; use --help, --version, or --run")
