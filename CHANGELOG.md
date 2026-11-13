@@ -265,4 +265,13 @@ versioning. Dated nightly prereleases are development builds, not stable release
   heartbeats, revalidating Node identity and scheduling guards on each attempt.
 - Reduced the README to an abstract ten-word sentence.
 
+### Fixed
+
+- Bounded per-Pod workers no longer starve Pods. Each pass offered work in a
+  fixed order, so with more running Pods than the four priority slots the same
+  Pods were deferred on every pass: on C4A hardware a fifth Pod stayed
+  `Pending` while its container ran and its liveness failure was never
+  enforced. A pass now starts operations least recently started first, so every
+  Pod with pending work starts within a bounded number of passes.
+
 [Unreleased]: https://github.com/ameukam/brie/commits/main

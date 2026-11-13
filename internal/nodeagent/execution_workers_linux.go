@@ -4,6 +4,8 @@
 package nodeagent
 
 import (
+	"cmp"
+	"slices"
 	"sync"
 )
 
@@ -27,11 +29,17 @@ func (f *podFault) Error() string { return f.reason + ": " + f.message }
 // podWorkers runs at most one reconciliation operation per Pod UID on a fixed
 // number of goroutines. A pass never waits for a free slot: work that does not
 // fit is retried on the next pass, and Pods with an operation in flight are
-// skipped until it ends.
+// skipped until it ends. A pass offers its operations least recently started
+// first (startLeastRecent), so deferred work is not starved by Pods that keep
+// taking the slots.
 type podWorkers struct {
-	mu       sync.Mutex
-	busy     map[string]bool
-	faults   map[string]error
+	mu     sync.Mutex
+	busy   map[string]bool
+	faults map[string]error
+	// started holds, for each UID, the turn at which its last operation
+	// started; turn increases with every started operation.
+	started  map[string]uint64
+	turn     uint64
 	priority chan struct{}
 	creation chan struct{}
 	running  sync.WaitGroup
@@ -39,8 +47,36 @@ type podWorkers struct {
 
 func newPodWorkers() *podWorkers {
 	return &podWorkers{
-		busy: make(map[string]bool), faults: make(map[string]error),
+		busy: make(map[string]bool), faults: make(map[string]error), started: make(map[string]uint64),
 		priority: make(chan struct{}, priorityWorkers), creation: make(chan struct{}, creationWorkers),
+	}
+}
+
+// podOperation is one Pod's reconciliation operation offered by a pass.
+type podOperation struct {
+	uid  string
+	pool chan struct{}
+	task func() error
+}
+
+// startLeastRecent offers operations to start in order of the turn at which
+// each UID last started an operation, least recent first. A UID that never
+// started one comes first; ties keep the given order. Every operation started
+// moves its UID behind all others, so an operation deferred by a full pool is
+// overtaken at most once by each UID ahead of it and starts within
+// ceil(waiting/slots) passes that find free slots, whatever the Pod count.
+func (w *podWorkers) startLeastRecent(operations []podOperation, pass *sync.WaitGroup) {
+	w.mu.Lock()
+	turns := make(map[string]uint64, len(operations))
+	for _, operation := range operations {
+		turns[operation.uid] = w.started[operation.uid]
+	}
+	w.mu.Unlock()
+	slices.SortStableFunc(operations, func(a, b podOperation) int {
+		return cmp.Compare(turns[a.uid], turns[b.uid])
+	})
+	for _, operation := range operations {
+		w.start(operation.uid, operation.pool, pass, operation.task)
 	}
 }
 
@@ -69,6 +105,8 @@ func (w *podWorkers) start(uid string, pool chan struct{}, pass *sync.WaitGroup,
 		return false
 	}
 	w.busy[uid] = true
+	w.turn++
+	w.started[uid] = w.turn
 	w.running.Add(1)
 	pass.Add(1)
 	go func() {
@@ -102,6 +140,11 @@ func (w *podWorkers) outstanding(present func(string) bool) bool {
 	for uid := range w.faults {
 		if !present(uid) && !w.busy[uid] {
 			delete(w.faults, uid)
+		}
+	}
+	for uid := range w.started {
+		if !present(uid) && !w.busy[uid] {
+			delete(w.started, uid)
 		}
 	}
 	return len(w.faults) != 0

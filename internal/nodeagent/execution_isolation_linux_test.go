@@ -6,7 +6,10 @@ package nodeagent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -745,6 +748,159 @@ func TestPodWorkersBounds(t *testing.T) {
 	}
 	if workers.outstanding(func(string) bool { return false }) {
 		t.Fatal("fault kept for an absent Pod")
+	}
+}
+
+// TestExecutionWorkersServeEveryPod is a regression test: with more running
+// Pods than priority slots, every pass that found the slots full deferred the
+// same Pods, so their status was never published and a liveness failure was
+// never enforced. Each pass below holds its operations until all are offered,
+// so exactly priorityWorkers of them start per pass.
+func TestExecutionWorkersServeEveryPod(t *testing.T) {
+	t.Parallel()
+	const count = 2*priorityWorkers + 1
+	last := fmt.Sprintf("pod-%d", count-1)
+	for _, tt := range []struct {
+		name string
+		// change acts on the running Pods before the bounded passes.
+		change func(t *testing.T, e *executor, service *executionRuntime, execer *probeExecer)
+		want   func(pod *corev1.Pod) bool
+	}{
+		{
+			name: "exited containers",
+			change: func(_ *testing.T, _ *executor, service *executionRuntime, _ *probeExecer) {
+				service.mu.Lock()
+				defer service.mu.Unlock()
+				for _, container := range service.containers {
+					container.State = runtimeapi.ContainerState_CONTAINER_EXITED
+				}
+			},
+			want: func(pod *corev1.Pod) bool { return pod.Status.Phase == corev1.PodSucceeded },
+		},
+		{
+			name: "liveness failure on the last Pod",
+			change: func(t *testing.T, e *executor, _ *executionRuntime, execer *probeExecer) {
+				uid := last + "-uid"
+				execer.mu.Lock()
+				execer.failContainer = e.record(uid).ContainerID
+				execer.mu.Unlock()
+				waitProbeStatus(t, e, uid, func(_, failed bool) bool { return failed })
+			},
+			want: func(pod *corev1.Pod) bool {
+				if pod.Name == last {
+					return pod.Status.Phase == corev1.PodFailed && pod.Status.Reason == reasonLivenessProbeFailed
+				}
+				return pod.Status.Phase == corev1.PodRunning
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var pods []*corev1.Pod
+			for i := range count {
+				pod := executionPod(fmt.Sprintf("pod-%d", i))
+				pod.Spec.Containers[0].LivenessProbe = execProbe(0)
+				pods = append(pods, pod)
+			}
+			e, service := newExecutor(t, pods...)
+			e.config.CPU, e.config.Memory, e.config.MaxPods = "16", "4Gi", count
+			execer := &probeExecer{}
+			e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks)
+			t.Cleanup(e.probes.Close)
+			phases := func() map[string]*corev1.Pod {
+				t.Helper()
+				list, err := e.api.CoreV1().Pods("default").List(t.Context(), metav1.ListOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				byName := make(map[string]*corev1.Pod)
+				for i := range list.Items {
+					byName[list.Items[i].Name] = &list.Items[i]
+				}
+				return byName
+			}
+			allRunning := func() bool {
+				for _, pod := range phases() {
+					if pod.Status.Phase != corev1.PodRunning {
+						return false
+					}
+				}
+				return true
+			}
+			for passes := 0; !allRunning(); passes++ {
+				if passes == 40 {
+					t.Fatal("Pods did not all reach Running")
+				}
+				reconcilePasses(t, e, 1)
+			}
+			tt.change(t, e, service, execer)
+			// Every Pod is served within ceil(count/priorityWorkers) passes.
+			for range (count + priorityWorkers - 1) / priorityWorkers {
+				gate := make(chan struct{})
+				service.mu.Lock()
+				service.sandboxStatusGate = gate
+				service.mu.Unlock()
+				err := e.reconcilePass(t.Context(), false)
+				close(gate)
+				e.workers.running.Wait()
+				e.pulls.wait()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, pod := range phases() {
+				if !tt.want(pod) {
+					t.Errorf("Pod %s not served: phase %s, reason %q", name, pod.Status.Phase, pod.Status.Reason)
+				}
+			}
+		})
+	}
+}
+
+// TestPodWorkersStartLeastRecent checks the order in which a pass offers
+// operations to a full pool.
+func TestPodWorkersStartLeastRecent(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		before  []string
+		offered []string
+		want    []string
+	}{
+		{name: "never started keep the given order", offered: []string{"c", "a", "b"}, want: []string{"c", "a"}},
+		{name: "least recent first", before: []string{"a", "b", "c"}, offered: []string{"c", "b", "a"}, want: []string{"a", "b"}},
+		{name: "never started before started", before: []string{"a", "b"}, offered: []string{"a", "b", "c"}, want: []string{"c", "a"}},
+		{name: "deferred overtakes served", before: []string{"b", "c", "a"}, offered: []string{"a", "b", "c"}, want: []string{"b", "c"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			workers := newPodWorkers()
+			workers.priority = make(chan struct{}, 2)
+			var pass sync.WaitGroup
+			for _, uid := range tt.before {
+				workers.start(uid, workers.priority, &pass, func() error { return nil })
+				pass.Wait()
+			}
+			release := make(chan struct{})
+			var operations []podOperation
+			for _, uid := range tt.offered {
+				operations = append(operations, podOperation{uid: uid, pool: workers.priority, task: func() error {
+					<-release
+					return nil
+				}})
+			}
+			workers.startLeastRecent(operations, &pass)
+			started := slices.Sorted(maps.Keys(workers.busySet()))
+			close(release)
+			pass.Wait()
+			want := slices.Sorted(slices.Values(tt.want))
+			if !slices.Equal(started, want) {
+				t.Fatalf("started %v, want %v", started, want)
+			}
+			if workers.outstanding(func(string) bool { return false }); len(workers.started) != 0 {
+				t.Fatalf("start turns kept for absent Pods: %v", workers.started)
+			}
+		})
 	}
 }
 
