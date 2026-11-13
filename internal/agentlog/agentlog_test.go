@@ -190,3 +190,25 @@ func TestLevelFilter(t *testing.T) {
 		t.Fatalf("records = %v", records)
 	}
 }
+
+func TestNewLineWriter(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	writer := NewLineWriter(NewHandler(&out, Options{}), slog.LevelError)
+	if _, err := fmt.Fprint(writer, "brie-node: first failure\nsecond failure\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	records := decodeLines(t, out.Bytes())
+	if len(records) != 2 || records[0]["msg"] != "first failure" || records[1]["msg"] != "second failure" || records[0]["level"] != "ERROR" {
+		t.Fatalf("records = %v", records)
+	}
+}
+
+func TestTextFormatRedacts(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	New(&out, Options{Text: true}).Warn("exec", slog.String("command", "secret-arg"), PodUID("u1"))
+	if text := out.String(); strings.Contains(text, "secret-arg") || !strings.Contains(text, "pod_uid=u1") || strings.HasPrefix(text, "{") {
+		t.Fatalf("text record = %q", text)
+	}
+}

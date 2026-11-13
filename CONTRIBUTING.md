@@ -44,6 +44,11 @@ Registration-only defaults do not change. The guide records a limited real C4A
 smoke run and its terminal-deletion limitation. Deployment-specific runtime
 qualification is still required; enabling the flag is not conformance evidence.
 
+The [observability guide](docs/observability.md) describes the opt-in JSON log,
+authenticated serving endpoint, metrics, Events, probe manager, and container
+log rotation, and the executor hooks they still need. They are tested only
+against fakes, not on hardware.
+
 ## Kubernetes baseline
 
 The [baseline workflow](.github/workflows/e2e.yml) runs Sonobuoy's `quick` Pod
