@@ -226,6 +226,29 @@ func TestSupervisorTransitions(t *testing.T) {
 			calls: "prepare op-1,abort op-1,abort op-1,abort op-1",
 		},
 		{
+			name:     "resume replay after a later epoch is stale",
+			workload: &fakeWorkload{point: point},
+			steps: []step{
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeReady},
+				{request: prepareRequest("op-2", 3, deadline), outcome: OutcomeSafePoint},
+				{request: abortRequest("op-2"), outcome: OutcomeAborted},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeRefusal, reason: "stale epoch"},
+			},
+			calls: "prepare op-1,resume op-1,prepare op-2,abort op-2",
+		},
+		{
+			name:     "resume replay while a later epoch is prepared is stale",
+			workload: &fakeWorkload{point: point},
+			steps: []step{
+				{request: prepareRequest("op-1", 2, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeReady},
+				{request: prepareRequest("op-2", 3, deadline), outcome: OutcomeSafePoint},
+				{request: resumeRequest("op-1", 2, testTime), outcome: OutcomeRefusal, reason: "stale epoch"},
+			},
+			calls: "prepare op-1,resume op-1,prepare op-2",
+		},
+		{
 			name:     "failed resume stays prepared",
 			workload: &fakeWorkload{point: point, resumeErr: Refuse("state file mismatch")},
 			steps: []step{
