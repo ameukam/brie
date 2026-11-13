@@ -377,6 +377,17 @@ func TestTeardown(t *testing.T) {
 			refused:  []string{"router " + testPrefix + "-router"},
 			retained: []string{"routers/" + testPrefix + "-router", "nats/" + testPrefix + "-nat"},
 		},
+		{
+			name: "owned router with a foreign NAT keeps every NAT and the router",
+			extra: []mockResource{
+				{Kind: "nats", Name: "brie-hw-r20261112-nat", Router: testPrefix + "-router", Region: testRegion},
+			},
+			code:    1,
+			refused: []string{"NAT brie-hw-r20261112-nat on router " + testPrefix + "-router"},
+			retained: []string{
+				"routers/" + testPrefix + "-router", "nats/" + testPrefix + "-nat", "nats/brie-hw-r20261112-nat",
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			resources := ownedLab()
