@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +27,19 @@ import (
 )
 
 type executor struct {
-	node     Config
-	config   ExecutionConfig
-	api      kubernetes.Interface
-	runtime  *cri.Client
-	health   *cri.Client
+	node   Config
+	config ExecutionConfig
+	api    kubernetes.Interface
+	// runtime serves inventory, stop, delete, and status calls; create serves
+	// image, sandbox, and container creation; health serves the health loop.
+	// Each client bounds its own calls in flight.
+	runtime *cri.Client
+	create  *cri.Client
+	health  *cri.Client
+	// mu guards journal records and saves once reconciliation workers run.
+	mu       sync.Mutex
 	journal  *executionJournal
+	workers  *podWorkers
 	nodeUID  types.UID
 	overhead corev1.ResourceList
 	healthy  atomic.Bool
@@ -70,19 +78,26 @@ func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfi
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, journal.close()) }()
-	workloads, err := cri.New(node.RuntimeSocket, 2*time.Minute)
+	// One slot beyond the priority workers keeps inventory lists from
+	// queueing behind slow stop or delete calls.
+	workloads, err := cri.NewConcurrent(node.RuntimeSocket, 2*time.Minute, priorityWorkers+1)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, workloads.Close()) }()
+	creation, err := cri.NewConcurrent(node.RuntimeSocket, 2*time.Minute, creationWorkers)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, creation.Close()) }()
 	health, err := cri.New(node.RuntimeSocket, 10*time.Second)
 	if err != nil {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, health.Close()) }()
 	agent := &executor{
-		node: node, config: config, api: api, journal: journal, runtime: workloads, health: health,
-		logger: log.New(stderr, "brie-node: ", 0),
+		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
+		workers: newPodWorkers(), logger: log.New(stderr, "brie-node: ", 0),
 	}
 	if err := agent.initialize(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -177,12 +192,13 @@ func (e *executor) run(ctx context.Context) error {
 		return renewLease(ctx, e.api.CoordinationV1().Leases(leaseNamespace), e.node.NodeName, e.nodeUID)
 	})
 	go loop(5*time.Second, e.updateHealth)
-	go loop(2*time.Second, e.reconcile)
+	go loop(2*time.Second, func(ctx context.Context) error { return e.reconcilePass(ctx, false) })
 	<-ctx.Done()
 	cancel()
 	for range 3 {
 		<-done
 	}
+	e.workers.running.Wait()
 	return shutdownError(ctx.Err())
 }
 
@@ -308,6 +324,8 @@ func (e *executor) labelsMatch(labels map[string]string, record *executionRecord
 		labels[configHashLabel] == record.Hash
 }
 
+// budgetFits reports whether a reservation fits the configured envelope next
+// to every unfinished record. The caller holds e.mu.
 func (e *executor) budgetFits(cpu, memory int64) bool {
 	remainingCPU, remainingMemory, _ := executionResources(corev1.ResourceList{
 		corev1.ResourceCPU: parseQuantity(e.config.CPU), corev1.ResourceMemory: parseQuantity(e.config.Memory),

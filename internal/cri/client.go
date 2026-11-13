@@ -24,7 +24,7 @@ import (
 
 const maxMessageBytes = 64 * 1024
 
-// Client observes one local runtime, with at most one RPC in flight.
+// Client observes one local runtime with a fixed bound on RPCs in flight.
 // The connection is private; only the explicitly exposed operations are available.
 type Client struct {
 	conn    *grpc.ClientConn
@@ -34,11 +34,20 @@ type Client struct {
 	slot    chan struct{}
 }
 
-// New creates a client without contacting the runtime. The positive timeout
-// bounds each call, including queueing and connection establishment.
-// Socket permissions must restrict access to the trusted runtime owner;
-// plaintext Unix-socket transport does not authenticate it.
+// New creates a client without contacting the runtime that admits one call at
+// a time. The positive timeout bounds each call, including queueing and
+// connection establishment. Socket permissions must restrict access to the
+// trusted runtime owner; plaintext Unix-socket transport does not authenticate it.
 func New(socketPath string, timeout time.Duration) (*Client, error) {
+	return NewConcurrent(socketPath, timeout, 1)
+}
+
+// NewConcurrent is New with at most concurrency calls in flight. Separate
+// clients keep one class of slow calls from queueing another class behind it.
+func NewConcurrent(socketPath string, timeout time.Duration, concurrency int) (*Client, error) {
+	if concurrency < 1 || concurrency > 64 {
+		return nil, errors.New("invalid CRI concurrency: must be between 1 and 64")
+	}
 	if !filepath.IsAbs(socketPath) || !utf8.ValidString(socketPath) ||
 		strings.ContainsRune(socketPath, '\x00') || len(socketPath) > 107 {
 		return nil, errors.New("invalid CRI socket path: must be absolute UTF-8, at most 107 bytes, without NUL")
@@ -65,7 +74,7 @@ func New(socketPath string, timeout time.Duration) (*Client, error) {
 	return &Client{
 		conn: conn, runtime: runtimeapi.NewRuntimeServiceClient(conn),
 		images:  runtimeapi.NewImageServiceClient(conn),
-		timeout: timeout, slot: make(chan struct{}, 1),
+		timeout: timeout, slot: make(chan struct{}, concurrency),
 	}, nil
 }
 
