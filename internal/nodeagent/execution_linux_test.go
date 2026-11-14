@@ -62,6 +62,8 @@ type executionRuntime struct {
 	pullError    error
 	// pullGate, when set, holds PullImage until it is closed.
 	pullGate chan struct{}
+	// sandboxStatusGate, when set, holds PodSandboxStatus until it is closed.
+	sandboxStatusGate chan struct{}
 	// pullRef, when set, is the image ID PullImage returns.
 	pullRef string
 	// images, imageFsUsed, and removedImages back image collection;
@@ -245,6 +247,12 @@ func (s *executionRuntime) ListContainers(context.Context, *runtimeapi.ListConta
 }
 
 func (s *executionRuntime) PodSandboxStatus(_ context.Context, request *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+	s.mu.Lock()
+	gate := s.sandboxStatusGate
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sandbox := s.sandboxes[request.PodSandboxId]

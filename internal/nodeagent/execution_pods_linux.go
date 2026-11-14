@@ -277,12 +277,15 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		defer passMu.Unlock()
 		passErrors = append(passErrors, err)
 	}
-	start := func(uid string, creation bool, describe string, task func(context.Context, *cri.Client) error) {
+	// Each group of operations is started least recently started first:
+	// orphan cleanup before Pod work, and Pod work after admission.
+	var cleanups, operations []podOperation
+	operation := func(uid string, creation bool, describe string, task func(context.Context, *cri.Client) error) podOperation {
 		pool, client := e.workers.priority, e.runtime
 		if creation {
 			pool, client = e.workers.creation, e.create
 		}
-		e.workers.start(uid, pool, &pass, func() error {
+		return podOperation{uid: uid, pool: pool, task: func() error {
 			err := task(ctx, client)
 			if fault := (*podFault)(nil); errors.As(err, &fault) {
 				e.logger.Printf("%s: %v", describe, err)
@@ -299,7 +302,7 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 				}
 			}
 			return err
-		})
+		}}
 	}
 	// Executions whose Pods are absent from the complete list are deleted;
 	// clean them up before any other work (section 6.3 of DESIGN.md).
@@ -326,10 +329,11 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 		if version := deletions[uid]; version != "" {
 			evidence = version
 		}
-		start(uid, false, describe, func(ctx context.Context, client *cri.Client) error {
+		cleanups = append(cleanups, operation(uid, false, describe, func(ctx context.Context, client *cri.Client) error {
 			return e.cleanupDeleted(ctx, client, e.record(uid), inventory, evidence)
-		})
+		}))
 	}
+	e.workers.startLeastRecent(cleanups, &pass)
 	for i := range pods {
 		pod := &pods[i]
 		uid := string(pod.UID)
@@ -378,10 +382,11 @@ func (e *executor) runPass(ctx context.Context, wait bool) error {
 			continue
 		}
 		allowCreate := creation && admit
-		start(uid, creation, describe, func(ctx context.Context, client *cri.Client) error {
+		operations = append(operations, operation(uid, creation, describe, func(ctx context.Context, client *cri.Client) error {
 			return e.reconcilePod(ctx, client, pod, inventory, allowCreate)
-		})
+		}))
 	}
+	e.workers.startLeastRecent(operations, &pass)
 	if wait {
 		pass.Wait()
 		e.pulls.wait()
