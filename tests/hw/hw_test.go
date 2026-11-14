@@ -927,3 +927,68 @@ func TestProvisionFailureTearsDown(t *testing.T) {
 		})
 	}
 }
+
+// TestProvisionExistingRun covers attempts that must not create or clean up
+// anything because the run is, or may be, owned by another invocation.
+func TestProvisionExistingRun(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		resources []mockResource
+		fail      []string
+		stderr    string
+		creates   int
+	}{
+		{
+			name:      "existing lab with another log directory",
+			resources: ownedLab(),
+			stderr:    "already has resources",
+		},
+		{
+			name:      "a leftover router with the run prefix",
+			resources: []mockResource{{Kind: "routers", Name: testPrefix + "-router", Region: testRegion}},
+			stderr:    "already has resources",
+		},
+		{
+			name:   "inventory list fails",
+			fail:   []string{"compute instances list"},
+			stderr: "could not be listed",
+		},
+		{
+			name:    "concurrent provision owns the network",
+			fail:    []string{"compute networks create"},
+			stderr:  "another provision may own run " + testRunID,
+			creates: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := provisionLab(t, mockState{Resources: tt.resources, Fail: tt.fail})
+			before := l.state().Resources
+			r := l.run("provision.sh")
+			if r.code == 0 || !strings.Contains(r.stderr, tt.stderr) {
+				t.Fatalf("exit=%d stderr=%q; want failure containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if strings.Contains(r.stderr, "running teardown") {
+				t.Errorf("an unclaimed run ran teardown: %q", r.stderr)
+			}
+			commands := l.commands()
+			creates := 0
+			for _, c := range commands {
+				fields := strings.Fields(c)
+				for _, verb := range fields {
+					if verb == "delete" || verb == "rm" {
+						t.Errorf("unclaimed run deleted: %q", c)
+					}
+				}
+				if len(fields) > 2 && fields[2] == "create" {
+					creates++
+				}
+			}
+			if creates != tt.creates {
+				t.Errorf("%d create calls, want %d: %q", creates, tt.creates, commands)
+			}
+			if after := l.state().Resources; len(after) != len(before) {
+				t.Errorf("resources changed: before=%v after=%v", before, after)
+			}
+		})
+	}
+}
