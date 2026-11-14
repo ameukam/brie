@@ -263,10 +263,15 @@ func TestRunOnHost(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		labels map[string]string
+		env    map[string]string
 		args   []string
 		stderr string
 	}{
 		{name: "labelled host", labels: runLabels(), args: []string{"install-host.sh", "checksums.txt"}},
+		{
+			name: "unsafe forwarded value", labels: runLabels(), env: map[string]string{"NODE_NAME": "x;reboot"},
+			args: []string{"node-conformance.sh", "checksums.txt"}, stderr: "cannot be forwarded",
+		},
 		{name: "unlabelled host", args: []string{"install-host.sh", "checksums.txt"}, stderr: "does not carry label " + testMarker},
 		{name: "unknown script", labels: runLabels(), args: []string{"teardown.sh"}, stderr: "not a host-side lab script"},
 		{name: "missing input", labels: runLabels(), args: []string{"install-host.sh", "absent.txt"}, stderr: "does not exist"},
@@ -276,6 +281,10 @@ func TestRunOnHost(t *testing.T) {
 				{Kind: "instances", Name: host, Zone: testZone, Labels: tt.labels, Status: "RUNNING"},
 			}})
 			writeFile(t, l.dir, "checksums.txt", filledChecksums(t))
+			l.env["NODE_NAME"] = "brie-worker-1"
+			for k, v := range tt.env {
+				l.env[k] = v
+			}
 			r := l.run("run-on-host.sh", append([]string{host, testZone}, tt.args...)...)
 			commands := l.commands()
 			if tt.stderr != "" {
@@ -291,7 +300,7 @@ func TestRunOnHost(t *testing.T) {
 				t.Fatalf("exit=%d stderr=%q", r.code, r.stderr)
 			}
 			scp := indexOf(commands, `^compute scp .*install-host\.sh .*checksums\.sh .*checksums\.txt `+host+`:/tmp/brie-hw-`+testRunID+`/`)
-			run := indexOf(commands, `^compute ssh `+host+` .*--command=sudo bash /tmp/brie-hw-`+testRunID+`/install-host\.sh /tmp/brie-hw-`+testRunID+`/checksums\.txt`)
+			run := indexOf(commands, `^compute ssh `+host+` .*--command=sudo env NODE_NAME=brie-worker-1 bash /tmp/brie-hw-`+testRunID+`/install-host\.sh /tmp/brie-hw-`+testRunID+`/checksums\.txt`)
 			if scp < 0 || run < scp || indexOf(commands, `^compute instances describe `+host) > scp {
 				t.Fatalf("unexpected command sequence: %q", commands)
 			}
