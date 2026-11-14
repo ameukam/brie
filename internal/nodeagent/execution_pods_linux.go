@@ -554,7 +554,12 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		// execution is preserved without further mutation until deletion.
 		fault := &podFault{reason: "ExecutionConfigChanged",
 			message: "Pod spec no longer matches its admitted execution; delete the Pod to replace it"}
-		return errors.Join(fault, e.publishPodBlocked(ctx, pod, fault.reason, fault.message))
+		// Only a published fault is confined to the Pod; a failed publication
+		// is an ordinary error.
+		if err := e.publishPodBlocked(ctx, pod, fault.reason, fault.message); err != nil {
+			return err
+		}
+		return fault
 	}
 	if err := e.resolveCreateRejection(record, inventory); err != nil {
 		return err
