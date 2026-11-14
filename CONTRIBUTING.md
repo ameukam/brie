@@ -21,6 +21,11 @@ govulncheck, and release configuration validation. Statement coverage must
 exceed 80%. `make e2e` also needs jq; it checks CLI binaries and the conformance
 result parser.
 
+`make test` also runs the [hardware lab script](tests/hw/README.md) tests,
+which need bash, awk, python3, and GNU coreutils, plus shellcheck when it is
+installed. They use only a mock `gcloud` and `kubectl`; never run the scripts
+against a real project without the approvals the README describes.
+
 Use `make fmt` to format Go code. Add regression tests for behavior changes and
 keep reproducible fuzz failures in the Go fuzz corpus. Prefer the standard
 library, pass contexts to blocking operations, and return useful errors.
