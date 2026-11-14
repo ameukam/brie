@@ -25,6 +25,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `PendingStage` and `PendingSince` fields; a pending record from an older
   journal reports its age as `NaN` instead of a guessed time.
 
+- A versioned cooperative guest supervisor protocol (`brie.guestsupervisor/v1`)
+  with prepare, resume, and abort messages, length-limited canonical JSON, and
+  a `brie-guestctl` relay. The supervisor listens only on a Unix socket inside
+  the workload container; the host reaches it through CRI ExecSync, so Kata
+  stays the only guest-control channel. Nothing in the node agent calls it,
+  and it is tested only against fakes and local sockets, not on Kata.
 - Opt-in `brie-node` flags, all off by default: `--log-format=json`;
   `--enable-serving` with `--serving-address`, `--tls-cert-file`,
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
