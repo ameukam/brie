@@ -185,6 +185,45 @@ func removeLine(text, prefix string) string {
 	return strings.Join(kept, "\n")
 }
 
+// TestControlPlaneTokenOutput guards the bootstrap credentials: the script's
+// output is forwarded by run-on-host.sh, so no kubeadm call may print a token.
+func TestControlPlaneTokenOutput(t *testing.T) {
+	script := string(mustRead(t, "install-control-plane.sh"))
+	var calls []string
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "kubeadm ") || strings.Contains(line, "$(kubeadm ") {
+			calls = append(calls, strings.TrimSpace(line))
+		}
+	}
+	for _, tt := range []struct {
+		name  string
+		match func(call string) bool
+		want  int
+	}{
+		{name: "init skips the token print", match: func(c string) bool {
+			return strings.HasPrefix(c, "kubeadm init ") && strings.HasSuffix(c, " --skip-token-print")
+		}, want: 1},
+		{name: "init without the skip flag", match: func(c string) bool {
+			return strings.HasPrefix(c, "kubeadm init ") && !strings.Contains(c, "--skip-token-print")
+		}},
+		{name: "token commands", match: func(c string) bool { return strings.Contains(c, "kubeadm token") }},
+		{name: "join command print", match: func(c string) bool { return strings.Contains(c, "print-join-command") }},
+		{name: "certificate key print", match: func(c string) bool { return strings.Contains(c, "upload-certs") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := 0
+			for _, c := range calls {
+				if tt.match(c) {
+					got++
+				}
+			}
+			if got != tt.want {
+				t.Errorf("%d kubeadm calls match, want %d: %q", got, tt.want, calls)
+			}
+		})
+	}
+}
+
 func TestInstallHostRefusals(t *testing.T) {
 	l := newLab(t, mockState{})
 	checksums := writeFile(t, l.dir, "checksums.txt", filledChecksums(t))

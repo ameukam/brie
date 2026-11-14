@@ -165,7 +165,9 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: systemd
 YAML
-kubeadm init --config "$kubeadm_config"
+# The default init output prints the bootstrap join token, and run-on-host.sh
+# forwards this script's output to the operator's terminal and logs.
+kubeadm init --config "$kubeadm_config" --skip-token-print
 
 export KUBECONFIG=/etc/kubernetes/admin.conf
 apiserver=/etc/kubernetes/manifests/kube-apiserver.yaml
