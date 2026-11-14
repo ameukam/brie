@@ -1,0 +1,29 @@
+# Brie hardware lab artifact checksums (D4 tuple, D9 digests).
+# Copy this file, verify every URL and digest from the upstream release
+# yourself, and replace each <SHA256> with 64 lowercase hex digits.
+# install-host.sh and install-control-plane.sh refuse placeholders, unknown
+# versions, and non-HTTPS URLs. No value below was verified in session
+# r20261113; the URLs follow each project's release naming and must be checked.
+#
+# artifact <name> <version> <https-url> <sha256>
+artifact containerd 2.4.2 https://github.com/containerd/containerd/releases/download/v2.4.2/containerd-2.4.2-linux-arm64.tar.gz <SHA256>
+artifact containerd-service 2.4.2 https://raw.githubusercontent.com/containerd/containerd/v2.4.2/containerd.service <SHA256>
+artifact kata-static 4.3.1 https://github.com/kata-containers/kata-containers/releases/download/4.3.1/kata-static-4.3.1-arm64.tar.zst <SHA256>
+artifact cni-plugins 1.9.1 https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz <SHA256>
+artifact crictl 1.37.0 https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.37.0/crictl-v1.37.0-linux-arm64.tar.gz <SHA256>
+#
+# Control plane and Node Conformance (install-control-plane.sh,
+# node-conformance.sh). Pick the runc release you qualify and one Kubernetes
+# 1.37 patch release; replace <RUNC_VERSION> and <K8S_PATCH> everywhere.
+artifact runc <RUNC_VERSION> https://github.com/opencontainers/runc/releases/download/v<RUNC_VERSION>/runc.arm64 <SHA256>
+artifact kubeadm 1.37.<K8S_PATCH> https://dl.k8s.io/v1.37.<K8S_PATCH>/bin/linux/arm64/kubeadm <SHA256>
+artifact kubelet 1.37.<K8S_PATCH> https://dl.k8s.io/v1.37.<K8S_PATCH>/bin/linux/arm64/kubelet <SHA256>
+artifact kubectl 1.37.<K8S_PATCH> https://dl.k8s.io/v1.37.<K8S_PATCH>/bin/linux/arm64/kubectl <SHA256>
+artifact kubernetes-test 1.37.<K8S_PATCH> https://dl.k8s.io/v1.37.<K8S_PATCH>/kubernetes-test-linux-arm64.tar.gz <SHA256>
+#
+# binary <absolute-path> <sha256>: the D9 node-local digest manifest. Take the
+# digests from the verified Kata 4.3.1 release contents, not from a host.
+binary /opt/kata/bin/firecracker <SHA256>
+binary /opt/kata/bin/jailer <SHA256>
+binary /opt/kata/bin/containerd-shim-kata-v2 <SHA256>
+binary /opt/kata/bin/kata-runtime <SHA256>

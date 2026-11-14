@@ -119,6 +119,13 @@ versioning. Dated nightly prereleases are development builds, not stable release
   ID, and journal stage fields, key-based redaction of environment values,
   commands, arguments, request bodies, and credentials, and rate limiting of
   repeated warnings and errors. It is not yet the default agent log format.
+- `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
+  control plane with the Node authorizer, NodeRestriction, bridge CNI, and
+  kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
+  operator-filled checksums file that refuses placeholders, and the host
+  install verifies Kata, Firecracker, and jailer binaries against a node-local
+  digest manifest (D9). Only the input validation is tested; neither script has
+  run on a host.
 - `tests/hw/fence.sh`, a provisional lab fence (D5) that stops only a host
   labelled for the run, waits for the same incarnation to report TERMINATED,
   detaches its data disk, and prints JSON evidence; it exits nonzero unless
