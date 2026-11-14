@@ -243,7 +243,7 @@ func ownedLab() []mockResource {
 	}
 }
 
-var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh"}
+var scripts = []string{"verify-empty.sh", "teardown.sh", "provision.sh", "fence.sh"}
 
 func TestRequiredInputs(t *testing.T) {
 	for _, script := range scripts {
@@ -714,15 +714,7 @@ func TestProvisionStockoutAbort(t *testing.T) {
 	if left := l.state().Resources; len(left) != 0 {
 		t.Fatalf("resources left after abort: %+v", left)
 	}
-	clock, err := os.ReadFile(l.env[mockClockEnv])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var now int64
-	if _, err := fmt.Sscan(string(clock), &now); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := now - testClockStart; elapsed < 2700 || elapsed > 2700+60 {
+	if elapsed := l.clock() - testClockStart; elapsed < 2700 || elapsed > 2700+60 {
 		t.Errorf("aborted after %d simulated seconds, want the 45-minute cap", elapsed)
 	}
 	commands := l.commands()
@@ -734,4 +726,135 @@ func TestProvisionStockoutAbort(t *testing.T) {
 	if indexOf(commands, `^compute (disks|instances) create .*metal`) >= 0 {
 		t.Error("created a metal host or disk despite the stockout")
 	}
+}
+
+func TestFence(t *testing.T) {
+	source := testPrefix + "-metal-1"
+	url := instanceURL(testProject, testZone, source)
+	instance := func(labels map[string]string) mockResource {
+		return mockResource{Kind: "instances", Name: source, Zone: testZone, Labels: labels,
+			Status: "RUNNING", ID: "9001", Created: "2026-11-13T11:00:00.000-08:00"}
+	}
+	dataDisk := func(labels map[string]string, users ...string) mockResource {
+		return mockResource{Kind: "disks", Name: source + "-data", Zone: testZone, Labels: labels, Users: users}
+	}
+	for _, tt := range []struct {
+		name       string
+		state      mockState
+		args       []string
+		verified   bool
+		reason     string
+		stopped    bool
+		detached   bool
+		minElapsed int64
+	}{
+		{
+			name:     "verified",
+			state:    mockState{Resources: []mockResource{instance(runLabels()), dataDisk(runLabels(), url)}},
+			verified: true, reason: "TERMINATED observed", stopped: true, detached: true,
+		},
+		{
+			name:     "disk already detached",
+			state:    mockState{Resources: []mockResource{instance(runLabels()), dataDisk(runLabels())}},
+			verified: true, reason: "TERMINATED observed", stopped: true,
+		},
+		{
+			name:   "unlabelled instance",
+			state:  mockState{Resources: []mockResource{instance(nil), dataDisk(runLabels(), url)}},
+			reason: "does not carry label " + testMarker,
+		},
+		{
+			name:   "instance of another run",
+			state:  mockState{Resources: []mockResource{instance(map[string]string{"brie-hw-run": "r20261112"}), dataDisk(runLabels(), url)}},
+			reason: "does not carry label " + testMarker,
+		},
+		{
+			name:   "missing instance",
+			state:  mockState{},
+			reason: "cannot describe instance",
+		},
+		{
+			name: "never terminated",
+			state: mockState{StopStatus: "STOPPING",
+				Resources: []mockResource{instance(runLabels()), dataDisk(runLabels(), url)}},
+			reason: "status STOPPING did not reach TERMINATED within 600 s", stopped: true, minElapsed: 600,
+		},
+		{
+			name:   "unlabelled data disk",
+			state:  mockState{Resources: []mockResource{instance(runLabels()), dataDisk(nil, url)}},
+			reason: "data disk " + source + "-data does not carry label", stopped: true,
+		},
+		{
+			name:   "missing data disk",
+			state:  mockState{Resources: []mockResource{instance(runLabels())}},
+			reason: "cannot describe data disk", stopped: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newLab(t, tt.state)
+			r := l.run("fence.sh", source, testZone)
+			if (r.code == 0) != tt.verified {
+				t.Fatalf("exit=%d stdout=%q stderr=%q; want verified=%t", r.code, r.stdout, r.stderr, tt.verified)
+			}
+			var evidence map[string]any
+			if err := json.Unmarshal([]byte(r.stdout), &evidence); err != nil {
+				t.Fatalf("evidence is not JSON: %v: %q", err, r.stdout)
+			}
+			if evidence["verified"] != tt.verified || !strings.Contains(evidence["reason"].(string), tt.reason) {
+				t.Errorf("evidence=%v; want verified=%t reason containing %q", evidence, tt.verified, tt.reason)
+			}
+			if evidence["schema"] != "brie.hw.fence/v1" || evidence["instance"] != source || evidence["run_id"] != testRunID {
+				t.Errorf("evidence identity: %v", evidence)
+			}
+			if tt.verified {
+				for key, want := range map[string]string{
+					"instance_id": "9001", "creation_timestamp": "2026-11-13T11:00:00.000-08:00",
+					"final_status": "TERMINATED", "disk_users_after": "",
+				} {
+					if evidence[key] != want {
+						t.Errorf("%s=%v, want %q", key, evidence[key], want)
+					}
+				}
+				for _, key := range []string{"requested_at", "stop_returned_at", "terminated_observed_at", "disk_detached_at"} {
+					if _, err := time.Parse(time.RFC3339, evidence[key].(string)); err != nil {
+						t.Errorf("%s=%v is not a timestamp", key, evidence[key])
+					}
+				}
+			}
+			commands := l.commands()
+			if stopped := indexOf(commands, `^compute instances stop `+source) >= 0; stopped != tt.stopped {
+				t.Errorf("stop issued=%t, want %t: %q", stopped, tt.stopped, commands)
+			}
+			if detached := indexOf(commands, `^compute instances detach-disk `+source) >= 0; detached != tt.detached {
+				t.Errorf("detach issued=%t, want %t: %q", detached, tt.detached, commands)
+			}
+			if elapsed := l.clock() - testClockStart; elapsed < tt.minElapsed {
+				t.Errorf("gave up after %d simulated seconds, want at least %d", elapsed, tt.minElapsed)
+			}
+			saved, err := os.ReadFile(filepath.Join(l.env["HW_LOG_DIR"], "fence-evidence.jsonl"))
+			if err != nil || strings.TrimSpace(string(saved)) != strings.TrimSpace(r.stdout) {
+				t.Errorf("saved evidence=%q err=%v", saved, err)
+			}
+		})
+	}
+
+	t.Run("usage", func(t *testing.T) {
+		l := newLab(t, mockState{})
+		if r := l.run("fence.sh", source); r.code == 0 || !strings.Contains(r.stderr, "usage: fence.sh INSTANCE ZONE") {
+			t.Fatalf("exit=%d stderr=%q", r.code, r.stderr)
+		}
+	})
+}
+
+func (l *lab) clock() int64 {
+	l.t.Helper()
+	data, err := os.ReadFile(l.env[mockClockEnv])
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	var now int64
+	if _, err := fmt.Sscan(string(data), &now); err != nil {
+		l.t.Fatal(err)
+	}
+	return now
 }
