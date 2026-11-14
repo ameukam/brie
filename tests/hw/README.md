@@ -193,7 +193,7 @@ Pod without `spec.nodeName` and records each step in `results.tsv`:
 | --- | --- |
 | startup | Pod Ready on `NODE_NAME`, Running, with an IP |
 | pod-network | HTTP from the worker host to the Pod IP returns the guest boot ID |
-| probes, exec, logs | Exercised only when listed in `M1_FEATURES`; otherwise `SKIPPED-UNSUPPORTED` |
+| probes, exec, logs | Exercised only when listed in `M1_FEATURES`; otherwise `SKIPPED-UNSUPPORTED`. The probes step submits a second Pod that declares container port 8080 and has a TCP readiness probe on it |
 | volumes, warm-pause-resume | Always `SKIPPED-UNSUPPORTED`; Brie has neither |
 | agent-restart | Firecracker PIDs, CRI container IDs, and guest boot ID are identical before and after restarting `AGENT_UNIT` |
 | cleanup | The Pod and its CRI sandbox are gone after deletion |
