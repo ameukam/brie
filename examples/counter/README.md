@@ -17,7 +17,9 @@ Firecracker backend, so running this example does not hibernate anything.
 - `GET /readyz` returns 503 while work is not admitted.
 
 The in-container supervisor listens on `/brie/supervisor.sock` with
-owner-only permissions. It is not a network service.
+owner-only permissions. It is not a network service. While it runs it holds an
+exclusive lock on `/brie/supervisor.sock.lock`; a second starter fails, and a
+leftover socket is replaced only when connecting to it is refused.
 
 - **prepare** closes admission (new requests receive 503), waits for in-flight
   requests until the prepare deadline, fsyncs the state file and its directory,
