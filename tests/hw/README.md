@@ -189,17 +189,25 @@ kubeconfig. The harness assumes `brie-node` already runs on the host as
 `node-conformance.sh CHECKSUMS` runs as root on the control-plane host with
 `NODE_NAME` set to the Brie node. It downloads the pinned
 `kubernetes-test-linux-arm64` 1.37 tarball, checks that the server version
-matches, that the Brie node carries its `brie.dev/runtime` taint, and that
-every other node keeps the kubeadm control-plane taint, so test Pods cannot
-silently run on a kubelet node. It then runs `e2e.test` with
+matches, and captures `kubectl get nodes -o json` as a whole; a failed, empty,
+or paginated list stops the run. The inventory must contain the Brie node with
+its `brie.dev/runtime` taint, and every other node must keep the kubeadm
+control-plane taint with a `NoSchedule` or `NoExecute` effect
+(`PreferNoSchedule` is refused), so test Pods cannot silently run on a kubelet
+node. `--check-nodes NODES_JSON` applies the same check to a saved inventory.
+Test-Pod placement itself is not recorded. It then runs `e2e.test` with
 `--ginkgo.focus='\[NodeConformance\]'` and no skip filter.
 `--non-blocking-taints` includes the Brie taint only so the suite can start.
 
 Results go to `/var/lib/brie-hw/evidence/node-conformance-<timestamp>/`:
-JUnit reports, `e2e.log`, `summary.txt`, `failures.txt` listing every failed
-or errored test, and `SHA256SUMS`. Publish all of `failures.txt`. The script
-exits nonzero if any test failed or none ran. `--summarize DIR` regenerates the
-summary from existing JUnit files.
+JUnit reports, `e2e.log`, `nodes.json`, `summary.txt`, `failures.txt` listing
+every failed or errored case, `skipped.txt` listing every skipped selected
+case, and `SHA256SUMS`. Publish all of `failures.txt` and `skipped.txt`.
+Selected cases are those named `[NodeConformance]`; specs the focus filtered
+out and suite setup nodes are counted as `unselected`, but a failure in any
+case is a failure. The script exits 1 if any case failed or no selected case
+ran, and 2 (incomplete) if any selected case was skipped. `--summarize DIR`
+regenerates the summary from existing JUnit files.
 
 These are the `[NodeConformance]`-tagged tests of the cluster e2e suite, not
 the kubelet-local `e2e_node` runner, which assumes a kubelet. The restricted
