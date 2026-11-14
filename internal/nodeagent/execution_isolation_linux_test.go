@@ -97,6 +97,9 @@ func TestExecutionCreationEvidence(t *testing.T) {
 		{name: "sandbox-rejected-foreign-claim", method: "RunPodSandbox", code: codes.NotFound, foreignClaim: true, want: "unresolved"},
 		{name: "sandbox-server-deadline", method: "RunPodSandbox", code: codes.DeadlineExceeded, want: "unresolved"},
 		{name: "sandbox-unknown", method: "RunPodSandbox", code: codes.Unknown, want: "unresolved"},
+		// grpc-go also reports transport resets and HTTP 403 as PermissionDenied.
+		{name: "sandbox-permission-denied", method: "RunPodSandbox", code: codes.PermissionDenied, want: "unresolved"},
+		{name: "container-permission-denied", method: "CreateContainer", code: codes.PermissionDenied, want: "unresolved"},
 		{name: "container-rejected", method: "CreateContainer", code: codes.FailedPrecondition, want: "ContainerCreateRejected"},
 		{name: "container-rejected-restart", method: "CreateContainer", code: codes.InvalidArgument, restart: true, want: "ContainerCreateRejected"},
 		{name: "container-rejected-but-created", method: "CreateContainer", code: codes.NotFound, createOnReject: true, want: "running"},
@@ -182,6 +185,7 @@ func TestExecutionJournalRejectsInvalidCreationEvidence(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct{ name, code string }{
 		{"lost-reply-code", "Unavailable"},
+		{"transport-permission-denied", "PermissionDenied"},
 		{"unknown-code", "Bogus"},
 		{"started-stage", "InvalidArgument"},
 	} {

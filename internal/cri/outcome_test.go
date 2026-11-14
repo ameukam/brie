@@ -4,12 +4,18 @@
 package cri
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -26,7 +32,7 @@ func TestDefiniteRejection(t *testing.T) {
 		{"invalid-argument", status.Error(codes.InvalidArgument, "bad config"), true},
 		{"not-found", status.Error(codes.NotFound, "no image"), true},
 		{"failed-precondition", status.Error(codes.FailedPrecondition, "sandbox not ready"), true},
-		{"permission-denied", status.Error(codes.PermissionDenied, "denied"), true},
+		{"permission-denied", status.Error(codes.PermissionDenied, "denied"), false},
 		{"out-of-range", status.Error(codes.OutOfRange, "too large"), true},
 		{"wrapped", fmt.Errorf("CRI RunPodSandbox: %w", status.Error(codes.InvalidArgument, "bad")), true},
 		{"lost-reply", status.Error(codes.Unavailable, "connection reset"), false},
@@ -140,5 +146,92 @@ func TestNewConcurrent(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// serveRawHTTP2 answers every request stream on a Unix socket with respond,
+// without running any gRPC handler. It stands in for a transport failure
+// between the client and the runtime.
+func serveRawHTTP2(t *testing.T, respond func(*http2.Framer, uint32) error) string {
+	t.Helper()
+	socket := filepath.Join(t.TempDir(), "raw.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				preface := make([]byte, len(http2.ClientPreface))
+				if _, err := io.ReadFull(conn, preface); err != nil {
+					return
+				}
+				framer := http2.NewFramer(conn, conn)
+				if framer.WriteSettings() != nil {
+					return
+				}
+				for {
+					frame, err := framer.ReadFrame()
+					if err != nil {
+						return
+					}
+					switch frame := frame.(type) {
+					case *http2.SettingsFrame:
+						if !frame.IsAck() && framer.WriteSettingsAck() != nil {
+							return
+						}
+					case *http2.HeadersFrame:
+						if respond(framer, frame.StreamID) != nil {
+							return
+						}
+					}
+				}
+			}()
+		}
+	}()
+	return socket
+}
+
+// TestDefiniteRejectionExcludesTransportPermissionDenied is a regression test:
+// grpc-go reports an HTTP/2 INADEQUATE_SECURITY reset and an HTTP 403 reply as
+// PermissionDenied although no runtime handler answered, so neither may count
+// as evidence that a create call created nothing.
+func TestDefiniteRejectionExcludesTransportPermissionDenied(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		respond func(*http2.Framer, uint32) error
+	}{
+		{"inadequate-security-reset", func(framer *http2.Framer, stream uint32) error {
+			return framer.WriteRSTStream(stream, http2.ErrCodeInadequateSecurity)
+		}},
+		{"http-403", func(framer *http2.Framer, stream uint32) error {
+			var block bytes.Buffer
+			if err := hpack.NewEncoder(&block).WriteField(hpack.HeaderField{Name: ":status", Value: "403"}); err != nil {
+				return err
+			}
+			return framer.WriteHeaders(http2.HeadersFrameParam{StreamID: stream, BlockFragment: block.Bytes(),
+				EndHeaders: true, EndStream: true})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			client := newClient(t, serveRawHTTP2(t, test.respond), time.Second)
+			_, err := client.RunPodSandbox(t.Context(), &runtimeapi.PodSandboxConfig{
+				Metadata: &runtimeapi.PodSandboxMetadata{Name: "app", Namespace: "default", Uid: "app-uid"},
+			}, "kata-fc")
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("transport failure = %v, want grpc-go's PermissionDenied", err)
+			}
+			if _, rejected := DefiniteRejection(err); rejected {
+				t.Fatalf("transport-generated %v counted as a runtime rejection", err)
+			}
+		})
 	}
 }
