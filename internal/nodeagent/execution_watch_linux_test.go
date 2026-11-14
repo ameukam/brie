@@ -344,6 +344,72 @@ func TestAssignedPodWatchRejectsUnusableView(t *testing.T) {
 	}
 }
 
+// TestExecutionWatchBackoffAccumulates is a regression test: a watch that
+// opens and then breaks at once, or delivers only an error event before a
+// successful relist, keeps backing off exponentially up to the limit. Only an
+// applied event resets the failure count.
+func TestExecutionWatchBackoffAccumulates(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		// disrupt ends one watch stream.
+		disrupt func(*watch.RaceFreeFakeWatcher)
+		// want is the failure count after each disrupted stream.
+		want []int
+	}{
+		{
+			name:    "immediate closes",
+			disrupt: func(watcher *watch.RaceFreeFakeWatcher) { watcher.Stop() },
+			want:    []int{1, 2, 3, 4, 5, 6},
+		},
+		{
+			name: "error events after successful relists",
+			disrupt: func(watcher *watch.RaceFreeFakeWatcher) {
+				watcher.Error(&metav1.Status{Status: metav1.StatusFailure, Code: http.StatusInternalServerError})
+			},
+			want: []int{1, 2, 3, 4, 5, 6},
+		},
+		{
+			name: "progress resets",
+			disrupt: func(watcher *watch.RaceFreeFakeWatcher) {
+				watcher.Action(watch.Bookmark, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "150"}})
+				watcher.Stop()
+			},
+			want: []int{0, 0, 0},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e, _ := newExecutor(t)
+			fakes := watchPods(e)
+			view := startWatch(t, e, time.Hour)
+			watcher, _ := fakes.next(t)
+			previous := time.Duration(0)
+			for _, want := range tc.want {
+				tc.disrupt(watcher)
+				// The count changes before the next watch opens.
+				watcher, _ = fakes.next(t)
+				got := view.failureCount()
+				if got != want {
+					t.Fatalf("failure count = %d, want %d", got, want)
+				}
+				if got == 0 {
+					continue
+				}
+				// Without jitter, each delay doubles up to the limit.
+				floor := min(view.base<<(got-1), view.limit)
+				if floor < previous || floor > view.limit {
+					t.Fatalf("backoff floor %s after %s did not grow toward the limit", floor, previous)
+				}
+				previous = floor
+			}
+			if len(tc.want) > 3 && previous != view.limit {
+				t.Fatalf("backoff never reached the limit: %s", previous)
+			}
+		})
+	}
+}
+
 func TestWatchBackoff(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
