@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -42,14 +43,16 @@ func (e *executor) collectImages(ctx context.Context) error {
 	return e.collectImagesAt(ctx, time.Now())
 }
 
-// collectImagesAt runs one collection pass. Every input must be complete: an
-// unreconstructed execution inventory, a failed image filesystem, image,
-// sandbox, or container list, or an unfinished journal record without an
-// image reference stops the pass before any removal. An image is a candidate
+// collectImagesAt runs one collection pass. Every input must be complete and
+// every image dependency positively identified, or the pass removes nothing:
+// it stops on an unreconstructed execution inventory, a running image pull, a
+// failed image filesystem, image, sandbox, or container list, any existing
+// sandbox, a container whose image is not identified in the image list, or a
+// retained journal record without an image reference. An image is a candidate
 // only when it is not pinned by the runtime, matches no reference, and was
-// already unreferenced imageGCMinUnused earlier. Candidates are removed
-// largest first until the reported usage, reduced by the sizes removed, is at
-// or below the threshold.
+// already unreferenced imageGCMinUnused earlier. Candidates are removed largest
+// first until the reported usage, reduced by the sizes removed, is at or below
+// the threshold.
 func (e *executor) collectImagesAt(ctx context.Context, now time.Time) error {
 	collector := e.images
 	if collector == nil {
@@ -57,6 +60,17 @@ func (e *executor) collectImagesAt(ctx context.Context, now time.Time) error {
 	}
 	if !e.synced.Load() || e.recovery.Load() {
 		return errors.New("image collection skipped: execution inventory is not reconstructed")
+	}
+	// Holding the gate for the whole pass orders it against image presence
+	// checks and pull starts, which hold it for reading: a check that saw an
+	// image present ran after its journal record existed, and no pull starts
+	// until the pass ends. A pull already running can add a reference to a
+	// listed image, so the pass waits for a later run.
+	e.imageGate.Lock()
+	defer e.imageGate.Unlock()
+	pulling, pulled := e.pulls.collectionView()
+	if pulling {
+		return errors.New("image collection skipped: an image pull is in progress")
 	}
 	filesystems, err := collector.client.ImageFsInfo(ctx)
 	if err != nil {
@@ -66,8 +80,6 @@ func (e *executor) collectImagesAt(ctx context.Context, now time.Time) error {
 	for _, usage := range filesystems {
 		used += min(usage.GetUsedBytes().GetValue(), math.MaxUint64-used)
 	}
-	// The image list precedes the journal read below, so an image pulled for
-	// a record admitted after that read is absent from the list.
 	images, err := collector.client.ListImages(ctx)
 	if err != nil {
 		return fmt.Errorf("image collection: %w", err)
@@ -80,8 +92,26 @@ func (e *executor) collectImagesAt(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("image collection: %w", err)
 	}
+	// CRI sandbox inventory does not name the sandbox image, and a pinned
+	// image is not known to be that image. Every sandbox is a VM that may
+	// depend on an image no other input names.
+	if len(sandboxes) != 0 {
+		return errors.New("image collection refused: CRI does not identify the images of existing sandboxes")
+	}
 	references := make(map[string]bool)
+	for _, id := range pulled {
+		references[id] = true
+	}
 	for _, container := range containers {
+		identity := container.GetImageId()
+		if identity == "" {
+			identity = container.GetImageRef()
+		}
+		if identity == "" || !slices.ContainsFunc(images, func(image *runtimeapi.Image) bool {
+			return imageReferenced(image, map[string]bool{identity: true})
+		}) {
+			return errors.New("image collection refused: a container's image is not identified in the image list")
+		}
 		for _, reference := range []string{container.GetImage().GetImage(), container.GetImage().GetUserSpecifiedImage(),
 			container.GetImageRef(), container.GetImageId()} {
 			if reference != "" {
@@ -89,29 +119,16 @@ func (e *executor) collectImagesAt(ctx context.Context, now time.Time) error {
 			}
 		}
 	}
-	pinned := false
-	for _, image := range images {
-		pinned = pinned || image.GetPinned()
-	}
-	// CRI sandbox inventory does not name the sandbox image. The runtime
-	// pins its configured sandbox image; without any pinned image, that
-	// image cannot be told apart from an unreferenced one.
-	if len(sandboxes) != 0 && !pinned {
-		return errors.New("image collection refused: sandboxes exist but the runtime pins no image")
-	}
-	// Holding the gate orders this pass against image presence checks: a
-	// check that saw an image present ran after its journal record existed,
-	// so the record is read below.
-	e.imageGate.Lock()
-	defer e.imageGate.Unlock()
 	e.mu.Lock()
 	for _, record := range e.journal.Records {
-		if record.Stage == "finished" {
+		// A finished record keeps its image until RemovePodSandbox succeeded
+		// for the sandbox it names.
+		if record.Stage == "finished" && (record.SandboxID == "" || record.SandboxRemoved) {
 			continue
 		}
 		if record.Image == "" {
 			e.mu.Unlock()
-			return errors.New("image collection refused: an unfinished execution record has no image reference")
+			return errors.New("image collection refused: a retained execution record has no image reference")
 		}
 		references[record.Image] = true
 	}

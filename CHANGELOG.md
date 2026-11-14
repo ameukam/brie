@@ -27,10 +27,11 @@ versioning. Dated nightly prereleases are development builds, not stable release
   grpc-go also reports for transport failures, still block admission.
 - With `--enable-workloads`, the new `--image-gc-threshold` flag enables image
   collection through CRI (disabled by default). While the reported image
-  filesystem usage exceeds the threshold, images that no container or
-  unfinished execution references, that the runtime does not pin, and that were
-  unreferenced for five minutes are removed, largest first. A failed or partial
-  list removes nothing.
+  filesystem usage exceeds the threshold, images that no container, image pull,
+  or retained execution references, that the runtime does not pin, and that
+  were unreferenced for five minutes are removed, largest first. A failed or
+  partial list, a running pull, a container whose image is not identified, or
+  any existing sandbox, whose image CRI does not name, removes nothing.
 - With `--enable-workloads`, image pulls run on two bounded pull workers,
   shared by every Pod that needs the same image reference, with a ten-minute
   deadline and per-image backoff with jitter. A waiting Pod reports

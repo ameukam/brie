@@ -44,7 +44,8 @@ type executor struct {
 	// DESIGN.md).
 	pulls *imagePuller
 	// images, when set, collects unreferenced images; imageGate orders
-	// image presence checks (read) against collection (write).
+	// image presence checks and pull starts (read) against collection
+	// (write).
 	images    *imageCollector
 	imageGate sync.RWMutex
 	// watch, when set, serves the assigned-Pod view of each pass; run sets
