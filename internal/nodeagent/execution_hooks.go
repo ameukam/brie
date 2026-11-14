@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
 )
@@ -41,6 +42,10 @@ type ExecutionHooks struct {
 	ProbeResult func(kind, handler, result string)
 	// LivenessFailed receives a Pod published Failed after its liveness probe failed.
 	LivenessFailed func(pod *corev1.Pod, message string)
+	// Inventory receives, after each pass that read the runtime, the
+	// executions whose journal record, owner labels, and runtime objects agree.
+	// Foreign, ambiguous, and busy executions are omitted.
+	Inventory func([]execinventory.Execution)
 }
 
 // AdmissionAdmitted is the admission decision for a reserved Pod.
@@ -83,6 +88,12 @@ func (h ExecutionHooks) leaseRenewed(err error) {
 func (h ExecutionHooks) passFinished(err error) {
 	if h.Pass != nil {
 		h.Pass(err, time.Now())
+	}
+}
+
+func (h ExecutionHooks) inventoryVerified(executions []execinventory.Execution) {
+	if h.Inventory != nil {
+		h.Inventory(executions)
 	}
 }
 

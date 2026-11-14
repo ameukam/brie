@@ -109,6 +109,8 @@ type fakeRuntime struct {
 	execCmd    []string
 	execOpts   cri.ExecOptions
 	ports      []int32
+	// lastIDs records the container and sandbox IDs the server acted on.
+	lastIDs []string
 }
 
 func (f *fakeRuntime) ListPodSandbox(context.Context) ([]*runtimeapi.PodSandbox, error) {
@@ -120,26 +122,32 @@ func (f *fakeRuntime) ListContainers(context.Context) ([]*runtimeapi.Container, 
 }
 
 func (f *fakeRuntime) ContainerStatus(_ context.Context, id string) (*runtimeapi.ContainerStatus, error) {
+	f.mu.Lock()
+	f.lastIDs = append(f.lastIDs, id)
+	f.mu.Unlock()
 	return &runtimeapi.ContainerStatus{Id: id, LogPath: f.logPath}, nil
 }
 
-func (f *fakeRuntime) Exec(_ context.Context, _ string, command []string, options cri.ExecOptions) (*url.URL, error) {
+func (f *fakeRuntime) Exec(_ context.Context, id string, command []string, options cri.ExecOptions) (*url.URL, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastIDs = append(f.lastIDs, id)
 	f.execCmd, f.execOpts = command, options
 	return f.url()
 }
 
-func (f *fakeRuntime) Attach(_ context.Context, _ string, options cri.ExecOptions) (*url.URL, error) {
+func (f *fakeRuntime) Attach(_ context.Context, id string, options cri.ExecOptions) (*url.URL, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastIDs = append(f.lastIDs, id)
 	f.execOpts = options
 	return f.url()
 }
 
-func (f *fakeRuntime) PortForward(_ context.Context, _ string, ports []int32) (*url.URL, error) {
+func (f *fakeRuntime) PortForward(_ context.Context, id string, ports []int32) (*url.URL, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastIDs = append(f.lastIDs, id)
 	f.ports = ports
 	return f.url()
 }
@@ -173,6 +181,9 @@ func (b *syncBuffer) String() string {
 	return b.buffer.String()
 }
 
+// testOwnerLabel is the executor's owner label on runtime objects.
+const testOwnerLabel = "brie.dev/execution-owner"
+
 const (
 	testNode    = "worker-1"
 	testHandler = "kata-fc"
@@ -187,21 +198,27 @@ func ownedRuntime(logDir string) *fakeRuntime {
 			{
 				Id: "old-sandbox", Metadata: &runtimeapi.PodSandboxMetadata{Name: "web", Namespace: "team", Uid: "old-uid"},
 				State: runtimeapi.PodSandboxState_SANDBOX_NOTREADY, CreatedAt: 1, RuntimeHandler: testHandler,
-				Labels: map[string]string{executionOwnerLabel: "owner"},
+				Labels: map[string]string{testOwnerLabel: "owner"},
 			},
 			{
 				Id: "sandbox-1", Metadata: &runtimeapi.PodSandboxMetadata{Name: "web", Namespace: "team", Uid: testUID},
 				State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: 2, RuntimeHandler: testHandler,
-				Labels: map[string]string{executionOwnerLabel: "owner"},
+				Labels: map[string]string{testOwnerLabel: "owner"},
 			},
 			{
 				Id: "foreign", Metadata: &runtimeapi.PodSandboxMetadata{Name: "web", Namespace: "team", Uid: "foreign-uid"},
 				State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: 3, RuntimeHandler: "runc",
-				Labels: map[string]string{executionOwnerLabel: "owner"},
+				Labels: map[string]string{testOwnerLabel: "owner"},
 			},
 			{
 				Id: "unlabeled", Metadata: &runtimeapi.PodSandboxMetadata{Name: "web", Namespace: "team", Uid: "unlabeled-uid"},
 				State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: 4, RuntimeHandler: testHandler,
+			},
+			{
+				// The newest owner-labeled sandbox, which the executor did not verify.
+				Id: "rogue", Metadata: &runtimeapi.PodSandboxMetadata{Name: "web", Namespace: "team", Uid: "rogue-uid"},
+				State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: 5, RuntimeHandler: testHandler,
+				Labels: map[string]string{testOwnerLabel: "another-owner"},
 			},
 		},
 		containers: []*runtimeapi.Container{
@@ -209,6 +226,8 @@ func ownedRuntime(logDir string) *fakeRuntime {
 				State: runtimeapi.ContainerState_CONTAINER_RUNNING, CreatedAt: 2},
 			{Id: "other", PodSandboxId: "foreign", Metadata: &runtimeapi.ContainerMetadata{Name: "app"},
 				State: runtimeapi.ContainerState_CONTAINER_RUNNING, CreatedAt: 3},
+			{Id: "rogue-container", PodSandboxId: "rogue", Metadata: &runtimeapi.ContainerMetadata{Name: "app"},
+				State: runtimeapi.ContainerState_CONTAINER_RUNNING, CreatedAt: 5},
 		},
 		logPath: filepath.Join(logDir, podlogDirName(testUID), "0.log"),
 	}

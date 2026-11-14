@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/execinventory"
 	"github.com/ameukam/brie/internal/podlog"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
@@ -43,6 +44,8 @@ type harness struct {
 	address string
 	stream  *streamBackend
 	logs    *syncBuffer
+	// executions is the verified inventory; it names sandbox-1 and container-1.
+	executions *execinventory.Store
 }
 
 type stateSource struct {
@@ -87,7 +90,11 @@ func newHarness(t *testing.T, modify func(*Config, *Dependencies)) *harness {
 		Address: "127.0.0.1:0", CertFile: h.pki.certFile, KeyFile: h.pki.keyFile, ClientCAFile: h.pki.caFile,
 		NodeName: testNode, RuntimeHandler: testHandler, LogDir: h.logDir,
 	}
-	deps := Dependencies{API: newAPIClient(t, h.api), Runtime: h.runtime, Gatherer: registry,
+	h.executions = &execinventory.Store{}
+	h.executions.Set([]execinventory.Execution{{
+		PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1",
+	}})
+	deps := Dependencies{API: newAPIClient(t, h.api), Runtime: h.runtime, Executions: h.executions, Gatherer: registry,
 		Logger: slog.New(slog.NewTextHandler(io.MultiWriter(testWriter{t}, h.logs), nil))}
 	if modify != nil {
 		modify(&config, &deps)
@@ -392,7 +399,7 @@ func TestConcurrencyBound(t *testing.T) {
 	server, err := New(Config{
 		CertFile: "/c", KeyFile: "/k", ClientCAFile: "/ca", NodeName: testNode, RuntimeHandler: testHandler,
 		LogDir: "/var/log/brie", MaxConcurrent: 1,
-	}, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	}, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +423,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestNewValidation(t *testing.T) {
 	t.Parallel()
 	valid := Config{CertFile: "/c", KeyFile: "/k", ClientCAFile: "/ca", NodeName: testNode, RuntimeHandler: testHandler, LogDir: "/var/log/brie"}
-	deps := Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}}
+	deps := Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}}
 	server, err := New(valid, deps)
 	if err != nil || server.config.Address != DefaultAddress || server.config.MaxConcurrent != 64 {
 		t.Fatalf("defaults = %+v, %v", server, err)
@@ -434,6 +441,7 @@ func TestNewValidation(t *testing.T) {
 		{"log root", func(c *Config, _ *Dependencies) { c.LogDir = "/" }, "log directory"},
 		{"api", func(_ *Config, d *Dependencies) { d.API = nil }, "API and runtime"},
 		{"runtime", func(_ *Config, d *Dependencies) { d.Runtime = nil }, "API and runtime"},
+		{"executions", func(_ *Config, d *Dependencies) { d.Executions = nil }, "verified execution inventory"},
 	} {
 		config, deps := valid, deps
 		tt.change(&config, &deps)
@@ -485,7 +493,7 @@ func TestRun(t *testing.T) {
 		Address: "127.0.0.1:0", CertFile: pki.certFile, KeyFile: pki.keyFile, ClientCAFile: pki.caFile,
 		NodeName: testNode, RuntimeHandler: testHandler, LogDir: "/var/log/brie",
 	}
-	server, err := New(config, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Logger: slog.New(slog.DiscardHandler)})
+	server, err := New(config, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +507,7 @@ func TestRun(t *testing.T) {
 	}
 	bad := config
 	bad.KeyFile = filepath.Join(pki.dir, "absent")
-	server, err = New(bad, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	server, err = New(bad, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +521,7 @@ func TestRun(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 	busy := config
 	busy.Address = listener.Addr().String()
-	server, err = New(busy, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}})
+	server, err = New(busy, Dependencies{API: newAPIClient(t, &fakeAPI{}), Runtime: &fakeRuntime{}, Executions: &execinventory.Store{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,6 +645,67 @@ func TestContainerLogRefusals(t *testing.T) {
 			status, body := h.do(t, h.client(nil), http.MethodGet, tt.path, "good-token")
 			if status != tt.code || !strings.Contains(body, tt.want) || strings.Contains(body, "host secret") {
 				t.Fatalf("status %d body %q, want %d %q", status, body, tt.code, tt.want)
+			}
+		})
+	}
+}
+
+// TestServingRequiresVerifiedExecution is a regression test: a sandbox that
+// merely carries an owner label, even the newest one, is never served, and a
+// Pod name with several verified executions is refused.
+func TestServingRequiresVerifiedExecution(t *testing.T) {
+	t.Parallel()
+	paths := []string{
+		"/containerLogs/team/web/app", "/exec/team/web/app?command=id&output=1", "/attach/team/web/app?output=1", "/portForward/team/web?ports=80",
+	}
+	for _, tt := range []struct {
+		name       string
+		executions []execinventory.Execution
+		unset      bool
+		// containerOnly limits the check to container paths; port-forward
+		// needs only the verified sandbox.
+		containerOnly bool
+		code          int
+		want          string
+	}{
+		{name: "verified", code: http.StatusOK, executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"}}},
+		{name: "foreign owner only", code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{}},
+		{name: "unverified container", containerOnly: true, code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1"}}},
+		{name: "IDs of another Pod", code: http.StatusNotFound, want: "not found", executions: []execinventory.Execution{
+			{PodUID: "rogue-uid", Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"}}},
+		{name: "duplicate executions", code: http.StatusConflict, want: "several executions", executions: []execinventory.Execution{
+			{PodUID: testUID, Namespace: "team", Name: "web", SandboxID: "sandbox-1", ContainerName: "app", ContainerID: "container-1"},
+			{PodUID: "rogue-uid", Namespace: "team", Name: "web", SandboxID: "rogue", ContainerName: "app", ContainerID: "rogue-container"}}},
+		{name: "inventory unavailable", unset: true, code: http.StatusServiceUnavailable, want: "inventory is unavailable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, func(_ *Config, d *Dependencies) {
+				store := &execinventory.Store{}
+				if !tt.unset {
+					store.Set(tt.executions)
+				}
+				d.Executions = store
+			})
+			for _, path := range paths {
+				method := http.MethodGet
+				if !strings.HasPrefix(path, "/containerLogs") {
+					method = http.MethodPost
+				}
+				if tt.containerOnly && strings.HasPrefix(path, "/portForward") {
+					continue
+				}
+				status, body := h.do(t, h.client(nil), method, path, "good-token")
+				if status != tt.code || !strings.Contains(body, tt.want) || strings.Contains(body, "rogue") {
+					t.Fatalf("%s: status %d body %q, want %d %q", path, status, body, tt.code, tt.want)
+				}
+			}
+			h.runtime.mu.Lock()
+			defer h.runtime.mu.Unlock()
+			if slices.Contains(h.runtime.lastIDs, "rogue") || slices.Contains(h.runtime.lastIDs, "rogue-container") {
+				t.Fatalf("rogue container reached: %v", h.runtime.lastIDs)
 			}
 		})
 	}
