@@ -550,14 +550,26 @@ func containerWaiting(pod *corev1.Pod) *corev1.ContainerStateWaiting {
 	return pod.Status.ContainerStatuses[0].State.Waiting
 }
 
-// TestImagePullBackoff checks the jittered exponential pull backoff bounds.
+// TestImagePullBackoff checks the jittered pull backoff against the documented
+// bounds: from the doubled base up to 50% more, never above five minutes.
 func TestImagePullBackoff(t *testing.T) {
 	t.Parallel()
-	for failures := range 10 {
-		base := min(pullBackoffBase<<min(failures, 5), pullBackoffLimit)
-		for range 20 {
-			if delay := pullBackoff(failures); delay < base || delay > base+base/2 {
-				t.Fatalf("failure %d: delay %s outside [%s, %s]", failures, delay, base, base+base/2)
+	for _, test := range []struct {
+		failures int
+		low      time.Duration
+		high     time.Duration
+	}{
+		{failures: 0, low: 10 * time.Second, high: 15 * time.Second},
+		{failures: 1, low: 20 * time.Second, high: 30 * time.Second},
+		{failures: 3, low: 80 * time.Second, high: 120 * time.Second},
+		{failures: 4, low: 160 * time.Second, high: 240 * time.Second},
+		// Regression: jitter once pushed the capped delay to 7.5 minutes.
+		{failures: 5, low: 5 * time.Minute, high: 5 * time.Minute},
+		{failures: 9, low: 5 * time.Minute, high: 5 * time.Minute},
+	} {
+		for range 50 {
+			if delay := pullBackoff(test.failures); delay < test.low || delay > test.high || delay > pullBackoffLimit {
+				t.Fatalf("failure %d: delay %s outside [%s, %s]", test.failures, delay, test.low, test.high)
 			}
 		}
 	}

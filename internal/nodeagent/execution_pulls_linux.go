@@ -26,7 +26,7 @@ import (
 // imagePullDeadline per call. The image size is unknown before the pull, so
 // the deadline is one implementation constant, not a value sized to the image.
 // A failed pull backs off per image reference: the delay doubles from the base
-// up to the limit, with up to 50% added jitter.
+// up to the limit, with up to 50% added jitter, and never exceeds the limit.
 const (
 	pullWorkers       = 2
 	imagePullDeadline = 10 * time.Minute
@@ -85,7 +85,7 @@ func newImagePuller(client *cri.Client) *imagePuller {
 // failures of the same image reference.
 func pullBackoff(failures int) time.Duration {
 	delay := min(pullBackoffBase<<min(failures, 5), pullBackoffLimit)
-	return delay + rand.N(delay/2+1)
+	return min(pullBackoffLimit, delay+rand.N(delay/2+1))
 }
 
 // unchanged reports whether uid already reported the current state of its
