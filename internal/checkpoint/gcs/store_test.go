@@ -198,6 +198,15 @@ func TestPublishManifestRequiresVerifiedArtifacts(t *testing.T) {
 		{name: "checksum mismatch", mutate: func(_ *fakeGCS, m *checkpoint.Manifest) {
 			m.Artifacts.Memory.CRC32C = "AAAAAA=="
 		}, want: ErrIntegrity},
+		{name: "sha256 mismatch", mutate: func(_ *fakeGCS, m *checkpoint.Manifest) {
+			m.Artifacts.Memory.SHA256 = m.Artifacts.VMState.SHA256
+		}, want: ErrIntegrity},
+		{name: "downloaded bytes differ", mutate: func(f *fakeGCS, _ *checkpoint.Manifest) {
+			f.mangleMedia = 1
+		}, want: ErrIntegrity},
+		{name: "download not found", mutate: func(f *fakeGCS, _ *checkpoint.Manifest) {
+			f.mediaStatuses = []int{404}
+		}, want: ErrObjectNotFound},
 		{name: "invalid manifest", mutate: func(_ *fakeGCS, m *checkpoint.Manifest) { m.OperationID = "" }, text: "invalid manifest"},
 		{name: "name collision", mutate: func(_ *fakeGCS, m *checkpoint.Manifest) {
 			m.Artifacts.Memory.Object.Name = "op-1/manifest.json"
@@ -279,6 +288,16 @@ func TestReadManifestRejectsIncompleteCheckpoints(t *testing.T) {
 			ref.Generation = 0
 			return ref
 		}, text: "generation must be positive"},
+		{name: "artifact sha256 mismatch", mutate: func(f *fakeGCS, m checkpoint.Manifest, ref checkpoint.ObjectRef) checkpoint.ObjectRef {
+			// A manifest whose only defect is another valid digest.
+			m.Artifacts.Disks[0].Artifact.SHA256 = m.Artifacts.Memory.SHA256
+			encoded, _ := checkpoint.EncodeManifest(m)
+			object, _ := f.object(testBucket, ref.Name)
+			object.data = encoded
+			object.crc32c, _ = checksumsOf(encoded)
+			f.setObject(testBucket, ref.Name, object)
+			return ref
+		}, want: ErrIntegrity},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := newFakeGCS(t)
@@ -291,6 +310,55 @@ func TestReadManifestRejectsIncompleteCheckpoints(t *testing.T) {
 			_, err = store.ReadManifest(t.Context(), tt.mutate(fake, manifest, ref))
 			if tt.want != nil && !errors.Is(err, tt.want) || tt.text != "" && (err == nil || !strings.Contains(err.Error(), tt.text)) {
 				t.Fatalf("ReadManifest error = %v, want %v %q", err, tt.want, tt.text)
+			}
+		})
+	}
+}
+
+func TestVerifyArtifactDownload(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		inject func(*fakeGCS)
+		mutate func(*checkpoint.Artifact)
+		want   error
+		text   string
+	}{
+		{name: "verifies", inject: func(*fakeGCS) {}},
+		{name: "transient download error retried", inject: func(f *fakeGCS) { f.mediaStatuses = []int{503, 500} }},
+		{name: "persistent download error", inject: func(f *fakeGCS) { f.mediaStatuses = []int{503, 503, 503, 503} }, text: "giving up after 4 attempts"},
+		{name: "download denied", inject: func(f *fakeGCS) { f.mediaStatuses = []int{403} }, want: ErrAccessDenied},
+		{name: "corrupted download", inject: func(f *fakeGCS) { f.mangleMedia = 1 }, want: ErrIntegrity},
+		{name: "sha256 only mismatch", inject: func(*fakeGCS) {}, mutate: func(a *checkpoint.Artifact) {
+			a.SHA256 = strings.Repeat("0", 64)
+		}, want: ErrIntegrity},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGCS(t)
+			store := fake.store(t, Config{})
+			content := []byte("checkpoint bytes")
+			artifact, err := store.UploadArtifact(t.Context(), testBucket, "op-1/memory", bytes.NewReader(content), int64(len(content)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.inject(fake)
+			if tt.mutate != nil {
+				tt.mutate(&artifact)
+			}
+			err = store.VerifyArtifact(t.Context(), artifact)
+			if err != nil && strings.Contains(err.Error(), fakeToken) {
+				t.Fatalf("error leaks the token: %v", err)
+			}
+			switch {
+			case tt.want != nil:
+				if !errors.Is(err, tt.want) {
+					t.Fatalf("VerifyArtifact error = %v, want %v", err, tt.want)
+				}
+			case tt.text != "":
+				if err == nil || !strings.Contains(err.Error(), tt.text) {
+					t.Fatalf("VerifyArtifact error = %v, want %q", err, tt.text)
+				}
+			case err != nil:
+				t.Fatal(err)
 			}
 		})
 	}
