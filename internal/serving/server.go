@@ -160,7 +160,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	user, err := authenticate(ctx, s.api, s.config.TokenAudiences, r)
 	if err != nil {
 		cancel()
-		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "serving request unauthenticated", slog.String("error", err.Error()))
+		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "serving request unauthenticated", failureAttrs(err)...)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -168,7 +168,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cancel()
 	if err != nil {
 		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "serving request forbidden",
-			slog.String("user", user.Name), slog.String("error", err.Error()))
+			append([]slog.Attr{slog.String("user", user.Name)}, failureAttrs(err)...)...)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
