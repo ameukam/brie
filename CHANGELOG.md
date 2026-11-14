@@ -53,7 +53,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
   pending stage age, CRI latency and errors by method, image pulls, journal
   bounds, Lease renewal failures, probes, log rotation, and Events, with
   bounded label values and no tenant data in labels. CRI clients accept a call
-  observer. A gauge that was never set is not exported.
+  observer. A gauge that was never set is not exported, so unreported state
+  is never exported as zero.
 - A kubelet-compatible HTTPS serving package (`internal/serving`) with TLS
   1.2+, client-certificate and TokenReview authentication, SubjectAccessReview
   authorization using kubelet's node subresource mapping, `/healthz`,
