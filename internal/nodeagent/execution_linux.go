@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"github.com/ameukam/brie/internal/probe"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,6 +60,8 @@ type executor struct {
 	network  string
 	logger   *log.Logger
 	hooks    ExecutionHooks
+	// probes, when set, runs readiness and liveness probes (ExecutionConfig.Probes).
+	probes *probe.Manager
 }
 
 // Execute explicitly enables scheduling and CRI execution for the restricted
@@ -121,6 +124,18 @@ func ExecuteObserved(ctx context.Context, node Config, config ExecutionConfig, k
 	agent := &executor{
 		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
 		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(stderr, "brie-node: ", 0), hooks: hooks,
+	}
+	journal.saved = agent.journalSaved
+	if config.Probes {
+		// Exec probes take up to 60 seconds; their client allows more.
+		probes, err := cri.NewConcurrent(node.RuntimeSocket, 2*time.Minute, probeWorkers)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, probes.Close()) }()
+		hooks.observeCRI(probes)
+		agent.probes = newProbeManager(probes, config.MaxPods, hooks)
+		defer agent.probes.Close()
 	}
 	if threshold, _ := imageGCThresholdBytes(config.ImageGCThreshold); threshold > 0 {
 		collection, err := cri.New(node.RuntimeSocket, 2*time.Minute)
