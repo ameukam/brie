@@ -222,12 +222,41 @@ func TestDigestManifest(t *testing.T) {
 		{
 			name:   "malformed line",
 			modify: func(_ string, manifest *string) { *manifest += "not a digest line\n" },
-			stderr: "do not match digest manifest",
+			stderr: "malformed line",
 		},
 		{
 			name:   "empty manifest",
 			modify: func(_ string, manifest *string) { *manifest = "" },
 			stderr: "missing or empty",
+		},
+		{
+			name:   "truncated to one valid entry",
+			modify: func(_ string, manifest *string) { *manifest = strings.SplitAfter(*manifest, "\n")[0] },
+			stderr: "does not cover",
+		},
+		{
+			name: "missing kata-runtime entry",
+			modify: func(_ string, manifest *string) {
+				lines := strings.SplitAfter(*manifest, "\n")
+				*manifest = strings.Join(lines[:3], "")
+			},
+			stderr: "/kata-runtime",
+		},
+		{
+			name: "duplicate entry replaces a required one",
+			modify: func(_ string, manifest *string) {
+				lines := strings.SplitAfter(*manifest, "\n")
+				*manifest = strings.Join([]string{lines[0], lines[1], lines[2], lines[0]}, "")
+			},
+			stderr: "more than once",
+		},
+		{
+			name: "unexpected extra binary",
+			modify: func(dir string, manifest *string) {
+				sum := sha256.Sum256([]byte("extra"))
+				*manifest += hex.EncodeToString(sum[:]) + "  " + writeFile(t, dir, "extra", "extra") + "\n"
+			},
+			stderr: "unexpected binary",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -247,7 +276,13 @@ func TestDigestManifest(t *testing.T) {
 				tt.modify(bin, &manifest)
 			}
 			path := writeFile(t, l.dir, "hw-digests.sha256", manifest)
-			r := l.run("install-host.sh", "--verify-manifest", path)
+			lib, err := filepath.Abs("checksums.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The required list names /opt/kata/bin; point it at the fixture binaries.
+			r := l.runCommand("bash", "-c", `source "$1"; HW_MANIFEST_BINARIES=("$2"/firecracker "$2"/jailer "$2"/containerd-shim-kata-v2 "$2"/kata-runtime); hw_verify_manifest "$3"`,
+				"verify", lib, bin, path)
 			if tt.stderr == "" && r.code != 0 {
 				t.Fatalf("exit=%d stderr=%q; want success", r.code, r.stderr)
 			}
