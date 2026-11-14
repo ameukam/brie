@@ -805,7 +805,7 @@ func TestExecutionWorkersServeEveryPod(t *testing.T) {
 			e, service := newExecutor(t, pods...)
 			e.config.CPU, e.config.Memory, e.config.MaxPods = "16", "4Gi", count
 			execer := &probeExecer{}
-			e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks)
+			e.probes = newProbeManager(execer, e.config.MaxPods, e.hooks, nil)
 			t.Cleanup(e.probes.Close)
 			phases := func() map[string]*corev1.Pod {
 				t.Helper()

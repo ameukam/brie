@@ -264,6 +264,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - Retry bounded Node/Lease resource-version conflicts during registration
   heartbeats, revalidating Node identity and scheduling guards on each attempt.
 - Reduced the README to an abstract ten-word sentence.
+- With `--enable-probes`, a probe status change wakes the next reconciliation
+  pass, so readiness is published and a liveness failure enforced without
+  waiting for the poll interval.
 
 ### Fixed
 

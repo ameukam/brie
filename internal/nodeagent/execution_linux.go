@@ -62,6 +62,8 @@ type executor struct {
 	hooks    ExecutionHooks
 	// probes, when set, runs readiness and liveness probes (ExecutionConfig.Probes).
 	probes *probe.Manager
+	// wake starts the next reconciliation pass before the poll interval.
+	wake chan struct{}
 }
 
 // Execute explicitly enables scheduling and CRI execution for the restricted
@@ -124,6 +126,7 @@ func ExecuteObserved(ctx context.Context, node Config, config ExecutionConfig, k
 	agent := &executor{
 		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
 		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(stderr, "brie-node: ", 0), hooks: hooks,
+		wake: make(chan struct{}, 1),
 	}
 	journal.saved = agent.journalSaved
 	if config.Probes {
@@ -134,7 +137,7 @@ func ExecuteObserved(ctx context.Context, node Config, config ExecutionConfig, k
 		}
 		defer func() { retErr = errors.Join(retErr, probes.Close()) }()
 		hooks.observeCRI(probes)
-		agent.probes = newProbeManager(probes, config.MaxPods, hooks)
+		agent.probes = newProbeManager(probes, config.MaxPods, hooks, agent.wake)
 		defer agent.probes.Close()
 	}
 	if threshold, _ := imageGCThresholdBytes(config.ImageGCThreshold); threshold > 0 {
@@ -240,9 +243,10 @@ func (e *executor) run(ctx context.Context) error {
 			}
 		}
 	}
-	// A change to the assigned-Pod view wakes the next pass. Finished Pod
-	// operations do not, because status operations finish on every pass.
-	wake := make(chan struct{}, 1)
+	// A change to the assigned-Pod view, a finished pull, or a probe status
+	// change wakes the next pass. Finished Pod operations do not, because
+	// status operations finish on every pass.
+	wake := e.wake
 	e.watch = newAssignedPodWatch(wake)
 	e.pulls.wake = wake
 	go func() {

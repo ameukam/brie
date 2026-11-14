@@ -165,9 +165,20 @@ func (e *executor) enforceLiveness(ctx context.Context, runtime *cri.Client, pod
 // probeWorkers bounds probes running at once and the call slots of their CRI client.
 const probeWorkers = 16
 
-// newProbeManager creates the probe manager for at most maxPods Pods.
-func newProbeManager(execer probe.Execer, maxPods int, hooks ExecutionHooks) *probe.Manager {
+// newProbeManager creates the probe manager for at most maxPods Pods. A probe
+// status change signals wake, when set, without blocking, so the next pass
+// publishes readiness and enforces a liveness failure without waiting for the
+// poll interval.
+func newProbeManager(execer probe.Execer, maxPods int, hooks ExecutionHooks, wake chan<- struct{}) *probe.Manager {
 	options := probe.Options{MaxPods: maxPods, MaxConcurrent: probeWorkers}
+	if wake != nil {
+		options.Notify = func(string) {
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
+	}
 	if hooks.ProbeResult != nil {
 		options.Observe = func(kind probe.Kind, handler string, result probe.Result) {
 			hooks.ProbeResult(string(kind), handler, string(result))
