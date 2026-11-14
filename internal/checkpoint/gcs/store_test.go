@@ -28,7 +28,8 @@ func testManifest(vmState, memory, disk checkpoint.Artifact) checkpoint.Manifest
 			Disks: []checkpoint.DiskArtifact{{Device: "rootfs", Artifact: disk}}},
 		Compatibility: checkpoint.Compatibility{
 			HostKernel: "6.8.0", CPUModel: "Google Axion", GICVersion: "v3", FirecrackerVersion: "1.17.0",
-			SnapshotFormatVersion: "8.0.0", KataVersion: "4.3.1", GuestKernel: "6.18.56", CPUTemplate: "none",
+			SnapshotFormatVersion: "8.0.0", KataVersion: "4.3.1", GuestAgentVersion: "4.3.1",
+			SecurityProfile: "restricted-pod-v1", GuestKernel: "6.18.56", CPUTemplate: "none",
 			ImageDigests: []string{"sha256:" + strings.Repeat("a", 64)}, VCPUCount: 1, MemoryMiB: 512,
 		},
 		DeviceLayout:          []checkpoint.Device{{Name: "rootfs", Kind: checkpoint.DeviceBlock, LogicalVolume: "container-rootfs"}},
