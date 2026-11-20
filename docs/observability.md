@@ -167,3 +167,22 @@ about the application. `Suspend(uid, state)` stops a Pod's probes for a
 recorded extension state: readiness becomes false, liveness evidence is kept,
 and after `Resume` readiness must succeed again. Probe output is never logged
 or stored.
+
+## Container log rotation
+
+`internal/logrotation` checks every running container of an owned sandbox
+(label `brie.dev/execution-owner`, configured runtime handler) every ten
+seconds. When the runtime-reported log file, which must be a regular file
+directly inside the Pod's log directory, exceeds the maximum size (1 MiB to
+10 GiB), it removes the oldest rotated files so that at most `max files`
+remain including the current one (2 to 100), renames the log to
+`<name>.<UTC YYYYMMDD-HHMMSS>`, and calls CRI `ReopenContainerLog`. If the
+runtime cannot reopen the log, the rename is undone so the runtime keeps
+writing to the same name. Rotated files are not compressed. Exited containers
+are not rotated.
+
+Directory cleanup removes `<pod-log-dir>/<sha256(UID)>` only for UIDs the
+caller reports as journal-finished, only when no sandbox for that UID remains
+in the CRI inventory, and never for an entry that is not a real directory.
+Directories of unknown Pods are never removed. Without a finished-Pod source,
+cleanup is disabled; the executor does not provide one yet.
