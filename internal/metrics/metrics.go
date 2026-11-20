@@ -74,32 +74,19 @@ type Metrics struct {
 	registry *prometheus.Registry
 	now      func() time.Time
 
-	admissions        *prometheus.CounterVec
-	reservedCPU       prometheus.Gauge
-	reservedMemory    prometheus.Gauge
-	reservedPods      prometheus.Gauge
-	budgetCPU         prometheus.Gauge
-	budgetMemory      prometheus.Gauge
-	budgetPods        prometheus.Gauge
-	barrier           *prometheus.GaugeVec
-	criDuration       *prometheus.HistogramVec
-	criErrors         *prometheus.CounterVec
-	pullDuration      prometheus.Histogram
-	pullFailures      prometheus.Counter
-	journalRecords    prometheus.Gauge
-	journalBytes      prometheus.Gauge
-	journalRecordsMax prometheus.Gauge
-	journalBytesMax   prometheus.Gauge
-	leaseFailures     prometheus.Counter
-	probeResults      *prometheus.CounterVec
-	logRotations      *prometheus.CounterVec
-	events            *prometheus.CounterVec
-
-	// The reservation, budget, and journal gauges are registered by their
-	// first Set, so a value that was never observed is absent, not zero.
-	reservationsOnce sync.Once
-	budgetOnce       sync.Once
-	journalOnce      sync.Once
+	admissions    *prometheus.CounterVec
+	reservations  *observedGauges
+	budget        *observedGauges
+	barrier       *prometheus.GaugeVec
+	criDuration   *prometheus.HistogramVec
+	criErrors     *prometheus.CounterVec
+	pullDuration  prometheus.Histogram
+	pullFailures  prometheus.Counter
+	journal       *observedGauges
+	leaseFailures prometheus.Counter
+	probeResults  *prometheus.CounterVec
+	logRotations  *prometheus.CounterVec
+	events        *prometheus.CounterVec
 
 	mu            sync.Mutex
 	lastPass      time.Time
@@ -122,12 +109,16 @@ func New(now func() time.Time) *Metrics {
 	m.admissions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Name: "admission_decisions_total", Help: "Pod admission decisions by published reason.",
 	}, []string{"reason"})
-	m.reservedCPU = gauge("reserved_cpu_cores", "CPU reserved by unfinished executions, including overhead.")
-	m.reservedMemory = gauge("reserved_memory_bytes", "Memory reserved by unfinished executions, including overhead.")
-	m.reservedPods = gauge("reserved_executions", "Unfinished executions holding a reservation.")
-	m.budgetCPU = gauge("budget_cpu_cores", "Configured schedulable CPU budget.")
-	m.budgetMemory = gauge("budget_memory_bytes", "Configured schedulable memory budget.")
-	m.budgetPods = gauge("budget_executions", "Configured maximum admitted Pods.")
+	m.reservations = &observedGauges{registry: m.registry, gauges: []prometheus.Gauge{
+		gauge("reserved_cpu_cores", "CPU reserved by unfinished executions, including overhead. No sample until observed."),
+		gauge("reserved_memory_bytes", "Memory reserved by unfinished executions, including overhead. No sample until observed."),
+		gauge("reserved_executions", "Unfinished executions holding a reservation. No sample until observed."),
+	}}
+	m.budget = &observedGauges{registry: m.registry, gauges: []prometheus.Gauge{
+		gauge("budget_cpu_cores", "Configured schedulable CPU budget. No sample until set."),
+		gauge("budget_memory_bytes", "Configured schedulable memory budget. No sample until set."),
+		gauge("budget_executions", "Configured maximum admitted Pods. No sample until set."),
+	}}
 	m.barrier = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace, Name: "admission_barrier",
 		Help: "1 for the cause of a raised admission barrier, 0 otherwise. No samples until observed.",
@@ -144,10 +135,12 @@ func New(now func() time.Time) *Metrics {
 		Buckets: []float64{.1, .5, 1, 2.5, 5, 10, 30, 60, 120},
 	})
 	m.pullFailures = counter("image_pull_failures_total", "Failed CRI PullImage calls.")
-	m.journalRecords = gauge("journal_records", "Execution journal records.")
-	m.journalBytes = gauge("journal_bytes", "Execution journal encoded size.")
-	m.journalRecordsMax = gauge("journal_records_limit", "Execution journal record bound.")
-	m.journalBytesMax = gauge("journal_bytes_limit", "Execution journal size bound.")
+	m.journal = &observedGauges{registry: m.registry, gauges: []prometheus.Gauge{
+		gauge("journal_records", "Execution journal records. No sample until observed."),
+		gauge("journal_bytes", "Execution journal encoded size. No sample until observed."),
+		gauge("journal_records_limit", "Execution journal record bound. No sample until the journal is observed."),
+		gauge("journal_bytes_limit", "Execution journal size bound. No sample until the journal is observed."),
+	}}
 	m.leaseFailures = counter("lease_renewal_failures_total", "Failed node Lease renewals.")
 	m.probeResults = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Name: "probe_results_total", Help: "Probe results by probe kind, handler, and result.",
@@ -180,20 +173,36 @@ func (m *Metrics) AdmissionDecision(reason string) {
 	m.admissions.WithLabelValues(ReasonOther).Inc()
 }
 
-// SetReservations records reserved CPU millicores, memory bytes, and executions.
-func (m *Metrics) SetReservations(cpuMillicores, memoryBytes int64, executions int) {
-	m.reservationsOnce.Do(func() { m.registry.MustRegister(m.reservedCPU, m.reservedMemory, m.reservedPods) })
-	m.reservedCPU.Set(float64(cpuMillicores) / 1000)
-	m.reservedMemory.Set(float64(memoryBytes))
-	m.reservedPods.Set(float64(executions))
+// observedGauges are registered on their first observation, so a quantity
+// nothing has reported has no sample rather than a false zero (DESIGN 12.1).
+type observedGauges struct {
+	once     sync.Once
+	registry *prometheus.Registry
+	gauges   []prometheus.Gauge
 }
 
-// SetBudget records the configured envelope.
+// set records one value per gauge, in order, then exposes the gauges.
+func (o *observedGauges) set(values ...float64) {
+	for i, value := range values {
+		o.gauges[i].Set(value)
+	}
+	o.once.Do(func() {
+		for _, gauge := range o.gauges {
+			o.registry.MustRegister(gauge)
+		}
+	})
+}
+
+// SetReservations records reserved CPU millicores, memory bytes, and
+// executions. The reservation gauges have no samples until the first call.
+func (m *Metrics) SetReservations(cpuMillicores, memoryBytes int64, executions int) {
+	m.reservations.set(float64(cpuMillicores)/1000, float64(memoryBytes), float64(executions))
+}
+
+// SetBudget records the configured envelope. The budget gauges have no
+// samples until the first call.
 func (m *Metrics) SetBudget(cpuMillicores, memoryBytes int64, maxPods int) {
-	m.budgetOnce.Do(func() { m.registry.MustRegister(m.budgetCPU, m.budgetMemory, m.budgetPods) })
-	m.budgetCPU.Set(float64(cpuMillicores) / 1000)
-	m.budgetMemory.Set(float64(memoryBytes))
-	m.budgetPods.Set(float64(maxPods))
+	m.budget.set(float64(cpuMillicores)/1000, float64(memoryBytes), float64(maxPods))
 }
 
 // SetBarrier records the current barrier cause; BarrierNone lowers it.
@@ -279,15 +288,10 @@ const (
 	JournalBytesLimit   = 4 * 1024 * 1024
 )
 
-// SetJournal records the journal's size against its bounds.
+// SetJournal records the journal's size against its bounds. The journal
+// gauges have no samples until the first call.
 func (m *Metrics) SetJournal(records, bytes int) {
-	m.journalOnce.Do(func() {
-		m.registry.MustRegister(m.journalRecords, m.journalBytes, m.journalRecordsMax, m.journalBytesMax)
-	})
-	m.journalRecords.Set(float64(records))
-	m.journalBytes.Set(float64(bytes))
-	m.journalRecordsMax.Set(JournalRecordsLimit)
-	m.journalBytesMax.Set(JournalBytesLimit)
+	m.journal.set(float64(records), float64(bytes), JournalRecordsLimit, JournalBytesLimit)
 }
 
 // LeaseRenewalFailed counts one failed Lease renewal.

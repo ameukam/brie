@@ -87,6 +87,45 @@ func TestAdmissionAndBudget(t *testing.T) {
 	}
 }
 
+// TestUnobservedGaugesHaveNoSamples is a regression test: reservations,
+// budget, and journal state nothing has reported are absent, not zero.
+func TestUnobservedGaugesHaveNoSamples(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		observe func(*Metrics)
+		absent  []string
+		present map[string]string
+	}{
+		{name: "unwired", observe: func(*Metrics) {},
+			absent: []string{"brie_node_reserved_", "brie_node_budget_", "brie_node_journal_"}},
+		{name: "budget only", observe: func(m *Metrics) { m.SetBudget(4000, 8<<30, 10) },
+			absent:  []string{"brie_node_reserved_", "brie_node_journal_"},
+			present: map[string]string{"brie_node_budget_executions": "10"}},
+		{name: "populated", observe: func(m *Metrics) {
+			m.SetReservations(0, 0, 0)
+			m.SetReservations(2500, 1<<20, 3)
+			m.SetJournal(0, 0)
+		}, absent: []string{"brie_node_budget_"}, present: map[string]string{
+			"brie_node_reserved_cpu_cores": "2.5", "brie_node_reserved_memory_bytes": "1.048576e+06",
+			"brie_node_reserved_executions": "3", "brie_node_journal_records": "0", "brie_node_journal_records_limit": "10000",
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := New(nil)
+			tt.observe(m)
+			got := samples(t, m)
+			for _, prefix := range tt.absent {
+				if n := count(got, prefix); n != 0 {
+					t.Errorf("%d unobserved %s samples exported", n, prefix)
+				}
+			}
+			expect(t, got, tt.present)
+		})
+	}
+}
+
 func TestBarrier(t *testing.T) {
 	t.Parallel()
 	m := New(nil)
