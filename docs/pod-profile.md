@@ -185,12 +185,14 @@ only from matching observations, including across restart. An uncertain absent
 result blocks admission rather than triggering another create or start.
 A sandbox or container create is proven to have created nothing only when the
 runtime answered with a definite rejection (`InvalidArgument`, `NotFound`,
-`FailedPrecondition`, `PermissionDenied`, or `OutOfRange`, codes grpc-go never
-generates itself), the code is journaled, and a later complete sandbox and
-container inventory holds no object claiming the Pod. The Pod then fails with
+`FailedPrecondition`, or `OutOfRange`, codes grpc-go never generates itself),
+the code is journaled, and a later complete sandbox and container inventory
+holds no object claiming the Pod. The Pod then fails with
 `SandboxCreateRejected` or `ContainerCreateRejected` and its reservation is
 released through normal cleanup; the create is never retried. Unavailable,
-deadline, cancellation, `Unknown`, and other codes remain unresolved.
+deadline, cancellation, `Unknown`, and other codes remain unresolved, including
+`PermissionDenied`, which grpc-go also reports for an HTTP/2
+`INADEQUATE_SECURITY` stream reset or an HTTP 403 reply.
 
 Faults confined to one Pod's inputs do not change Node readiness or other
 admissions. A spec change to an admitted Pod sets the Pod condition
