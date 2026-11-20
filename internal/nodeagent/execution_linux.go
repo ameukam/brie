@@ -43,6 +43,10 @@ type executor struct {
 	// pulls runs image pulls outside Pod reconciliation (section 10.4 of
 	// DESIGN.md).
 	pulls *imagePuller
+	// images, when set, collects unreferenced images; imageGate orders
+	// image presence checks (read) against collection (write).
+	images    *imageCollector
+	imageGate sync.RWMutex
 	// watch, when set, serves the assigned-Pod view of each pass; run sets
 	// it. Without it, each pass lists the assigned Pods.
 	watch    *assignedPodWatch
@@ -109,6 +113,14 @@ func Execute(ctx context.Context, node Config, config ExecutionConfig, kubeconfi
 	agent := &executor{
 		node: node, config: config, api: api, journal: journal, runtime: workloads, create: creation, health: health,
 		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(stderr, "brie-node: ", 0),
+	}
+	if threshold, _ := imageGCThresholdBytes(config.ImageGCThreshold); threshold > 0 {
+		collection, err := cri.New(node.RuntimeSocket, 2*time.Minute)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, collection.Close()) }()
+		agent.images = &imageCollector{client: collection, threshold: threshold, unusedSince: make(map[string]time.Time)}
 	}
 	if err := agent.initialize(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -183,7 +195,11 @@ func (e *executor) initialize(ctx context.Context) error {
 func (e *executor) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 4)
+	loops := 4
+	if e.images != nil {
+		loops++
+	}
+	done := make(chan struct{}, loops)
 	loop := func(interval time.Duration, wake <-chan struct{}, step func(context.Context) error) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -214,9 +230,12 @@ func (e *executor) run(ctx context.Context) error {
 	})
 	go loop(5*time.Second, nil, e.updateHealth)
 	go loop(inventoryInterval, wake, func(ctx context.Context) error { return e.reconcilePass(ctx, false) })
+	if e.images != nil {
+		go loop(imageGCInterval, nil, e.collectImages)
+	}
 	<-ctx.Done()
 	cancel()
-	for range 4 {
+	for range loops {
 		<-done
 	}
 	e.workers.running.Wait()

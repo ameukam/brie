@@ -477,7 +477,7 @@ func (e *executor) admitPod(ctx context.Context, pod *corev1.Pod) (*executionRec
 	overheadCPU, overheadMemory, _ := executionResources(e.overhead)
 	cpu, memory, fits := addBudget(cpu, memory, overheadCPU, overheadMemory)
 	record := &executionRecord{UID: string(pod.UID), Namespace: pod.Namespace, Name: pod.Name,
-		Hash: hash, Stage: "reserved", CPU: cpu, Memory: memory}
+		Hash: hash, Stage: "reserved", CPU: cpu, Memory: memory, Image: pod.Spec.Containers[0].Image}
 	e.mu.Lock()
 	fits = fits && e.budgetFits(cpu, memory)
 	if fits {
@@ -616,7 +616,9 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 		if _, err := e.currentPod(ctx, pod, false); err != nil {
 			return err
 		}
+		e.imageGate.RLock()
 		ready, err := e.imageReady(ctx, runtime, pod, image, sandbox)
+		e.imageGate.RUnlock()
 		if err != nil || !ready {
 			return err
 		}

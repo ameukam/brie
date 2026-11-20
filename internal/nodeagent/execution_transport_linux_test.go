@@ -134,7 +134,10 @@ func TestExecuteAPITransportAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- Execute(ctx, e.node, e.config, kubeconfig, io.Discard) }()
+	// Image collection runs as a fifth loop and stops with the others.
+	config := e.config
+	config.ImageGCThreshold = "1Gi"
+	go func() { done <- Execute(ctx, e.node, config, kubeconfig, io.Discard) }()
 	seen := make(map[string]bool)
 	for len(seen) < 4 {
 		select {
