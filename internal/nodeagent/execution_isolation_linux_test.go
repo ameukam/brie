@@ -5,6 +5,7 @@ package nodeagent
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -279,6 +280,62 @@ func TestExecutionCreationEvidenceJournalFailure(t *testing.T) {
 			}
 			if calls := countCalls(service, "CreateContainer"); calls != 1 {
 				t.Fatalf("CreateContainer issued %d times", calls)
+			}
+		})
+	}
+}
+
+// TestExecutionPodFaultPublicationFailure is a regression test: a Pod fault
+// whose status publication failed is reported as an error, keeps its worker
+// fault, and is not cleared as a reported Pod fault.
+func TestExecutionPodFaultPublicationFailure(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		err   error
+		check func(error) bool
+	}{
+		{"service-unavailable", apierrors.NewServiceUnavailable("apiserver unavailable"), apierrors.IsServiceUnavailable},
+		{"forbidden", apierrors.NewForbidden(corev1.Resource("pods"), "first", errors.New("denied")), apierrors.IsForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, _ := newExecutor(t, executionPod("first"))
+			reconcilePasses(t, e, 6)
+			var failStatus atomic.Bool
+			e.api.(*fake.Clientset).PrependReactor("update", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() == "status" && failStatus.Load() {
+					return true, nil, test.err
+				}
+				return false, nil, nil
+			})
+			pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
+			pod.Spec.Containers[0].Image = "registry.example/other@sha256:" + strings.Repeat("1", 64)
+			if _, err := e.api.CoreV1().Pods("default").Update(t.Context(), pod, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			failStatus.Store(true)
+			for range 2 {
+				err := e.reconcile(t.Context())
+				if err == nil || !test.check(err) {
+					t.Fatalf("failed fault publication = %v, want the API error", err)
+				}
+				var fault *podFault
+				if errors.As(err, &fault) {
+					t.Fatalf("failed publication still classified as a Pod fault: %v", err)
+				}
+				if !e.recovery.Load() || !e.workers.outstanding(func(string) bool { return true }) {
+					t.Fatal("failed fault publication cleared as success")
+				}
+			}
+			failStatus.Store(false)
+			reconcilePasses(t, e, 2)
+			pod, _ = e.api.CoreV1().Pods("default").Get(t.Context(), "first", metav1.GetOptions{})
+			if condition := blockedCondition(pod); condition == nil || condition.Reason != "ExecutionConfigChanged" {
+				t.Fatalf("fault not published after the API recovered: %+v", pod.Status)
+			}
+			if e.recovery.Load() {
+				t.Fatal("published Pod fault kept the node barrier")
 			}
 		})
 	}
