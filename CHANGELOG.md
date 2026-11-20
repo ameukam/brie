@@ -30,8 +30,11 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
   `--container-log-max-size` with `--container-log-max-files`. Serving, Events,
   and rotation require `--enable-workloads`. The executor now exposes
-  observation hooks for CRI calls, Lease renewals, reconciliation passes, and
-  barrier inputs; see [docs/observability.md](docs/observability.md). Tested
+  observation hooks for CRI calls, Lease renewals, reconciliation passes,
+  barrier inputs, and its verified execution inventory. Serving and log
+  rotation act only on runtime objects in that inventory, never on a sandbox
+  merely because it carries an owner label, and refuse a Pod name with several
+  verified executions; see [docs/observability.md](docs/observability.md). Tested
   only against fakes.
 - Size-based container log rotation (`internal/logrotation`) through CRI
   `ReopenContainerLog`, with bounded max size and max files, restoring the log
