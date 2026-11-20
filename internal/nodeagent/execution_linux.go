@@ -37,9 +37,12 @@ type executor struct {
 	create  *cri.Client
 	health  *cri.Client
 	// mu guards journal records and saves once reconciliation workers run.
-	mu       sync.Mutex
-	journal  *executionJournal
-	workers  *podWorkers
+	mu      sync.Mutex
+	journal *executionJournal
+	workers *podWorkers
+	// watch, when set, serves the assigned-Pod view of each pass; run sets
+	// it. Without it, each pass lists the assigned Pods.
+	watch    *assignedPodWatch
 	nodeUID  types.UID
 	overhead corev1.ResourceList
 	healthy  atomic.Bool
@@ -172,8 +175,8 @@ func (e *executor) initialize(ctx context.Context) error {
 func (e *executor) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan struct{}, 3)
-	loop := func(interval time.Duration, step func(context.Context) error) {
+	done := make(chan struct{}, 4)
+	loop := func(interval time.Duration, wake <-chan struct{}, step func(context.Context) error) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -185,17 +188,26 @@ func (e *executor) run(ctx context.Context) error {
 				done <- struct{}{}
 				return
 			case <-ticker.C:
+			case <-wake:
 			}
 		}
 	}
-	go loop(heartbeatInterval, func(ctx context.Context) error {
+	// A change to the assigned-Pod view wakes the next pass. Finished Pod
+	// operations do not, because status operations finish on every pass.
+	wake := make(chan struct{}, 1)
+	e.watch = newAssignedPodWatch(wake)
+	go func() {
+		e.watchAssigned(ctx, e.watch)
+		done <- struct{}{}
+	}()
+	go loop(heartbeatInterval, nil, func(ctx context.Context) error {
 		return renewLease(ctx, e.api.CoordinationV1().Leases(leaseNamespace), e.node.NodeName, e.nodeUID)
 	})
-	go loop(5*time.Second, e.updateHealth)
-	go loop(2*time.Second, func(ctx context.Context) error { return e.reconcilePass(ctx, false) })
+	go loop(5*time.Second, nil, e.updateHealth)
+	go loop(inventoryInterval, wake, func(ctx context.Context) error { return e.reconcilePass(ctx, false) })
 	<-ctx.Done()
 	cancel()
-	for range 3 {
+	for range 4 {
 		<-done
 	}
 	e.workers.running.Wait()
