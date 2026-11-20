@@ -9,7 +9,13 @@ configuration, sandbox, and container lifecycle calls.
 Create a client with `New(socketPath, timeout)`, or `NewConcurrent` to allow a
 fixed number of calls in flight, and close it when done. `New` runs calls one at
 a time; the timeout includes queueing and connection setup.
-Responses are limited to 64 KiB. Restrict socket access with filesystem permissions.
+Responses are limited to 64 KiB, except `ExecSync` output, which is limited to
+1 MiB. Restrict socket access with filesystem permissions.
+
+`Exec`, `Attach`, and `PortForward` return the runtime's streaming URL; they do
+not stream. `ExecSync` runs a bounded command for probes, and
+`ReopenContainerLog` supports log rotation. None of them resumes a paused
+sandbox; callers check recorded lifecycle state first.
 
 Lists are unfiltered and retain foreign and non-running objects. Status calls
 are non-verbose and require an exact runtime ID. Invalid or oversized responses
