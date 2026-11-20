@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -558,6 +559,34 @@ func TestContainerLogs(t *testing.T) {
 			}
 			if status != code || (code == http.StatusOK && body != tt.want) || !strings.Contains(body, tt.want) {
 				t.Fatalf("status %d body %q, want %d %q", status, body, code, tt.want)
+			}
+		})
+	}
+}
+
+// TestContainerLogTailBeyondScanBound is a regression test: a tail that
+// cannot be located within the scan bound must fail before HTTP 200 is sent.
+func TestContainerLogTailBeyondScanBound(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	line := "2026-11-13T10:00:00Z stdout F " + strings.Repeat("x", 994) + "\n"
+	lines := maxTailScan/len(line) + 16
+	logFile := filepath.Join(podlog.Directory(h.logDir, testUID), "0.log")
+	writeLog(t, logFile, strings.Repeat(line, lines))
+	for _, tt := range []struct {
+		name  string
+		query string
+		code  int
+		want  string
+	}{
+		{name: "beyond bound", query: "tailLines=" + strconv.Itoa(MaxTailLines), code: http.StatusUnprocessableEntity, want: "scan bound"},
+		{name: "beyond bound with follow", query: "follow=true&tailLines=" + strconv.Itoa(MaxTailLines), code: http.StatusUnprocessableEntity, want: "scan bound"},
+		{name: "within bound", query: "tailLines=2", code: http.StatusOK, want: strings.Repeat("x", 994) + "\n" + strings.Repeat("x", 994) + "\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			status, body := h.do(t, h.client(nil), http.MethodGet, "/containerLogs/team/web/app?"+tt.query, "good-token")
+			if status != tt.code || (tt.code == http.StatusOK && body != tt.want) || !strings.Contains(body, tt.want) {
+				t.Fatalf("status %d body %.80q, want %d %.80q", status, body, tt.code, tt.want)
 			}
 		})
 	}
