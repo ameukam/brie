@@ -43,11 +43,48 @@ are not runtime configuration or proof of ownership.
   DNS settings, host aliases, and hostname overrides remain unsupported.
 - Nonnegative termination grace periods and API-defaulted termination-message
   fields are recognized; custom termination-message settings, active deadlines,
-  probes, lifecycle hooks, readiness gates, streaming/TTY, restart rules, and
-  resize policies are unsupported.
+  probes (see the probe increment below), lifecycle hooks, readiness gates,
+  streaming/TTY, restart rules, and resize policies are unsupported.
 - No volumes, mounts, block devices, projected data, init/sidecar containers,
   ephemeral containers, CSI, or DRA. Disable token injection in the submitted
   Pod; admission-injected volumes or containers are rejected too.
+
+## Probe increment (`ProfileProbes`)
+
+`ValidatePodProfile` accepts readiness and liveness probes, and the TCP
+container ports they name, only when the caller passes the `ProfileProbes`
+feature. The execution path does not pass it yet: it does not run probes or
+gate readiness on them, so it still refuses every Pod with probes or port
+declarations. A caller may pass the feature only once it runs the
+`internal/probe` manager, publishes `Ready` from probe results, and fails the
+Pod after a liveness failure.
+
+With the feature:
+
+- Only `readinessProbe` and `livenessProbe`, each with exactly one `exec`,
+  `httpGet`, or `tcpSocket` handler. `startupProbe`, `grpc`, and probe-level
+  `terminationGracePeriodSeconds` are refused.
+- Timing is bounded: `initialDelaySeconds` 0-3600, `timeoutSeconds` 1-60,
+  `periodSeconds` 1-3600, `successThreshold` 1-10 (exactly 1 for liveness),
+  and `failureThreshold` 1-100. API-defaulted values are required.
+- `exec` commands have 1-32 entries, at most 4,096 bytes in total, and no NUL.
+  They run through CRI `ExecSync` in the container.
+- `httpGet` and `tcpSocket` probes target the Pod IP. `host` is refused.
+  `httpGet` accepts `HTTP` or `HTTPS` (certificates are not verified, as in
+  kubelet), an absolute path of at most 1,024 bytes without spaces or control
+  characters, and at most eight headers. Header values are at most 256 bytes
+  without line breaks. A `Host` header and any header whose name suggests
+  credentials (containing `auth`, `cookie`, `token`, `secret`, `password`,
+  `key`, `credential`, `session`, or `bearer`) are refused.
+- A probe port must number or name a declared container port. Up to 16 ports
+  are accepted, each TCP, unique by number and name, without `hostPort` or
+  `hostIP`. Declarations do not publish ports on the host.
+- Under `restartPolicy: Never`, a liveness failure fails the Pod; Brie never
+  restarts the container. A probe that cannot run, for example because CRI is
+  unavailable, withholds readiness but is not liveness evidence.
+- While a recorded lifecycle-extension state suspends a Pod's probes, the Pod
+  is not ready, liveness evidence is kept, and readiness must succeed again
+  after resumption.
 
 The upstream scheduler retains placement ownership. Existing node selectors,
 affinity, scheduler name, tolerations, priority/preemption, and topology-spread
