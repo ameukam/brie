@@ -55,6 +55,9 @@ type assignedPodWatch struct {
 	wake chan<- struct{}
 	// base, limit, and resync are the intervals above; tests shorten them.
 	base, limit, resync time.Duration
+	// failures counts consecutive list or watch attempts that failed or
+	// ended without progress; it sets the next backoff delay.
+	failures int
 }
 
 func newAssignedPodWatch(wake chan<- struct{}) *assignedPodWatch {
@@ -112,6 +115,30 @@ func (w *assignedPodWatch) currentVersion() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.version
+}
+
+// backoff counts one more failed attempt and returns the delay before the
+// next one.
+func (w *assignedPodWatch) backoff() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.failures++
+	return watchBackoff(w.failures, w.base, w.limit)
+}
+
+// progressed resets the failure count after a watch stream applied an event
+// or stayed open until its deadline. Opening a stream or completing a list is
+// not progress, so streams that break at once keep backing off.
+func (w *assignedPodWatch) progressed() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.failures = 0
+}
+
+func (w *assignedPodWatch) failureCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.failures
 }
 
 // errRelist reports that the watch cannot resume from its resource version
@@ -192,10 +219,8 @@ func watchBackoff(failures int, base, limit time.Duration) time.Duration {
 // expired version, an inapplicable event, or the resync deadline starts a new
 // cycle. Failures back off with bounded exponential delays.
 func (e *executor) watchAssigned(ctx context.Context, w *assignedPodWatch) {
-	failures := 0
 	wait := func() bool {
-		failures++
-		timer := time.NewTimer(watchBackoff(failures, w.base, w.limit))
+		timer := time.NewTimer(w.backoff())
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
@@ -218,8 +243,7 @@ func (e *executor) watchAssigned(ctx context.Context, w *assignedPodWatch) {
 			continue
 		}
 		w.replace(pods, version)
-		failures = 0
-		err = e.watchUntilRelist(ctx, w, time.Now().Add(w.resync), &failures, wait)
+		err = e.watchUntilRelist(ctx, w, time.Now().Add(w.resync), wait)
 		if err != nil && ctx.Err() == nil {
 			e.logger.Print(err)
 			if !wait() {
@@ -231,7 +255,7 @@ func (e *executor) watchAssigned(ctx context.Context, w *assignedPodWatch) {
 
 // watchUntilRelist streams events into the view until the resync deadline,
 // ctx end, or an error that requires a relist.
-func (e *executor) watchUntilRelist(ctx context.Context, w *assignedPodWatch, deadline time.Time, failures *int, wait func() bool) error {
+func (e *executor) watchUntilRelist(ctx context.Context, w *assignedPodWatch, deadline time.Time, wait func() bool) error {
 	selector := fields.OneTermEqualSelector("spec.nodeName", e.node.NodeName).String()
 	for ctx.Err() == nil {
 		remaining := time.Until(deadline)
@@ -257,9 +281,11 @@ func (e *executor) watchUntilRelist(ctx context.Context, w *assignedPodWatch, de
 		// The stream resumes exactly after the view's resource version, so
 		// the view stays usable across reconnects.
 		w.setUsable(true)
-		*failures = 0
 		events, err := consumeWatch(ctx, w, e.node.NodeName, stream, deadline)
 		stream.Stop()
+		if events != 0 || !time.Now().Before(deadline) {
+			w.progressed()
+		}
 		if err != nil {
 			w.setUsable(false)
 			return err
