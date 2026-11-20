@@ -29,6 +29,7 @@ fuzz:
 	$(GO) test ./cmd/brie-node -run='^$$' -fuzz='^FuzzRun$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzConfig$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzPodProfile$$' -fuzztime=10s -parallel=2
+	$(GO) test ./internal/nodeagent -run='^$$' -fuzz='^FuzzExecutionResources$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/cri -run='^$$' -fuzz='^FuzzNew$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzDecodeInfo$$' -fuzztime=10s -parallel=2
 	$(GO) test ./internal/runtime/internal/firecracker -run='^$$' -fuzz='^FuzzArtifactPath$$' -fuzztime=10s -parallel=2

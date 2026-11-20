@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package nodeagent provides explicit host registration and a shutdown boundary.
-// It can observe CRI health but does not reconcile Pods or mutate the runtime.
+// Explicit execution mode reconciles restricted Pods through containerd CRI.
 package nodeagent
 
 import (

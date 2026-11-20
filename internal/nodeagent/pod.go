@@ -57,6 +57,14 @@ func ValidatePodProfile(pod *corev1.Pod, nodeName, runtimeClassName string) erro
 	if spec.HostUsers != nil && !*spec.HostUsers {
 		return errors.New("spec.hostUsers=false is not supported by the initial Pod profile")
 	}
+	if len(spec.Overhead) != 0 {
+		if len(spec.Overhead) != 2 {
+			return errors.New("spec.overhead requires only positive CPU and memory")
+		}
+		if _, _, err := executionResources(spec.Overhead); err != nil {
+			return fmt.Errorf("spec.overhead: %w", err)
+		}
+	}
 	// Only scheduler-owned placement fields and the selected execution fields
 	// pass through. New Kubernetes fields fail closed until reviewed.
 	if err := onlyProfileFields("spec", spec, corev1.PodSpec{
@@ -71,6 +79,7 @@ func ValidatePodProfile(pod *corev1.Pod, nodeName, runtimeClassName string) erro
 		Tolerations: spec.Tolerations, PriorityClassName: spec.PriorityClassName,
 		Priority: spec.Priority, PreemptionPolicy: spec.PreemptionPolicy,
 		TopologySpreadConstraints: spec.TopologySpreadConstraints,
+		Overhead:                  spec.Overhead,
 	}); err != nil {
 		return err
 	}

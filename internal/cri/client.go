@@ -1,8 +1,8 @@
 // Copyright 2026 The Brie Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cri provides read-only observations of a local CRI v1 runtime.
-// It does not admit Pods, mutate runtime state, or establish Node readiness.
+// Package cri provides bounded CRI v1 calls to a local runtime.
+// Callers own admission, reconciliation, and uncertain mutation outcomes.
 package cri
 
 import (
@@ -25,10 +25,11 @@ import (
 const maxMessageBytes = 64 * 1024
 
 // Client observes one local runtime, with at most one RPC in flight.
-// The connection is private so callers cannot use it for runtime mutations.
+// The connection is private; only the explicitly exposed operations are available.
 type Client struct {
 	conn    *grpc.ClientConn
 	runtime runtimeapi.RuntimeServiceClient
+	images  runtimeapi.ImageServiceClient
 	timeout time.Duration
 	slot    chan struct{}
 }
@@ -63,6 +64,7 @@ func New(socketPath string, timeout time.Duration) (*Client, error) {
 	}
 	return &Client{
 		conn: conn, runtime: runtimeapi.NewRuntimeServiceClient(conn),
+		images:  runtimeapi.NewImageServiceClient(conn),
 		timeout: timeout, slot: make(chan struct{}, 1),
 	}, nil
 }
