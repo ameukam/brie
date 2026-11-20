@@ -82,7 +82,8 @@ func (e *executor) assignedView(ctx context.Context) ([]corev1.Pod, string, map[
 	return pods, version, nil, err
 }
 
-// reconcile runs one pass and waits for the operations it starts.
+// reconcile runs one pass and waits for the operations and image pulls it
+// starts.
 func (e *executor) reconcile(ctx context.Context) error {
 	return e.reconcilePass(ctx, true)
 }
@@ -221,6 +222,9 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 	faulted := e.workers.outstanding(func(uid string) bool {
 		return byUID[uid] != nil || records[uid] != nil && records[uid].Stage != "finished"
 	})
+	e.pulls.retain(func(uid string) bool {
+		return byUID[uid] != nil && records[uid] != nil && records[uid].Stage == "reserved" || busy[uid]
+	})
 	e.recovery.Store(blocked || faulted)
 	admit := !blocked && !faulted
 
@@ -325,6 +329,12 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 		}
 		creation := !deleting && record.CreateRejected == "" &&
 			(record.Stage == "reserved" || record.Stage == "sandbox" || record.Stage == "created")
+		// A Pod waiting on an image pull that has nothing new to report takes
+		// no creation slot, so it cannot starve younger Pods of pull requests.
+		if creation && record.Stage == "reserved" && len(pod.Spec.Containers) == 1 &&
+			e.pulls.unchanged(uid, pod.Spec.Containers[0].Image, time.Now()) {
+			continue
+		}
 		allowCreate := creation && admit
 		start(uid, creation, describe, func(ctx context.Context, client *cri.Client) error {
 			return e.reconcilePod(ctx, client, pod, inventory, allowCreate)
@@ -332,6 +342,7 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 	}
 	if wait {
 		pass.Wait()
+		e.pulls.wait()
 	}
 	faulted = e.workers.outstanding(func(uid string) bool {
 		record := e.record(uid)
@@ -601,15 +612,15 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 	sandbox, container := podRuntimeConfigs(pod, e.config, e.journal.Owner, record.Hash)
 	switch record.Stage {
 	case "reserved":
-		if !e.workers.pullAllowed(record.UID, time.Now()) {
-			return nil
-		}
+		image := container.Image.Image
 		if _, err := e.currentPod(ctx, pod, false); err != nil {
 			return err
 		}
-		if err := e.ensureImage(ctx, runtime, pod, container.Image.Image, sandbox); err != nil {
+		ready, err := e.imageReady(ctx, runtime, pod, image, sandbox)
+		if err != nil || !ready {
 			return err
 		}
+		// Re-read Pod intent after the image wait and before sandbox creation.
 		if _, err := e.currentPod(ctx, pod, false); err != nil {
 			return err
 		}
@@ -656,28 +667,6 @@ func (e *executor) reconcilePod(ctx context.Context, runtime *cri.Client, pod *c
 	default:
 		return errors.New("execution outcome remains unknown; waiting for runtime evidence without retrying mutations")
 	}
-}
-
-// ensureImage makes the Pod's image present before any sandbox exists. A
-// failed observation or pull is confined to this Pod: it is published on the
-// Pod, retried with backoff, and leaves node readiness unchanged. Nothing is
-// created for the Pod until the pull succeeds.
-func (e *executor) ensureImage(ctx context.Context, runtime *cri.Client, pod *corev1.Pod, image string, sandbox *runtimeapi.PodSandboxConfig) error {
-	present, err := runtime.ImageStatus(ctx, image)
-	if err == nil && present == nil {
-		_, err = runtime.PullImage(ctx, image, sandbox)
-	}
-	if err == nil {
-		e.workers.pullSucceeded(string(pod.UID))
-		return nil
-	}
-	if ctx.Err() != nil {
-		return err
-	}
-	delay := e.workers.pullFailed(string(pod.UID), time.Now())
-	fault := &podFault{reason: "ImagePullFailed",
-		message: fmt.Sprintf("Image %s could not be pulled; retrying in %s", image, delay.Round(time.Second))}
-	return errors.Join(fault, e.publishPodBlocked(ctx, pod, fault.reason, fault.message))
 }
 
 func terminalPod(pod *corev1.Pod) bool {

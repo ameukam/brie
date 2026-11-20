@@ -315,9 +315,14 @@ func newExecutor(t *testing.T, pods ...*corev1.Pod) (*executor, *executionRuntim
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = creation.Close() })
+	pulls, err := cri.NewConcurrent(socket, 5*time.Second, pullWorkers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pulls.Close() })
 	e := &executor{node: Config{NodeName: "worker-1", RuntimeSocket: socket}, config: config,
 		api: api, journal: journal, runtime: client, create: creation, health: health,
-		workers: newPodWorkers(), logger: log.New(io.Discard, "", 0)}
+		workers: newPodWorkers(), pulls: newImagePuller(pulls), logger: log.New(io.Discard, "", 0)}
 	if err := e.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +643,8 @@ func TestExecutionUncertainAbsence(t *testing.T) {
 	t.Parallel()
 	e, service := newExecutor(t, executionPod("app"))
 	service.loseReply = "RunPodSandbox"
-	reconcilePasses(t, e, 1)
+	// The first pass synchronizes; the second admits the Pod and pulls its image.
+	reconcilePasses(t, e, 2)
 	if err := e.reconcile(t.Context()); status.Code(err) != codes.Unavailable {
 		t.Fatalf("expected uncertain mutation: %v", err)
 	}
@@ -749,21 +755,34 @@ func TestExecutionOwnershipAndAdministratorFields(t *testing.T) {
 	}
 }
 
+// TestExecutionDeletionDuringPull is a regression test for section 10.4 of
+// DESIGN.md: Pod intent is re-read after the image wait and before sandbox
+// creation, so a Pod deleted during its pull never reaches the runtime even
+// when the pass still sees it undeleted.
 func TestExecutionDeletionDuringPull(t *testing.T) {
 	t.Parallel()
 	e, service := newExecutor(t, executionPod("app"))
+	stale, err := e.api.CoreV1().Pods("default").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	service.onPull = func() {
 		pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
 		now := metav1.Now()
 		pod.DeletionTimestamp = &now
 		_, _ = e.api.CoreV1().Pods("default").Update(t.Context(), pod, metav1.UpdateOptions{})
 	}
-	reconcilePasses(t, e, 1)
+	reconcilePasses(t, e, 2)
+	// The next pass reads a view that predates the deletion.
+	e.api.(*fake.Clientset).PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, stale.DeepCopy(), nil
+	})
 	if err := e.reconcile(t.Context()); err == nil {
 		t.Fatal("deletion during image pull was ignored")
 	}
-	reconcilePasses(t, e, 1)
-	if len(service.calls) != 1 || service.calls[0] != "PullImage" {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if len(service.calls) != 1 || service.calls[0] != "PullImage" || e.journal.Records["app-uid"].Stage != "reserved" {
 		t.Fatalf("deleted Pod reached sandbox execution: %v", service.calls)
 	}
 }
@@ -1056,6 +1075,8 @@ func TestExecutionDeletionEvidenceReleasesUnstartedReservation(t *testing.T) {
 			reconcilePasses(t, e, 1)
 			_ = e.reconcile(t.Context())
 			if lost != "" {
+				// The pull finished in the previous pass; this one creates the sandbox.
+				_ = e.reconcile(t.Context())
 				// The sandbox creation outcome is unknown and its object is gone.
 				service.mu.Lock()
 				clear(service.sandboxes)
