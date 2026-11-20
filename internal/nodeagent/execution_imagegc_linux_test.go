@@ -4,19 +4,22 @@
 package nodeagent
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // collectionImages is the image store of TestExecutionImageCollection. The
-// running Pod's container names "sha256:image"; "mirror" shares its digest
-// from another repository; "pause" is pinned like a sandbox image.
+// waiting Pod's record names the digest of "sha256:image"; "mirror" shares
+// that digest from another repository; "pause" is pinned.
 func collectionImages() []*runtimeapi.Image {
 	digest := "@sha256:" + strings.Repeat("a", 64)
 	return []*runtimeapi.Image{
@@ -28,15 +31,20 @@ func collectionImages() []*runtimeapi.Image {
 	}
 }
 
-// newCollectionExecutor runs one Pod to completion of its start and enables
-// image collection with the given threshold.
+// newCollectionExecutor admits Pod "app", whose pull fails, so the node holds
+// its reserved record and no sandbox, and enables image collection with the
+// given threshold. The record names the "sha256:image" digest.
 func newCollectionExecutor(t *testing.T, threshold int64) (*executor, *executionRuntime) {
 	t.Helper()
 	e, service := newExecutor(t, executionPod("app"))
-	reconcilePasses(t, e, 6)
+	service.mu.Lock()
+	service.pullError = status.Error(codes.NotFound, "manifest unknown")
+	service.mu.Unlock()
+	reconcilePasses(t, e, 2)
 	pod, _ := e.api.CoreV1().Pods("default").Get(t.Context(), "app", metav1.GetOptions{})
-	if pod.Status.Phase != corev1.PodRunning {
-		t.Fatalf("Pod not running: %+v", pod.Status)
+	if record := e.record("app-uid"); record == nil || record.Stage != "reserved" || pod.Status.Phase != corev1.PodPending ||
+		!e.synced.Load() || e.recovery.Load() {
+		t.Fatalf("Pod not waiting for its image: %+v", pod.Status)
 	}
 	service.mu.Lock()
 	service.images, service.imageFsUsed = collectionImages(), 1000
@@ -45,6 +53,14 @@ func newCollectionExecutor(t *testing.T, threshold int64) (*executor, *execution
 		e.images = &imageCollector{client: e.runtime, threshold: threshold, unusedSince: make(map[string]time.Time)}
 	}
 	return e, service
+}
+
+// orphanContainer completes the listed fields of a container whose sandbox
+// is gone.
+func orphanContainer(container *runtimeapi.Container) *runtimeapi.Container {
+	container.PodSandboxId, container.CreatedAt = "removed-sandbox", 1
+	container.Metadata = &runtimeapi.ContainerMetadata{Name: "orphan"}
+	return container
 }
 
 // TestExecutionImageCollection covers section 10.4 of DESIGN.md: collection is
@@ -77,10 +93,58 @@ func TestExecutionImageCollection(t *testing.T) {
 				e.journal.Records["done-uid"] = &executionRecord{UID: "done-uid", Namespace: "default", Name: "done",
 					Hash: strings.Repeat("0", 64), Stage: "finished", CPU: 1, Memory: 1, Image: "example.test/small:v1"}
 			}},
+		// The sandbox was removed outside the agent, so RemovePodSandbox
+		// never succeeded for it.
+		{name: "finished record with unproven sandbox removal", threshold: 100, passes: 2, removed: []string{"sha256:large"},
+			change: func(e *executor, _ *executionRuntime) {
+				e.journal.Records["done-uid"] = &executionRecord{UID: "done-uid", Namespace: "default", Name: "done",
+					Hash: strings.Repeat("0", 64), Stage: "finished", CPU: 1, Memory: 1, SandboxID: "sandbox-done",
+					Image: "example.test/small:v1"}
+			}},
+		{name: "finished record with proven sandbox removal", threshold: 100, passes: 2, removed: []string{"sha256:large", "sha256:small"},
+			change: func(e *executor, _ *executionRuntime) {
+				e.journal.Records["done-uid"] = &executionRecord{UID: "done-uid", Namespace: "default", Name: "done",
+					Hash: strings.Repeat("0", 64), Stage: "finished", CPU: 1, Memory: 1, SandboxID: "sandbox-done",
+					SandboxRemoved: true, Image: "example.test/small:v1"}
+			}},
 		{name: "record without image", threshold: 100, passes: 2, wantErr: "no image reference",
 			change: func(e *executor, _ *executionRuntime) { e.journal.Records["app-uid"].Image = "" }},
-		{name: "unpinned sandbox image", threshold: 100, passes: 2, wantErr: "pins no image",
-			change: func(_ *executor, service *executionRuntime) { service.images[2].Pinned = false }},
+		// An unpinned sandbox image next to an unrelated pinned image.
+		{name: "existing sandbox", threshold: 100, passes: 2, wantErr: "existing sandboxes",
+			change: func(_ *executor, service *executionRuntime) {
+				service.images = append(service.images, &runtimeapi.Image{Id: "sha256:sandbox", Size: 50,
+					RepoTags: []string{"registry.k8s.io/pause:3.9"}})
+				service.sandboxes["foreign"] = &runtimeapi.PodSandbox{Id: "foreign", CreatedAt: 1,
+					Metadata: &runtimeapi.PodSandboxMetadata{Name: "other", Namespace: "default", Uid: "other-uid"}}
+			}},
+		{name: "container image identified", threshold: 100, passes: 2, removed: []string{"sha256:large"},
+			change: func(_ *executor, service *executionRuntime) {
+				service.containers["orphan"] = orphanContainer(&runtimeapi.Container{Id: "orphan", ImageRef: "sha256:small"})
+			}},
+		{name: "container image identified by ID", threshold: 100, passes: 2, removed: []string{"sha256:small"},
+			change: func(_ *executor, service *executionRuntime) {
+				service.containers["orphan"] = orphanContainer(&runtimeapi.Container{Id: "orphan", ImageId: "sha256:large",
+					ImageRef: "example.test/large@sha256:" + strings.Repeat("1", 64)})
+			}},
+		{name: "container without image identity", threshold: 100, passes: 2, wantErr: "not identified",
+			change: func(_ *executor, service *executionRuntime) {
+				service.containers["orphan"] = orphanContainer(&runtimeapi.Container{Id: "orphan"})
+			}},
+		{name: "container with only an image name", threshold: 100, passes: 2, wantErr: "not identified",
+			change: func(_ *executor, service *executionRuntime) {
+				service.containers["orphan"] = orphanContainer(&runtimeapi.Container{Id: "orphan",
+					Image: &runtimeapi.ImageSpec{Image: "example.test/small:v1"}})
+			}},
+		{name: "container image not listed", threshold: 100, passes: 2, wantErr: "not identified",
+			change: func(_ *executor, service *executionRuntime) {
+				service.containers["orphan"] = orphanContainer(&runtimeapi.Container{Id: "orphan", ImageRef: "sha256:gone"})
+			}},
+		{name: "running pull", threshold: 100, passes: 2, wantErr: "pull is in progress",
+			change: func(e *executor, _ *executionRuntime) {
+				e.pulls.mu.Lock()
+				e.pulls.pulls["example.test/small:v2"] = &imagePull{running: true, waiters: map[string]string{}}
+				e.pulls.mu.Unlock()
+			}},
 		{name: "not reconstructed", threshold: 100, passes: 2, wantErr: "not reconstructed",
 			change: func(e *executor, _ *executionRuntime) { e.synced.Store(false) }},
 		{name: "recovery", threshold: 100, passes: 2, wantErr: "not reconstructed",
@@ -189,6 +253,66 @@ func TestExecutionImageCollectionWaitsForPresenceChecks(t *testing.T) {
 	e.imageGate.RUnlock()
 	if err := <-done; err != nil || countCalls(service, "RemoveImage") != 2 {
 		t.Fatalf("collection after the presence check = %v, %d removals", err, countCalls(service, "RemoveImage"))
+	}
+}
+
+// TestExecutionImageCollectionOrdersAgainstPulls is a regression test: a pull
+// that adds a reference to an image already observed unreferenced must not let
+// collection remove that image, whether the pass overlaps the pull or the
+// image list never shows the new reference.
+func TestExecutionImageCollectionOrdersAgainstPulls(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		// aliasListed adds the pulled reference to the listed image.
+		aliasListed bool
+	}{
+		{name: "alias listed", aliasListed: true},
+		{name: "alias not listed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			e, service := newCollectionExecutor(t, 100)
+			now := time.Now()
+			if err := e.collectImagesAt(t.Context(), now); err != nil {
+				t.Fatal(err)
+			}
+			// Admission journals the reference before it requests the pull.
+			alias := "example.test/small:v2"
+			e.mu.Lock()
+			e.journal.Records["next-uid"] = &executionRecord{UID: "next-uid", Namespace: "default", Name: "next",
+				Hash: strings.Repeat("0", 64), Stage: "reserved", CPU: 1, Memory: 1, Image: alias}
+			e.mu.Unlock()
+			gate := make(chan struct{})
+			service.mu.Lock()
+			service.pullError, service.pullGate, service.pullRef = nil, gate, "sha256:small"
+			service.onPull = func() {
+				if test.aliasListed {
+					service.images[4].RepoTags = append(service.images[4].RepoTags, alias)
+				}
+			}
+			service.mu.Unlock()
+			e.imageGate.RLock()
+			ready, _, _ := e.pulls.request(context.Background(), "next-uid", alias, nil, now)
+			e.imageGate.RUnlock()
+			if ready {
+				t.Fatal("pull finished before it started")
+			}
+			err := e.collectImagesAt(t.Context(), now.Add(imageGCMinUnused))
+			if err == nil || !strings.Contains(err.Error(), "pull is in progress") {
+				t.Fatalf("collection during a pull = %v", err)
+			}
+			close(gate)
+			e.pulls.wait()
+			if err := e.collectImagesAt(t.Context(), now.Add(2*imageGCMinUnused)); err != nil {
+				t.Fatal(err)
+			}
+			service.mu.Lock()
+			defer service.mu.Unlock()
+			if !slices.Equal(service.removedImages, []string{"sha256:large"}) {
+				t.Fatalf("removed %v; the pulled image was collected", service.removedImages)
+			}
+		})
 	}
 }
 
