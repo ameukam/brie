@@ -169,7 +169,7 @@ func TestRequestAccess(t *testing.T) {
 		{method: "GET", path: "/stats/summary", want: Access{Verb: "get", Subresources: []string{"stats"}}},
 		{method: "GET", path: "/logs/syslog", want: Access{Verb: "get", Subresources: []string{"log"}}},
 		{method: "GET", path: "/containerLogs/ns/pod/c", want: Access{Verb: "get", Subresources: []string{"proxy"}}},
-		{method: "HEAD", path: "/containerLogs/ns/pod/c", want: Access{Verb: "get", Subresources: []string{"proxy"}}},
+		{method: "HEAD", path: "/healthz", err: true},
 		{method: "GET", path: "/exec/ns/pod/c", want: Access{Verb: "create", Subresources: []string{"proxy"}}},
 		{method: "POST", path: "/exec/ns/pod/c", want: Access{Verb: "create", Subresources: []string{"proxy"}}},
 		{method: "GET", path: "/attach/ns/pod/c", want: Access{Verb: "create", Subresources: []string{"proxy"}}},
