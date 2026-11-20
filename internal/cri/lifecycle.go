@@ -9,8 +9,46 @@ import (
 	"fmt"
 	"net/netip"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+// rejectionCodes are the gRPC status codes that only a completed runtime
+// handler can return and that mean the runtime refused the request. grpc-go
+// never generates them for transport, deadline, cancellation, or decoding
+// failures, which instead surface as Unavailable, DeadlineExceeded, Canceled,
+// Unknown, Internal, ResourceExhausted, Unimplemented, or Unauthenticated.
+// AlreadyExists, Aborted, and DataLoss are excluded because they can describe
+// an object that exists or a partially applied change.
+var rejectionCodes = map[codes.Code]bool{
+	codes.InvalidArgument: true, codes.NotFound: true, codes.FailedPrecondition: true,
+	codes.PermissionDenied: true, codes.OutOfRange: true,
+}
+
+// DefiniteRejection reports the status code of an error that a runtime
+// returned to refuse a mutation, as opposed to a lost or interrupted reply.
+// It is necessary but not sufficient evidence that nothing was created: a
+// runtime can fail after a partial mutation, so callers must also observe a
+// complete inventory without the object.
+func DefiniteRejection(err error) (codes.Code, bool) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return codes.OK, false
+	}
+	code := status.Code(err)
+	return code, rejectionCodes[code]
+}
+
+// IsRejectionCode reports whether name is the string form of a code that
+// DefiniteRejection accepts.
+func IsRejectionCode(name string) bool {
+	for code := range rejectionCodes {
+		if code.String() == name {
+			return true
+		}
+	}
+	return false
+}
 
 // ImageStatus reads a non-verbose image observation. A nil image with no error
 // explicitly means the image is absent, as defined by CRI.

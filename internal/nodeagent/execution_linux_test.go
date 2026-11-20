@@ -51,6 +51,13 @@ type executionRuntime struct {
 	onPull     func()
 	failStop   bool
 	stopGrace  []int64
+	// reject answers the named create method with a status code. With
+	// createOnReject, the object is created before the rejection is returned.
+	reject         map[string]codes.Code
+	createOnReject bool
+	pullError      error
+	// pullGate, when set, holds PullImage until it is closed.
+	pullGate chan struct{}
 }
 
 func (s *executionRuntime) Version(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
@@ -75,10 +82,19 @@ func (s *executionRuntime) ImageStatus(context.Context, *runtimeapi.ImageStatusR
 
 func (s *executionRuntime) PullImage(context.Context, *runtimeapi.PullImageRequest) (*runtimeapi.PullImageResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	gate := s.pullGate
 	s.calls = append(s.calls, "PullImage")
+	s.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.onPull != nil {
 		s.onPull()
+	}
+	if s.pullError != nil {
+		return nil, s.pullError
 	}
 	return &runtimeapi.PullImageResponse{ImageRef: "sha256:image"}, nil
 }
@@ -87,11 +103,17 @@ func (s *executionRuntime) RunPodSandbox(_ context.Context, request *runtimeapi.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "RunPodSandbox")
+	if code, ok := s.reject["RunPodSandbox"]; ok && !s.createOnReject {
+		return nil, status.Error(code, "sandbox rejected")
+	}
 	id := "sandbox-" + request.Config.Metadata.Uid
 	s.sandboxes[id] = &runtimeapi.PodSandbox{
 		Id: id, Metadata: proto.Clone(request.Config.Metadata).(*runtimeapi.PodSandboxMetadata),
 		State: runtimeapi.PodSandboxState_SANDBOX_READY, CreatedAt: time.Now().UnixNano(),
 		Labels: request.Config.Labels, RuntimeHandler: request.RuntimeHandler,
+	}
+	if code, ok := s.reject["RunPodSandbox"]; ok {
+		return nil, status.Error(code, "sandbox rejected after a partial create")
 	}
 	if s.loseReply == "RunPodSandbox" {
 		return nil, status.Error(codes.Unavailable, "lost committed sandbox reply")
@@ -103,6 +125,9 @@ func (s *executionRuntime) CreateContainer(_ context.Context, request *runtimeap
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "CreateContainer")
+	if code, ok := s.reject["CreateContainer"]; ok && !s.createOnReject {
+		return nil, status.Error(code, "container rejected")
+	}
 	id := "container-" + request.PodSandboxId
 	s.containers[id] = &runtimeapi.Container{
 		Id: id, PodSandboxId: request.PodSandboxId,
@@ -111,6 +136,9 @@ func (s *executionRuntime) CreateContainer(_ context.Context, request *runtimeap
 		Labels: request.Config.Labels, Image: request.Config.Image, ImageRef: "sha256:image",
 	}
 	s.configs[id] = request.Config
+	if code, ok := s.reject["CreateContainer"]; ok {
+		return nil, status.Error(code, "container rejected after a partial create")
+	}
 	if s.loseReply == "CreateContainer" {
 		return nil, status.Error(codes.Unavailable, "lost committed container reply")
 	}
@@ -282,8 +310,14 @@ func newExecutor(t *testing.T, pods ...*corev1.Pod) (*executor, *executionRuntim
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = health.Close() })
+	creation, err := cri.NewConcurrent(socket, time.Second, creationWorkers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = creation.Close() })
 	e := &executor{node: Config{NodeName: "worker-1", RuntimeSocket: socket}, config: config,
-		api: api, journal: journal, runtime: client, health: health, logger: log.New(io.Discard, "", 0)}
+		api: api, journal: journal, runtime: client, create: creation, health: health,
+		workers: newPodWorkers(), logger: log.New(io.Discard, "", 0)}
 	if err := e.initialize(t.Context()); err != nil {
 		t.Fatal(err)
 	}
