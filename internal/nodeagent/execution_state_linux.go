@@ -23,6 +23,13 @@ import (
 // evidence.
 const maxResourceVersion = 128
 
+// executionJournalVersion is the journal schema this agent writes. Version 1
+// journals predate SandboxRemoved; they are read and rewritten as version 2,
+// and their finished records that name a sandbox stay retained because they
+// carry no removal evidence. A newer agent never reads a version it does not
+// know, and an older agent refuses version 2.
+const executionJournalVersion = 2
+
 type executionRecord struct {
 	UID, Namespace, Name, Hash, Stage string
 	SandboxID, ContainerID            string
@@ -36,6 +43,10 @@ type executionRecord struct {
 	// the inventory that proves nothing was created is read, and it stays set
 	// after that proof so the create is never retried. Older journals omit it.
 	CreateRejected string `json:",omitempty"`
+	// SandboxRemoved records that RemovePodSandbox succeeded for this
+	// execution's sandbox. Compaction requires it for a record that names a
+	// sandbox. Version 1 journals omit it.
+	SandboxRemoved bool `json:",omitempty"`
 }
 
 type executionJournal struct {
@@ -73,7 +84,7 @@ func openExecutionJournal(dir, node string, config ExecutionConfig) (_ *executio
 	journal := &executionJournal{dir: dir, lock: lock}
 	file, err := os.Open(filepath.Join(dir, "state.json"))
 	if errors.Is(err, os.ErrNotExist) {
-		journal.Version, journal.Owner, journal.Node = 1, rand.Text(), node
+		journal.Version, journal.Owner, journal.Node = executionJournalVersion, rand.Text(), node
 		journal.Class, journal.Handler = config.RuntimeClass, config.RuntimeHandler
 		journal.NodeIP, journal.DNS, journal.Domain, journal.LogDir = config.NodeIP, config.ClusterDNS, config.ClusterDomain, config.LogDir
 		journal.Records = make(map[string]*executionRecord)
@@ -90,59 +101,77 @@ func openExecutionJournal(dir, node string, config ExecutionConfig) (_ *executio
 	if err != nil || !info.Mode().IsRegular() || info.Size() >= 4*1024*1024 {
 		return nil, errors.New("execution journal is not a bounded regular file")
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, 4*1024*1024))
+	data, err := io.ReadAll(io.LimitReader(file, 4*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read execution journal: %w", err)
+	}
+	if err := journal.decode(data, node, config); err != nil {
+		return nil, err
+	}
+	return journal, nil
+}
+
+// decode parses and validates a journal file for node and config and migrates
+// a version 1 payload to the current schema in memory. The migrated schema is
+// written by the next save.
+func (j *executionJournal) decode(data []byte, node string, config ExecutionConfig) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var envelope struct {
 		Data   []byte
 		SHA256 string
 	}
 	if err := decoder.Decode(&envelope); err != nil {
-		return nil, fmt.Errorf("decode execution journal: %w", err)
+		return fmt.Errorf("decode execution journal: %w", err)
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return nil, errors.New("execution journal has trailing or oversized data")
+		return errors.New("execution journal has trailing or oversized data")
 	}
 	sum := sha256.Sum256(envelope.Data)
 	if envelope.SHA256 != hex.EncodeToString(sum[:]) {
-		return nil, errors.New("execution journal checksum mismatch")
+		return errors.New("execution journal checksum mismatch")
 	}
 	payload := json.NewDecoder(bytes.NewReader(envelope.Data))
 	payload.DisallowUnknownFields()
-	if err := payload.Decode(journal); err != nil {
-		return nil, fmt.Errorf("decode execution journal payload: %w", err)
+	if err := payload.Decode(j); err != nil {
+		return fmt.Errorf("decode execution journal payload: %w", err)
 	}
 	if err := payload.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return nil, errors.New("execution journal payload has trailing data")
+		return errors.New("execution journal payload has trailing data")
 	}
-	if journal.Version != 1 || journal.Owner == "" || journal.Node != node ||
-		journal.Class != config.RuntimeClass || journal.Handler != config.RuntimeHandler || journal.Records == nil ||
-		journal.NodeIP != config.NodeIP || journal.DNS != config.ClusterDNS ||
-		journal.Domain != config.ClusterDomain || journal.LogDir != config.LogDir {
-		return nil, errors.New("execution journal identity, configuration, or schema mismatch")
+	if j.Version != 1 && j.Version != executionJournalVersion || j.Owner == "" || j.Node != node ||
+		j.Class != config.RuntimeClass || j.Handler != config.RuntimeHandler || j.Records == nil ||
+		j.NodeIP != config.NodeIP || j.DNS != config.ClusterDNS ||
+		j.Domain != config.ClusterDomain || j.LogDir != config.LogDir {
+		return errors.New("execution journal identity, configuration, or schema mismatch")
 	}
-	for uid, record := range journal.Records {
+	for uid, record := range j.Records {
 		if record == nil || uid == "" || uid != record.UID || record.Namespace == "" || record.Name == "" ||
 			len(record.Hash) != 64 || record.CPU <= 0 || record.Memory <= 0 ||
 			len(record.DeletionObserved) > maxResourceVersion {
-			return nil, errors.New("invalid execution journal record")
+			return errors.New("invalid execution journal record")
 		}
 		switch record.Stage {
 		case "reserved", "sandbox-pending", "sandbox", "container-pending", "created", "start-pending", "running", "finished":
 		default:
-			return nil, errors.New("unknown execution journal stage")
+			return errors.New("unknown execution journal stage")
+		}
+		if record.SandboxRemoved && (j.Version == 1 || record.Stage != "finished") {
+			return errors.New("invalid execution journal removal evidence")
 		}
 		if record.CreateRejected != "" && (!cri.IsRejectionCode(record.CreateRejected) ||
 			record.Stage == "created" || record.Stage == "start-pending" || record.Stage == "running") {
-			return nil, errors.New("invalid execution journal creation evidence")
+			return errors.New("invalid execution journal creation evidence")
 		}
 		if record.Stage != "reserved" && record.Stage != "sandbox-pending" && record.Stage != "finished" && record.SandboxID == "" {
-			return nil, errors.New("execution journal lost sandbox identity")
+			return errors.New("execution journal lost sandbox identity")
 		}
 		if (record.Stage == "created" || record.Stage == "start-pending" || record.Stage == "running") && record.ContainerID == "" {
-			return nil, errors.New("execution journal lost container identity")
+			return errors.New("execution journal lost container identity")
 		}
 	}
-	return journal, nil
+	j.Version = executionJournalVersion
+	return nil
 }
 
 func (j *executionJournal) close() error { return j.lock.Close() }

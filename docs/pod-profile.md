@@ -214,8 +214,16 @@ ambiguous associations, missing known IDs, and over-budget reconstructed
 reservations preserve workloads and block admission. Shutdown closes agent
 connections without killing VMs. There is no age- or inventory-based orphan GC,
 cross-host recovery, probes, streaming,
-hibernation, or conformance claim. Terminal journal records are retained; the
-journal is bounded to 10,000 records and 4 MiB and requires reviewed operator
+hibernation, or conformance claim. A finished journal record is compacted only
+when, in one pass, `RemovePodSandbox` succeeded for the sandbox it names (or it
+never named one), its Pod UID is absent from the complete assigned-Pod view, and
+complete sandbox and container lists hold no object that it names or that claims
+its Pod UID. A terminal Pod that is still listed keeps its record, and so does a
+record whose sandbox disappeared without a successful `RemovePodSandbox`, such as
+one removed by an operator or finished under the version 1 journal schema. The
+journal schema is now version 2; version 1 journals are read and rewritten as
+version 2, and older agents refuse version 2. The journal stays bounded to
+10,000 records and 4 MiB; retained records still need reviewed operator
 maintenance before those limits are reached. Polling, startup latency, host/guest
 resource enforcement, and real scheduler-to-Kata execution still require runtime
 qualification before deploying this mode.
