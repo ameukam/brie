@@ -186,3 +186,71 @@ caller reports as journal-finished, only when no sandbox for that UID remains
 in the CRI inventory, and never for an entry that is not a real directory.
 Directories of unknown Pods are never removed. Without a finished-Pod source,
 cleanup is disabled; the executor does not provide one yet.
+
+## Agent flags
+
+All services are off by default. Serving, Events, and rotation require
+`--enable-workloads` and its execution configuration; `--log-format` requires
+`--run`.
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--log-format=text\|json` | `text` | `json` turns agent log lines into redacted, rate-limited JSON records |
+| `--enable-serving` | off | Serve the endpoint above, with the agent metrics registry |
+| `--serving-address` | `:10250` | HTTPS listen address |
+| `--tls-cert-file`, `--tls-private-key-file` | none | Absolute PEM serving certificate and key (required with serving) |
+| `--client-ca-file` | none | Absolute PEM CA bundle for client certificates (required with serving) |
+| `--enable-events` | off | Record bounded Events; today only barrier entry and exit |
+| `--container-log-max-size` | none | Enables rotation above this size, such as `10Mi` |
+| `--container-log-max-files` | `5` | Files kept per container, including the current one |
+
+Serving and rotation each use their own CRI client, separate from the
+executor's. A service that fails, for example because the serving address is
+in use, stops the agent; as on any exit, running workloads are not stopped.
+The serving TLS files are read once at startup and are not reloaded.
+
+What the wiring feeds today: CRI latency, errors, and pull metrics from every
+Brie CRI client; the configured budget; the last complete pass age; Lease
+renewal failures; and the barrier cause (`RecoveryRequired`,
+`RuntimeUnhealthy`, or `IncompletePass`) with Events when it changes. The
+other signals need the executor hooks below.
+
+## Executor hooks still required
+
+`nodeagent.ExecuteObserved` passes `ExecutionHooks` (CRI observer, Lease
+renewal, pass result, readiness-gate inputs) into the executor. A later stage
+must add these hooks before the corresponding signals exist:
+
+1. Probes feeding readiness. When a container is observed running, call
+   `probe.Manager.Add` with the Pod UID, the sandbox's Pod IP, the container
+   ID and start time, the declared ports, and the probes; call `Remove` when
+   the execution stops or is cleaned up. In Pod status publication, set
+   `ContainersReady` and `Ready` true only when `Status.Ready` is true for a
+   Pod with a readiness probe. On `Status.LivenessFailed`, stop the container
+   with the Pod's grace period, publish phase `Failed` with reason
+   `LivenessProbeFailed`, record `ProbeFailed`, and never restart. Exec probes
+   need their own CRI client with a timeout above 60 seconds. Only then pass
+   `ProfileProbes` to `ValidatePodProfile`.
+2. Admission decisions. At each decision of DESIGN section 7.2, call
+   `metrics.AdmissionDecision` with the published reason (`Admitted` once the
+   `reserved` record is committed) and `events.PodRefused` for refusals.
+3. Pull failures. Where `PullImage` fails for a Pod, call
+   `events.ImagePullFailed` with the gRPC code, not the image reference. Pull
+   duration and failure metrics already come from the CRI observer.
+4. Cleanup blocked. Where cleanup waits for positive deletion evidence (DESIGN
+   section 6.3), call `events.CleanupBlocked`.
+5. Reservations and journal size. After each journal save, call
+   `metrics.SetReservations` with unfinished CPU, memory, and record count, and
+   `metrics.SetJournal` with the record count and encoded bytes.
+6. Pending stage age. `metrics.SetPendingStages` needs the time each record
+   entered its pending stage, which the journal does not record; adding it is
+   a journal schema change.
+7. Barrier cause detail. `UnresolvedExecution` is never reported because the
+   executor folds unresolved executions into its pass error and recovery flag;
+   the pass hook must report the cause to separate it.
+8. Finished Pods for log cleanup. Provide `logrotation.FinishedPods` from the
+   reconcile loop, because the journal map is not safe for concurrent reads.
+   Until then, log directory cleanup stays disabled.
+9. Extension states. The lifecycle extension must provide
+   `serving.ExtensionStates` and call `probe.Manager.Suspend` and `Resume`.
+   Brie has no lifecycle extension yet, so no state is ever reported.

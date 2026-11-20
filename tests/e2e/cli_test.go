@@ -9,7 +9,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +59,10 @@ func TestCLI(t *testing.T) {
 				{name: "workloads without run", args: []string{"--enable-workloads"}, stderr: "require --run", code: 1},
 				{name: "execution config without opt-in", args: []string{"--run", "--node-name=worker-1", "--max-pods=5"}, stderr: "requires --enable-workloads", code: 1},
 				{name: "incomplete execution config", args: []string{"--run", "--node-name=worker-1", "--enable-workloads"}, stderr: "validate execution configuration", code: 1},
+				{name: "serving without workloads", args: []string{"--run", "--node-name=worker-1", "--enable-serving"}, stderr: "requires --enable-workloads", code: 1},
+				{name: "serving without TLS", args: []string{"--run", "--node-name=worker-1", "--enable-workloads", "--enable-serving"}, stderr: "--tls-cert-file", code: 1},
+				{name: "invalid log format", args: []string{"--run", "--node-name=worker-1", "--log-format=xml"}, stderr: "--log-format", code: 1},
+				{name: "invalid log rotation", args: []string{"--run", "--node-name=worker-1", "--enable-workloads", "--container-log-max-size=1Ki"}, stderr: "max size", code: 1},
 				{name: "unknown flag", args: []string{"--unknown"}, stderr: "brie-node: parse flags:", code: 1},
 				{name: "invalid boolean", args: []string{"--version=invalid"}, stderr: "brie-node: parse flags:", code: 1},
 				{name: "positional argument", args: []string{"start"}, stderr: "brie-node: unexpected arguments:", code: 1},
@@ -99,6 +106,35 @@ func TestCLI(t *testing.T) {
 					}
 				})
 			}
+			t.Run("json log", func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, binary, "--run", "--node-name=worker-1", "--log-format=json")
+				stderr, err := cmd.StderrPipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				scanner := bufio.NewScanner(stderr)
+				var record map[string]any
+				if !scanner.Scan() || json.Unmarshal(scanner.Bytes(), &record) != nil ||
+					record["level"] != "INFO" || !strings.HasPrefix(fmt.Sprint(record["msg"]), "agent scaffold for worker-1") {
+					cancel()
+					waitErr := cmd.Wait()
+					t.Fatalf("startup record=%q wait error=%v", scanner.Text(), waitErr)
+				}
+				if err := cmd.Process.Signal(os.Interrupt); err != nil {
+					cancel()
+				}
+				if _, err := io.Copy(io.Discard, stderr); err != nil {
+					t.Error(err)
+				}
+				if err := cmd.Wait(); err != nil || ctx.Err() != nil {
+					t.Fatalf("shutdown: wait=%v context=%v", err, ctx.Err())
+				}
+			})
 			for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
 				t.Run("shutdown/"+sig.String(), func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
