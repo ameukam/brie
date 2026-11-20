@@ -29,6 +29,25 @@ type User struct {
 
 const authenticatedGroup = "system:authenticated"
 
+// Authentication and authorization outcomes whose text is safe to log.
+var (
+	errNoCredentials = errors.New("no client certificate or bearer token")
+	errTokenRejected = errors.New("token not authenticated")
+	errTokenAudience = errors.New("token audience not accepted")
+	errNoCommonName  = errors.New("client certificate has no common name")
+	errAccessDenied  = errors.New("access denied")
+)
+
+// reviewError is a failed TokenReview or SubjectAccessReview request. Its
+// cause comes from the API server and is never logged as text.
+type reviewError struct {
+	review string
+	err    error
+}
+
+func (e *reviewError) Error() string { return e.review + " failed: " + e.err.Error() }
+func (e *reviewError) Unwrap() error { return e.err }
+
 // authenticate identifies the caller from a verified client certificate or a
 // bearer token reviewed by the API server. Anonymous requests and every review
 // error are rejected.
@@ -39,20 +58,20 @@ func authenticate(ctx context.Context, api kubernetes.Interface, audiences []str
 	header := r.Header.Get("Authorization")
 	scheme, token, found := strings.Cut(header, " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
-		return nil, errors.New("no client certificate or bearer token")
+		return nil, errNoCredentials
 	}
 	review, err := api.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{
 		Spec: authenticationv1.TokenReviewSpec{Token: strings.TrimSpace(token), Audiences: audiences},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("TokenReview failed: %w", err)
+		return nil, &reviewError{review: "TokenReview", err: err}
 	}
 	status := review.Status
 	if !status.Authenticated || status.Error != "" || status.User.Username == "" {
-		return nil, errors.New("token not authenticated")
+		return nil, errTokenRejected
 	}
 	if len(audiences) > 0 && !slices.ContainsFunc(status.Audiences, func(a string) bool { return slices.Contains(audiences, a) }) {
-		return nil, errors.New("token audience not accepted")
+		return nil, errTokenAudience
 	}
 	extra := make(map[string][]string, len(status.User.Extra))
 	for key, values := range status.User.Extra {
@@ -63,7 +82,7 @@ func authenticate(ctx context.Context, api kubernetes.Interface, audiences []str
 
 func certificateUser(certificate *x509.Certificate) (*User, error) {
 	if certificate.Subject.CommonName == "" {
-		return nil, errors.New("client certificate has no common name")
+		return nil, errNoCommonName
 	}
 	groups := slices.Clone(certificate.Subject.Organization)
 	if !slices.Contains(groups, authenticatedGroup) {
@@ -131,11 +150,11 @@ func authorize(ctx context.Context, api kubernetes.Interface, nodeName string, u
 			},
 		}, metav1.CreateOptions{})
 		if err != nil {
-			return fmt.Errorf("SubjectAccessReview failed: %w", err)
+			return &reviewError{review: "SubjectAccessReview", err: err}
 		}
 		if review.Status.Allowed && !review.Status.Denied {
 			return nil
 		}
 	}
-	return fmt.Errorf("user %q cannot %s nodes/%s", user.Name, access.Verb, access.Subresources[0])
+	return fmt.Errorf("%w: user %q cannot %s nodes/%s", errAccessDenied, user.Name, access.Verb, access.Subresources[0])
 }

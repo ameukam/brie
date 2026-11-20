@@ -59,12 +59,15 @@ Endpoints:
 - `GET /metrics` serves the agent's Prometheus registry.
 - `GET /containerLogs/{namespace}/{pod}/{container}` reads the current CRI
   log file. It supports `follow`, `tailLines` (at most 100,000), `limitBytes`,
-  `timestamps`, `sinceSeconds`, and `sinceTime`. Every response, including a
-  follow session, stops at 128 MiB. `previous=true` is refused because Brie
+  `timestamps`, `sinceSeconds`, and `sinceTime`. A `tailLines` start beyond
+  the 64 MiB backward scan bound is refused with HTTP 422 before any output.
+  Every response, including a follow session, stops at 128 MiB. `previous=true` is refused because Brie
   never restarts containers. Rotated files are not read, except that a follow
   session drains the file being rotated before switching to the new one.
 - `/exec/{namespace}/{pod}/{container}` and
-  `/attach/{namespace}/{pod}/{container}` call CRI `Exec` or `Attach`;
+  `/attach/{namespace}/{pod}/{container}` call CRI `Exec` or `Attach` with
+  kubelet's `input`, `output`, `error`, `tty`, and repeated `command` query
+  parameters;
   `/portForward/{namespace}/{pod}` calls CRI `PortForward` with optional
   `port`/`ports` parameters (at most 16). Brie proxies the session to the
   runtime's streaming URL instead of redirecting, refuses URLs that are not
@@ -83,6 +86,12 @@ a sandbox in any recorded state other than `Running` is refused with HTTP 409
 and the state name, and an unavailable state is refused with HTTP 503. The
 server never resumes, pauses, or otherwise mutates a sandbox. Brie has no
 lifecycle extension yet, so no state source exists in this build.
+
+Server log records for failed requests carry an operation name and a bounded
+error code (a gRPC code, `HTTP<status>` for API server errors, `FileError`,
+`NetworkError`, `Canceled`, `DeadlineExceeded`, or `Unknown`), never the text of
+runtime, streaming proxy, or review errors, which can echo commands or
+credentials.
 
 Not implemented: `/stats`, `/logs`, `/pods`, `/configz`, `/checkpoint`, the
 UID forms of the streaming paths, serving certificate rotation, and caching of

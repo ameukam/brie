@@ -4,6 +4,7 @@
 package serving
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -53,7 +54,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/apis/authentication.k8s.io/v1/tokenreviews":
 		var review authenticationv1.TokenReview
 		if err := json.NewDecoder(r.Body).Decode(&review); err != nil || f.failTR {
-			http.Error(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":500}`, http.StatusInternalServerError)
+			http.Error(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":500,"message":"echo `+canarySecret+`"}`, http.StatusInternalServerError)
 			return
 		}
 		f.tokenAt = append(f.tokenAt, review.Spec)
@@ -69,7 +70,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.reviews = append(f.reviews, review.Spec)
 		if f.failSAR[review.Spec.ResourceAttributes.Subresource] {
-			http.Error(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":500}`, http.StatusInternalServerError)
+			http.Error(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","code":500,"message":"echo `+canarySecret+`"}`, http.StatusInternalServerError)
 			return
 		}
 		review.Status.Allowed = f.allow != nil && f.allow(*review.Spec.ResourceAttributes, review.Spec.User)
@@ -148,6 +149,28 @@ func (f *fakeRuntime) url() (*url.URL, error) {
 		return nil, f.streamErr
 	}
 	return url.Parse(f.streamURL)
+}
+
+// canarySecret stands for tenant data or a credential that backend errors
+// may echo; it must never reach agent logs.
+const canarySecret = "canary-secret-7f3a9c"
+
+// syncBuffer collects agent log output for assertions.
+type syncBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 
 const (
