@@ -65,6 +65,15 @@ func newOwner(t *testing.T, launch Launcher) *Owner {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		// The exit watcher journals the exit after the process cleanup runs,
+		// which would race the removal of the TempDir holding the journal.
+		if o.Status().State == Running {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := o.Stop(ctx); err != nil {
+				t.Error(err)
+			}
+		}
 		state := o.Status().State
 		if state == Idle || state == Exited {
 			if err := o.Close(); err != nil {
