@@ -13,6 +13,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"os"
@@ -25,6 +27,8 @@ import (
 	"github.com/ameukam/brie/internal/events"
 	"github.com/ameukam/brie/internal/metrics"
 	"github.com/ameukam/brie/internal/nodeagent"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -160,7 +164,7 @@ func TestRunExecutionWiresServices(t *testing.T) {
 	execution := nodeagent.ExecutionConfig{
 		RuntimeClass: "kata-fc", RuntimeHandler: "kata-fc", CPU: "4", Memory: "8Gi", MaxPods: 10,
 		NodeIP: "192.0.2.10", ClusterDNS: "10.96.0.10", ClusterDomain: "cluster.local",
-		StateDir: filepath.Join(dir, "state"), LogDir: filepath.Join(dir, "logs"),
+		StateDir: filepath.Join(dir, "state"), LogDir: filepath.Join(dir, "logs"), Probes: true,
 	}
 	node := nodeagent.Config{NodeName: "node-1", RuntimeSocket: filepath.Join(dir, "missing.sock")}
 	options := &observabilityOptions{
@@ -217,4 +221,118 @@ func TestBudget(t *testing.T) {
 	if cpu, memory := budgetMillicoresAndBytes(nodeagent.ExecutionConfig{CPU: "x"}); cpu != 0 || memory != 0 {
 		t.Fatal("invalid budget parsed")
 	}
+}
+
+// TestPodHooksFeedMetricsAndEvents covers every executor decision hook: the
+// metrics it feeds and the Event it records, without tenant data.
+func TestPodHooksFeedMetricsAndEvents(t *testing.T) {
+	t.Parallel()
+	client := fake.NewClientset()
+	registry := metrics.New(nil)
+	recorder := events.New(t.Context(), client, "node-1", events.Options{Observe: registry.Event})
+	defer recorder.Shutdown()
+	var hooks nodeagent.ExecutionHooks
+	addPodHooks(&hooks, registry, recorder)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web", UID: "uid-1"}}
+	for _, tt := range []struct {
+		name   string
+		call   func()
+		reason string
+	}{
+		{"admitted", func() { hooks.Admission(pod, nodeagent.AdmissionAdmitted, "") }, ""},
+		{"refused", func() {
+			hooks.Admission(pod, "InsufficientResources", "Configured CPU, memory, or Pod budget exhausted")
+		}, "InsufficientResources"},
+		{"pull failed", func() { hooks.ImagePullFailed(pod, false, "NotFound") }, events.ReasonImagePullFailed},
+		{"pull backoff", func() { hooks.ImagePullFailed(pod, true, "NotFound") }, events.ReasonImagePullBackOff},
+		{"blocked", func() { hooks.ExecutionBlocked(pod, "ExecutionConfigChanged", "delete the Pod to replace it") }, "ExecutionConfigChanged"},
+		{"cleanup", func() { hooks.CleanupBlocked(pod, "Cleanup waits for positive deletion evidence") }, events.ReasonCleanupBlocked},
+		{"liveness", func() { hooks.LivenessFailed(pod, "Liveness probe failed") }, events.ReasonLivenessProbeFailed},
+		{"probe result", func() { hooks.ProbeResult("liveness", "exec", "failure") }, ""},
+		{"journal", func() {
+			hooks.Journal(nodeagent.JournalState{Records: 3, Bytes: 2048, ReservedCPUMillicores: 1500,
+				ReservedMemoryBytes: 1 << 20, ReservedExecutions: 2, PendingSince: map[string]time.Time{"reserved": {}}})
+		}, ""},
+	} {
+		tt.call()
+		if tt.reason == "" {
+			continue
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			list, err := client.CoreV1().Events("team").List(t.Context(), metav1.ListOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, event := range list.Items {
+				found = found || event.Reason == tt.reason && event.InvolvedObject.UID == "uid-1"
+				if strings.Contains(event.Message, "registry.example") {
+					t.Fatalf("%s: Event carries an image reference: %q", tt.name, event.Message)
+				}
+			}
+			if found {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: no %s Event in %v", tt.name, tt.reason, list.Items)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	samples := gatherSamples(t, registry)
+	for name, want := range map[string]float64{
+		`brie_node_admission_decisions_total{reason="Admitted"}`:                          1,
+		`brie_node_admission_decisions_total{reason="InsufficientResources"}`:             1,
+		`brie_node_probe_results_total{handler="exec",probe="liveness",result="failure"}`: 1,
+		"brie_node_reserved_cpu_cores":                                                    1.5,
+		"brie_node_reserved_executions":                                                   2,
+		"brie_node_journal_records":                                                       3,
+		"brie_node_journal_bytes":                                                         2048,
+	} {
+		if got, found := samples[name]; !found || got != want {
+			t.Errorf("%s = %v (found %v), want %v", name, got, found, want)
+		}
+	}
+	if got, found := samples[`brie_node_oldest_pending_stage_age_seconds{stage="reserved"}`]; !found || !math.IsNaN(got) {
+		t.Errorf("unknown pending age = %v (found %v), want NaN", got, found)
+	}
+	// Without a registry, only Events are recorded; without a recorder, only metrics.
+	var eventsOnly, metricsOnly nodeagent.ExecutionHooks
+	addPodHooks(&eventsOnly, nil, recorder)
+	addPodHooks(&metricsOnly, registry, nil)
+	eventsOnly.Admission(pod, "UnsupportedPod", "unsupported")
+	metricsOnly.Admission(pod, "UnsupportedPod", "unsupported")
+	if eventsOnly.Journal != nil || metricsOnly.ImagePullFailed != nil {
+		t.Fatal("hooks installed without their sink")
+	}
+}
+
+// gatherSamples returns gauge and counter values by "name{labels}".
+func gatherSamples(t *testing.T, registry *metrics.Metrics) map[string]float64 {
+	t.Helper()
+	families, err := registry.Gatherer().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples := make(map[string]float64)
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			var labels []string
+			for _, label := range metric.GetLabel() {
+				labels = append(labels, fmt.Sprintf("%s=%q", label.GetName(), label.GetValue()))
+			}
+			name := family.GetName()
+			if len(labels) != 0 {
+				name += "{" + strings.Join(labels, ",") + "}"
+			}
+			switch {
+			case metric.GetGauge() != nil:
+				samples[name] = metric.GetGauge().GetValue()
+			case metric.GetCounter() != nil:
+				samples[name] = metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return samples
 }

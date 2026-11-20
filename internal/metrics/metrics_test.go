@@ -127,14 +127,57 @@ func TestAges(t *testing.T) {
 		t.Fatal("pending age reported with nothing pending")
 	}
 	m.PassCompleted(now.Add(-30 * time.Second))
-	m.SetPendingStages(map[string]time.Time{"sandbox-pending": now.Add(-5 * time.Second), "running": now})
+	m.SetPendingStages(map[string]time.Time{"sandbox-pending": now.Add(-5 * time.Second), "running": now, "reserved": {}})
 	got = samples(t, m)
 	expect(t, got, map[string]string{
 		"brie_node_last_complete_reconcile_age_seconds":                       "30",
 		`brie_node_oldest_pending_stage_age_seconds{stage="sandbox-pending"}`: "5",
+		// A pending record with an unknown entry time is reported as unknown, not as zero.
+		`brie_node_oldest_pending_stage_age_seconds{stage="reserved"}`: "NaN",
 	})
-	if n := count(got, "brie_node_oldest_pending_stage_age_seconds"); n != 1 {
+	if n := count(got, "brie_node_oldest_pending_stage_age_seconds"); n != 2 {
 		t.Fatalf("pending series = %d", n)
+	}
+}
+
+// TestUnobservedGaugesAreAbsent is a regression test for DESIGN 12.1: a gauge
+// that was never set is not exported as a fresh zero.
+func TestUnobservedGaugesAreAbsent(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		set     func(*Metrics)
+		present []string
+		absent  []string
+	}{
+		{name: "none", set: func(*Metrics) {},
+			absent: []string{"brie_node_reserved_", "brie_node_budget_", "brie_node_journal_"}},
+		{name: "reservations", set: func(m *Metrics) { m.SetReservations(0, 0, 0) },
+			present: []string{"brie_node_reserved_cpu_cores", "brie_node_reserved_memory_bytes", "brie_node_reserved_executions"},
+			absent:  []string{"brie_node_budget_", "brie_node_journal_"}},
+		{name: "budget", set: func(m *Metrics) { m.SetBudget(1000, 1, 1) },
+			present: []string{"brie_node_budget_cpu_cores", "brie_node_budget_memory_bytes", "brie_node_budget_executions"},
+			absent:  []string{"brie_node_reserved_", "brie_node_journal_"}},
+		{name: "journal", set: func(m *Metrics) { m.SetJournal(0, 0); m.SetJournal(1, 2) },
+			present: []string{"brie_node_journal_records", "brie_node_journal_bytes_limit"},
+			absent:  []string{"brie_node_reserved_", "brie_node_budget_"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			m := New(nil)
+			test.set(m)
+			got := samples(t, m)
+			for _, name := range test.present {
+				if _, found := got[name]; !found {
+					t.Errorf("%s missing after it was set", name)
+				}
+			}
+			for _, prefix := range test.absent {
+				if n := count(got, prefix); n != 0 {
+					t.Errorf("%s* exported %d samples before any observation", prefix, n)
+				}
+			}
+		})
 	}
 }
 

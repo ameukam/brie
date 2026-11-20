@@ -64,17 +64,19 @@ func TestRecorderEmitsBoundedEvents(t *testing.T) {
 	pod := testPod()
 	recorder.PodRefused(pod, "InsufficientResources", "CPU budget exhausted")
 	recorder.ImagePullFailed(pod, "pull failed: NotFound")
+	recorder.ImagePullBackOff(pod, "back-off after NotFound")
+	recorder.ExecutionBlocked(pod, "ExecutionConfigChanged", "spec changed")
 	recorder.CleanupBlocked(pod, "waiting for positive deletion evidence")
 	recorder.ProbeFailed(pod, true, "liveness probe failed 3 times")
 	recorder.ProbeFailed(pod, false, "readiness probe failed")
 	recorder.BarrierRaised("UnresolvedExecution")
 	recorder.BarrierLowered()
-	podEvents := waitEvents(t, client, "team", 5)
+	podEvents := waitEvents(t, client, "team", 7)
 	reasons := map[string]corev1.Event{}
 	for _, event := range podEvents {
 		reasons[event.Reason] = event
 	}
-	for _, reason := range []string{"InsufficientResources", ReasonImagePullFailed, ReasonCleanupBlocked, ReasonLivenessProbeFailed, ReasonReadinessProbeFailed} {
+	for _, reason := range []string{"InsufficientResources", ReasonImagePullFailed, ReasonImagePullBackOff, "ExecutionConfigChanged", ReasonCleanupBlocked, ReasonLivenessProbeFailed, ReasonReadinessProbeFailed} {
 		event, found := reasons[reason]
 		if !found {
 			t.Fatalf("missing Pod Event %s in %v", reason, podEvents)
@@ -90,7 +92,7 @@ func TestRecorderEmitsBoundedEvents(t *testing.T) {
 			t.Fatalf("node event = %+v", event.InvolvedObject)
 		}
 	}
-	if counts.get("recorded") != 7 {
+	if counts.get("recorded") != 9 {
 		t.Fatalf("recorded = %d", counts.get("recorded"))
 	}
 }

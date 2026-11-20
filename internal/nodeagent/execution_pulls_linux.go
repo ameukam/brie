@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/ameukam/brie/internal/cri"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,6 +53,8 @@ type imagePull struct {
 	failures int
 	next     time.Time
 	err      string
+	// code is the gRPC code name of the last failure.
+	code string
 	// waiters maps a Pod UID to the waiting reason last returned for it. A
 	// failed attempt clears the reasons so each waiter reports ErrImagePull
 	// once before ImagePullBackOff.
@@ -160,6 +164,7 @@ func (p *imagePuller) pull(ctx context.Context, image string, sandbox *runtimeap
 		pull.next = time.Now().Add(pullBackoff(pull.failures))
 		pull.failures++
 		pull.err = pullMessage(err)
+		pull.code = pullCode(err)
 		for uid := range pull.waiters {
 			pull.waiters[uid] = ""
 		}
@@ -198,6 +203,25 @@ func (p *imagePuller) retain(keep func(uid string) bool) {
 			delete(p.pulls, image)
 		}
 	}
+}
+
+// failureCode returns the gRPC code name of the last failed pull of image.
+func (p *imagePuller) failureCode(image string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if pull := p.pulls[image]; pull != nil {
+		return pull.code
+	}
+	return codes.Unknown.String()
+}
+
+// pullCode is the gRPC code name of a pull error; Events carry it instead of
+// the runtime's error text.
+func pullCode(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return codes.DeadlineExceeded.String()
+	}
+	return status.Code(err).String()
 }
 
 // collectionView reports whether any pull is running and returns the image
@@ -239,7 +263,13 @@ func (e *executor) imageReady(ctx context.Context, runtime *cri.Client, pod *cor
 	if ready {
 		return true, nil
 	}
-	return false, e.publishImageWaiting(ctx, pod, reason, message)
+	if err := e.publishImageWaiting(ctx, pod, reason, message); err != nil {
+		return false, err
+	}
+	if reason == reasonErrPull || reason == reasonPullBackOff {
+		e.hooks.imagePullFailed(pod, reason == reasonPullBackOff, e.pulls.failureCode(image))
+	}
+	return false, nil
 }
 
 // publishImageWaiting reports a Pending Pod whose container waits for its

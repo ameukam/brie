@@ -35,6 +35,10 @@ type ExecutionConfig struct {
 	// above which unreferenced images are removed through CRI. Empty
 	// disables image collection.
 	ImageGCThreshold string
+	// Probes accepts the ProfileProbes increment: readiness and liveness
+	// probes run for running containers, Ready waits for readiness success,
+	// and a liveness failure stops the container and fails the Pod.
+	Probes bool
 }
 
 // Validate rejects incomplete execution configuration before contacting services.

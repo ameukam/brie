@@ -95,6 +95,12 @@ type Metrics struct {
 	logRotations      *prometheus.CounterVec
 	events            *prometheus.CounterVec
 
+	// The reservation, budget, and journal gauges are registered by their
+	// first Set, so a value that was never observed is absent, not zero.
+	reservationsOnce sync.Once
+	budgetOnce       sync.Once
+	journalOnce      sync.Once
+
 	mu            sync.Mutex
 	lastPass      time.Time
 	pendingOldest map[string]time.Time
@@ -153,9 +159,7 @@ func New(now func() time.Time) *Metrics {
 		Namespace: namespace, Name: "events_total", Help: "Kubernetes Events by result after deduplication and rate limits.",
 	}, []string{"result"})
 	m.registry.MustRegister(
-		m.admissions, m.reservedCPU, m.reservedMemory, m.reservedPods, m.budgetCPU, m.budgetMemory, m.budgetPods,
-		m.barrier, m.criDuration, m.criErrors, m.pullDuration, m.pullFailures,
-		m.journalRecords, m.journalBytes, m.journalRecordsMax, m.journalBytesMax, m.leaseFailures,
+		m.admissions, m.barrier, m.criDuration, m.criErrors, m.pullDuration, m.pullFailures, m.leaseFailures,
 		m.probeResults, m.logRotations, m.events, &ageCollector{m: m},
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -178,6 +182,7 @@ func (m *Metrics) AdmissionDecision(reason string) {
 
 // SetReservations records reserved CPU millicores, memory bytes, and executions.
 func (m *Metrics) SetReservations(cpuMillicores, memoryBytes int64, executions int) {
+	m.reservationsOnce.Do(func() { m.registry.MustRegister(m.reservedCPU, m.reservedMemory, m.reservedPods) })
 	m.reservedCPU.Set(float64(cpuMillicores) / 1000)
 	m.reservedMemory.Set(float64(memoryBytes))
 	m.reservedPods.Set(float64(executions))
@@ -185,6 +190,7 @@ func (m *Metrics) SetReservations(cpuMillicores, memoryBytes int64, executions i
 
 // SetBudget records the configured envelope.
 func (m *Metrics) SetBudget(cpuMillicores, memoryBytes int64, maxPods int) {
+	m.budgetOnce.Do(func() { m.registry.MustRegister(m.budgetCPU, m.budgetMemory, m.budgetPods) })
 	m.budgetCPU.Set(float64(cpuMillicores) / 1000)
 	m.budgetMemory.Set(float64(memoryBytes))
 	m.budgetPods.Set(float64(maxPods))
@@ -216,7 +222,9 @@ func (m *Metrics) PassCompleted(at time.Time) {
 }
 
 // SetPendingStages records, per pending stage, when its oldest record entered
-// it. Stages absent from oldest have no pending record; unknown stages are ignored.
+// it. Stages absent from oldest have no pending record; unknown stages are
+// ignored. A zero time means a pending record's entry time is unknown, and the
+// stage's age is reported as NaN.
 func (m *Metrics) SetPendingStages(oldest map[string]time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -273,6 +281,9 @@ const (
 
 // SetJournal records the journal's size against its bounds.
 func (m *Metrics) SetJournal(records, bytes int) {
+	m.journalOnce.Do(func() {
+		m.registry.MustRegister(m.journalRecords, m.journalBytes, m.journalRecordsMax, m.journalBytesMax)
+	})
 	m.journalRecords.Set(float64(records))
 	m.journalBytes.Set(float64(bytes))
 	m.journalRecordsMax.Set(JournalRecordsLimit)
@@ -321,7 +332,7 @@ var (
 	lastPassDesc = prometheus.NewDesc(namespace+"_last_complete_reconcile_age_seconds",
 		"Seconds since the last reconciliation pass completed without errors; NaN before the first.", nil, nil)
 	pendingDesc = prometheus.NewDesc(namespace+"_oldest_pending_stage_age_seconds",
-		"Age of the oldest journal record in each pending stage; no sample when none is pending.", []string{"stage"}, nil)
+		"Age of the oldest journal record in each pending stage; NaN when an entry time is unknown, no sample when none is pending.", []string{"stage"}, nil)
 )
 
 // ageCollector computes ages at scrape time so they grow while nothing changes.
@@ -344,7 +355,11 @@ func (c *ageCollector) Collect(samples chan<- prometheus.Metric) {
 	samples <- prometheus.MustNewConstMetric(lastPassDesc, prometheus.GaugeValue, age)
 	for _, stage := range PendingStages {
 		if at, found := m.pendingOldest[stage]; found {
-			samples <- prometheus.MustNewConstMetric(pendingDesc, prometheus.GaugeValue, now.Sub(at).Seconds(), stage)
+			age := math.NaN()
+			if !at.IsZero() {
+				age = now.Sub(at).Seconds()
+			}
+			samples <- prometheus.MustNewConstMetric(pendingDesc, prometheus.GaugeValue, age, stage)
 		}
 	}
 }
