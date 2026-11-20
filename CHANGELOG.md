@@ -7,6 +7,10 @@ versioning. Dated nightly prereleases are development builds, not stable release
 
 ### Added
 
+- A bounded Kubernetes Events recorder (`internal/events`) for admission
+  refusals, image pull failures, barrier entry and exit, blocked cleanup, and
+  probe failures, with local deduplication, an agent-wide rate limit, and
+  client-go correlation. It needs no RBAC beyond the Node authorizer.
 - An agent Prometheus registry (`internal/metrics`) for admission decisions,
   reservations against the budget, reconciliation pass age, barrier cause,
   pending stage age, CRI latency and errors by method, image pulls, journal
