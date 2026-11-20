@@ -345,8 +345,7 @@ func (e *executor) reconcilePass(ctx context.Context, wait bool) error {
 		e.pulls.wait()
 	}
 	faulted = e.workers.outstanding(func(uid string) bool {
-		record := e.record(uid)
-		return byUID[uid] != nil || record != nil && record.Stage != "finished"
+		return byUID[uid] != nil || e.unfinished(uid)
 	})
 	if faulted || passFailed {
 		e.recovery.Store(true)
@@ -400,6 +399,16 @@ func (e *executor) record(uid string) *executionRecord {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.journal.Records[uid]
+}
+
+// unfinished reports whether uid has a journal record that is not finished.
+// It reads the stage under e.mu because an operation still in flight for uid
+// may commit a new stage concurrently.
+func (e *executor) unfinished(uid string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	record := e.journal.Records[uid]
+	return record != nil && record.Stage != "finished"
 }
 
 // commit applies change, which may modify only record, and durably saves the
