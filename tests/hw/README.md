@@ -94,6 +94,10 @@ stockout, or on any other failure after the first create, provisioning aborts
 and runs `teardown.sh`. The inventory is written to
 `$HW_LOG_DIR/inventory.tsv`; a second run with the same log directory refuses.
 
+The bucket and boot disks receive their labels in a second call after creation.
+If that call fails, teardown refuses the unlabelled resource and provisioning
+reports `TEARDOWN INCOMPLETE`; delete it by hand after checking it.
+
 ## Fencing (D5)
 
 `fence.sh INSTANCE ZONE` is the provisional lab fence for DESIGN.md section
