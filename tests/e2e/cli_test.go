@@ -30,11 +30,11 @@ func TestCLI(t *testing.T) {
 	} {
 		t.Run(build.name, func(t *testing.T) {
 			binary := filepath.Join(t.TempDir(), "brie-node")
-			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-			defer cancel()
 			args := append([]string{"build", "-trimpath", "-o", binary}, build.flags...)
 			args = append(args, "./cmd/brie-node")
-			cmd := exec.CommandContext(ctx, "go", args...)
+			// A cold build on a loaded CI runner can take more than a minute;
+			// the go test -timeout bounds it instead.
+			cmd := exec.CommandContext(t.Context(), "go", args...)
 			cmd.Dir = filepath.Join("..", "..")
 			if output, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("build CLI: %v\n%s", err, output)
