@@ -129,7 +129,9 @@ version, malformed digests, and duplicate records. Check a file locally with
 
 `run-on-host.sh INSTANCE ZONE SCRIPT [FILE...]` refuses instances without the
 run label, copies the script, `checksums.sh`, and the input files over IAP
-SSH, and runs the script as root. It forwards `NODE_NAME`, `POD_CIDR`,
+SSH into a fresh `mktemp -d /tmp/brie-hw-$RUN_ID.XXXXXXXXXX` directory, and
+runs the script as root only after checking that the directory is not a
+symlink and is owned by the SSH user with mode 0700. It forwards `NODE_NAME`, `POD_CIDR`,
 `SERVICE_CIDR`, and `ADVERTISE_ADDRESS` when set, and refuses values outside
 `[A-Za-z0-9./_-]`.
 
