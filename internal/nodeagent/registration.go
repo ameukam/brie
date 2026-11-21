@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -133,9 +134,18 @@ func register(ctx context.Context, config Config, nodes coreclient.NodeInterface
 }
 
 func heartbeat(ctx context.Context, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, name string, uid types.UID) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return apierrors.IsConflict(err) || isStaleTaintRejection(err)
+	}, func() error {
 		return heartbeatOnce(ctx, nodes, leases, name, uid)
 	})
+}
+
+// isStaleTaintRejection reports NodeRestriction refusing a status update whose
+// Node spec predates a controller adding a taint, such as not-ready. The status
+// update changes no taints, so it is safe to reread the Node and retry.
+func isStaleTaintRejection(err error) bool {
+	return apierrors.IsForbidden(err) && strings.Contains(err.Error(), "is not allowed to modify taints")
 }
 
 func heartbeatOnce(ctx context.Context, nodes coreclient.NodeInterface, leases coordinationclient.LeaseInterface, name string, uid types.UID) error {

@@ -287,11 +287,14 @@ func TestHeartbeatConflictRetries(t *testing.T) {
 		name       string
 		persistent bool
 		replace    bool
+		forbidden  string
 		wantCalls  int
 	}{
 		{name: "transient status conflict", wantCalls: 2},
 		{name: "persistent status conflict", persistent: true, wantCalls: 5},
 		{name: "identity changes after conflict", replace: true, wantCalls: 1},
+		{name: "stale taints rejected by NodeRestriction", forbidden: `node "worker-1" is not allowed to modify taints`, wantCalls: 2},
+		{name: "other forbidden status update", forbidden: "status writes are denied", wantCalls: 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client := fake.NewClientset(testNode())
@@ -309,6 +312,9 @@ func TestHeartbeatConflictRetries(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
+					if tt.forbidden != "" {
+						return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "worker-1", errors.New(tt.forbidden))
+					}
 					return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, "worker-1", errors.New("changed"))
 				}
 				return false, nil, nil
@@ -322,6 +328,10 @@ func TestHeartbeatConflictRetries(t *testing.T) {
 			case tt.replace:
 				if err == nil || !strings.Contains(err.Error(), "changed identity") {
 					t.Fatalf("expected identity refusal, got %v", err)
+				}
+			case tt.forbidden != "" && tt.wantCalls == 1:
+				if !apierrors.IsForbidden(err) {
+					t.Fatalf("expected forbidden status update, got %v", err)
 				}
 			case err != nil:
 				t.Fatal(err)

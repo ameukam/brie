@@ -53,6 +53,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - Registration heartbeats preserve externally managed Node conditions and status.
 - Retry bounded Node/Lease resource-version conflicts during registration
   heartbeats, revalidating Node identity and scheduling guards on each attempt.
+- Registration heartbeats also retry when NodeRestriction rejects a status
+  update because a controller tainted the Node after it was read, instead of
+  exiting.
 - Reduced the README to an abstract ten-word sentence.
 
 [Unreleased]: https://github.com/ameukam/brie/commits/main
