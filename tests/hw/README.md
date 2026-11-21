@@ -137,7 +137,8 @@ It installs containerd 2.4.2, Kata 4.3.1 (whose Firecracker must report
 `/etc/brie/hw-digests.sha256` from the operator's `binary` records; and verifies
 `firecracker`, `jailer`, `containerd-shim-kata-v2`, and `kata-runtime` against
 it before configuring containerd. Re-verify later with
-`install-host.sh --verify-manifest`. It configures a `kata-fc` runtime on a
+`install-host.sh --verify-manifest`, which first requires the manifest to list
+each of those four `/opt/kata/bin` paths exactly once and nothing else. It configures a `kata-fc` runtime on a
 loopback devmapper thin pool (16 GiB data, 256 MiB metadata, recreated at boot)
 and a bridge CNI template filled from the Pod CIDR Brie sends through CRI. It
 records the Kata Firecracker settings `jailer_path` and
