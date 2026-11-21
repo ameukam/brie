@@ -493,3 +493,51 @@ func TestRunOnHostStagingDirectory(t *testing.T) {
 		})
 	}
 }
+
+// TestInstallHostContainerdConfig checks the containerd configuration that
+// install-host.sh writes. Each table entry is a regression found on hardware.
+func TestInstallHostContainerdConfig(t *testing.T) {
+	data, err := os.ReadFile("install-host.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, config, opened := strings.Cut(string(data), "cat >/etc/containerd/config.toml <<TOML\n")
+	config, _, closed := strings.Cut(config, "\nTOML\n")
+	if !opened || !closed {
+		t.Fatal("install-host.sh writes no containerd config.toml here-document")
+	}
+	config += "\n"
+	for _, tt := range []struct {
+		name  string
+		table string
+		want  []string
+	}{
+		{
+			name:  "kata-fc runtime on devmapper",
+			table: "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata-fc]",
+			want:  []string{"runtime_type = 'io.containerd.kata.v2'", "snapshotter = 'devmapper'"},
+		},
+		{
+			// containerd 2.4.2 otherwise fails RunPodSandbox with "no unpack
+			// platforms defined" when pulling the pause image for kata-fc.
+			name:  "kata-fc unpack platform",
+			table: "[plugins.'io.containerd.cri.v1.images'.runtime_platforms.kata-fc]",
+			want:  []string{"platform = 'linux/arm64'", "snapshotter = 'devmapper'"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, body, found := strings.Cut(config, tt.table+"\n")
+			if !found {
+				t.Fatalf("config.toml lacks %s", tt.table)
+			}
+			if next := strings.Index(body, "\n["); next >= 0 {
+				body = body[:next]
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(body, "  "+want+"\n") {
+					t.Errorf("%s lacks %q:\n%s", tt.table, want, body)
+				}
+			}
+		})
+	}
+}

@@ -160,7 +160,10 @@ It installs containerd 2.4.2, Kata 4.3.1 (whose Firecracker must report
 it before configuring containerd. Re-verify later with
 `install-host.sh --verify-manifest`, which first requires the manifest to list
 each of those four `/opt/kata/bin` paths exactly once and nothing else. It configures a `kata-fc` runtime on a
-loopback devmapper thin pool (16 GiB data, 256 MiB metadata, recreated at boot)
+loopback devmapper thin pool (16 GiB data, 256 MiB metadata, recreated at boot),
+a CRI `runtime_platforms.kata-fc` entry (`linux/arm64` on `devmapper`) without
+which containerd cannot unpack the pause image for `kata-fc` and
+`RunPodSandbox` fails with `no unpack platforms defined`,
 and a bridge CNI template filled from the Pod CIDR Brie sends through CRI. It
 records the Kata Firecracker settings `jailer_path` and
 `disable_guest_seccomp` without changing them. Evidence goes to

@@ -276,5 +276,9 @@ versioning. Dated nightly prereleases are development builds, not stable release
   `Pending` while its container ran and its liveness failure was never
   enforced. A pass now starts operations least recently started first, so every
   Pod with pending work starts within a bounded number of passes.
+- The hardware lab's `install-host.sh` configures a CRI image unpack platform
+  (`linux/arm64` on `devmapper`) for the `kata-fc` runtime. Without it,
+  containerd 2.4.2 failed `RunPodSandbox` with `no unpack platforms defined`
+  when pulling the pause image.
 
 [Unreleased]: https://github.com/ameukam/brie/commits/main
