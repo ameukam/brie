@@ -220,7 +220,12 @@ its `brie.dev/runtime` taint, and every other node must keep the kubeadm
 control-plane taint with a `NoSchedule` or `NoExecute` effect
 (`PreferNoSchedule` is refused), so test Pods cannot silently run on a kubelet
 node. `--check-nodes NODES_JSON` applies the same check to a saved inventory.
-Test-Pod placement itself is not recorded. It then runs `e2e.test` with
+During the run a `kubectl get pods --all-namespaces --watch` records every
+Pod binding in `pod-placement.txt`. Afterwards every Pod outside the `kube-*`
+namespaces must have been bound to the Brie node and at least one must have
+been; a misplaced Pod, no observed Pod, or a watch that ended before the suite
+fails the run (`placement.txt` holds the verdict, and
+`--check-placement FILE` rechecks a saved record). It then runs `e2e.test` with
 `--ginkgo.focus='\[NodeConformance\]'` and no skip filter.
 `--non-blocking-taints` includes the Brie taint only so the suite can start.
 
