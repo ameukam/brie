@@ -49,6 +49,10 @@ type phase int
 const (
 	phaseActive phase = iota
 	phasePrepared
+	// phaseAbortPending follows an invalid safe point whose cleanup abort
+	// failed: admission may still be closed, so only a successful abort of
+	// the recorded operation returns to phaseActive.
+	phaseAbortPending
 )
 
 // Supervisor is the state machine between the host protocol and a Workload.
@@ -100,11 +104,14 @@ func (s *Supervisor) Handle(ctx context.Context, request Request) Response {
 }
 
 func (s *Supervisor) prepare(ctx context.Context, request PrepareRequest) Response {
-	if s.phase == phasePrepared {
+	switch s.phase {
+	case phasePrepared:
 		if request.OperationID == s.operationID && request.Epoch == s.epoch {
 			return safePoint(s.operationID, s.safePoint)
 		}
 		return refusal(request.OperationID, "another operation is prepared")
+	case phaseAbortPending:
+		return refusal(request.OperationID, abortPendingReason)
 	}
 	if request.Epoch < s.epoch {
 		return refusal(request.OperationID, "stale epoch")
@@ -128,7 +135,9 @@ func (s *Supervisor) prepare(ctx context.Context, request PrepareRequest) Respon
 	}
 	if err := (Response{Version: ProtocolVersion, Outcome: OutcomeSafePoint, OperationID: request.OperationID, SafePoint: &point}).Validate(); err != nil {
 		if abortErr := s.workload.Abort(ctx, request.OperationID); abortErr != nil {
-			// The workload may still be closed; report it rather than resume.
+			// The workload may still be closed; keep the operation until an
+			// abort of it succeeds.
+			s.phase, s.operationID, s.epoch = phaseAbortPending, request.OperationID, request.Epoch
 			return refusal(request.OperationID, "invalid safe point and abort failed")
 		}
 		return refusal(request.OperationID, "invalid safe point")
@@ -138,6 +147,9 @@ func (s *Supervisor) prepare(ctx context.Context, request PrepareRequest) Respon
 }
 
 func (s *Supervisor) resume(ctx context.Context, request ResumeRequest) Response {
+	if s.phase == phaseAbortPending {
+		return refusal(request.OperationID, abortPendingReason)
+	}
 	if s.phase != phasePrepared {
 		if s.lastResume != nil && sameExecution(*s.lastResume, request) {
 			return Response{Version: ProtocolVersion, Outcome: OutcomeReady, OperationID: request.OperationID}
@@ -162,12 +174,15 @@ func (s *Supervisor) resume(ctx context.Context, request ResumeRequest) Response
 }
 
 func (s *Supervisor) abort(ctx context.Context, operationID string) Response {
-	if s.phase != phasePrepared || operationID != s.operationID {
+	if s.phase == phaseActive || operationID != s.operationID {
 		if s.lastResume != nil && operationID == s.lastResume.OperationID {
 			return refusal(operationID, "operation already resumed")
 		}
-		if s.phase == phasePrepared {
+		switch s.phase {
+		case phasePrepared:
 			return refusal(operationID, "another operation is prepared")
+		case phaseAbortPending:
+			return refusal(operationID, abortPendingReason)
 		}
 		// Nothing is prepared under this ID, so admission is already open.
 		return Response{Version: ProtocolVersion, Outcome: OutcomeAborted, OperationID: operationID}
@@ -185,6 +200,9 @@ func sameExecution(a, b ResumeRequest) bool {
 	return a.OperationID == b.OperationID && a.SandboxUID == b.SandboxUID &&
 		a.PodUID == b.PodUID && a.Epoch == b.Epoch
 }
+
+// abortPendingReason refuses requests while phaseAbortPending lasts.
+const abortPendingReason = "an earlier operation awaits a successful abort"
 
 func safePoint(operationID string, point SafePoint) Response {
 	return Response{Version: ProtocolVersion, Outcome: OutcomeSafePoint, OperationID: operationID, SafePoint: &point}
