@@ -90,10 +90,16 @@ metal host gets a labelled persistent data disk attached as `brie-data`.
 Optional settings: `BOOT_DISK_GB` (100), `DATA_DISK_GB` (200), `SUBNET_RANGE`
 (`10.200.0.0/20`), `POD_RANGE` (`10.244.0.0/16`), `STOCKOUT_RETRY_SECONDS` (60).
 
+Before any create, `provision.sh` runs `verify-empty.sh` and refuses the run if
+anything with its label or prefix already exists or a list fails, whatever the
+log directory. Creating the run's network is its exclusive claim: a
+concurrent or repeated invocation fails that create and exits without
+deleting anything.
+
 An instance create that fails with a stockout in `ZONE` is retried in `ZONE2`,
 then both are retried after the retry interval. After 45 minutes of total
-stockout, or on any other failure after the first create, provisioning aborts
-and runs `teardown.sh`. The inventory is written to
+stockout, or on any other failure after this invocation created the network,
+provisioning aborts and runs `teardown.sh`. The inventory is written to
 `$HW_LOG_DIR/inventory.tsv`; a second run with the same log directory refuses.
 
 The bucket and boot disks receive their labels in a second call after creation.
