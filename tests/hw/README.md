@@ -79,8 +79,19 @@ fixed-overhead <USD per hour for the bucket, NAT data, egress, and anything else
 ```
 
 The script refuses the whole plan before any create if the projected hourly
-rate times `PLANNED_HOURS` exceeds `SPEND_CEILING_USD`, and checks the running
-total again before each priced create. It creates a custom-mode VPC, one
+rate, held for `PLANNED_HOURS` plus the 46-minute worst case of stockout
+retries (the 45-minute cap and one retry interval), exceeds
+`SPEND_CEILING_USD`, and checks the running total again before each priced
+create. Comparisons use unrounded amounts; displayed amounts are rounded up to
+the cent. That horizon, counted from the start of provisioning, is the run's
+deadline: every instance is created with `--termination-time` at the deadline
+and `--instance-termination-action=DELETE`, each metal data disk is set to
+auto-delete with its instance, and no instance is created after the deadline.
+GCE, not this script, enforces that deletion. The network, subnet, firewall
+rules, router, NAT, and bucket have no cloud-side expiry; only `teardown.sh`
+removes them, so their cost keeps accruing past the deadline until it runs.
+Neither the termination time on C4A metal hosts nor any price has been
+verified against Google Cloud. It creates a custom-mode VPC, one
 regional subnet with private Google access, internal and IAP-only SSH firewall
 rules, a Cloud Router with NAT, one bucket (uniform access, public access
 prevention, objects deleted after 7 days), and the hosts. Hosts use Ubuntu

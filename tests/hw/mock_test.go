@@ -336,6 +336,16 @@ func (s *mockState) handle(cmd gcloudCommand) int {
 			s.Resources[i].Flags[k] = v
 		}
 		return 0
+	case "set-disk-auto-delete":
+		disk := s.find("disks", cmd.flags["disk"], map[string]string{"zone": cmd.flags["zone"]})
+		if disk < 0 || s.find("instances", name, cmd.flags) < 0 {
+			return 1
+		}
+		if s.Resources[disk].Flags == nil {
+			s.Resources[disk].Flags = map[string]string{}
+		}
+		s.Resources[disk].Flags["auto-delete"] = "true"
+		return 0
 	case "attach-disk", "detach-disk":
 		disk := s.find("disks", cmd.flags["disk"], map[string]string{"zone": cmd.flags["zone"]})
 		if disk < 0 || s.find("instances", name, cmd.flags) < 0 {
