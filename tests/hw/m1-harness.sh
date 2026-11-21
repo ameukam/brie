@@ -132,8 +132,26 @@ host_state() {
 	printf 'vm_pids=%s\ncontainer_ids=%s\nguest_boot_id=%s\n' "$pids" "$containers" "$boot"
 }
 
+# The namespace is created exclusively with the run label, and cleanup deletes
+# only that incarnation: it re-reads the UID and label and deletes with a UID
+# precondition. Nothing is deleted before the create succeeds, so a failed
+# preflight or a preexisting namespace of the same name is never touched.
+namespace_uid=
 cleanup_namespace() {
-	k delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	[[ -n $namespace_uid ]] || return 0
+	local current
+	if ! current=$(k get namespace "$NAMESPACE" -o "jsonpath={.metadata.uid} {.metadata.labels.$HW_LABEL_KEY}" 2>/dev/null); then
+		printf 'm1: could not read namespace %s for cleanup; delete it by hand after checking UID %s\n' "$NAMESPACE" "$namespace_uid" >&2
+		return 0
+	fi
+	if [[ $current != "$namespace_uid $RUN_ID" ]]; then
+		hw_log refuse "namespace $NAMESPACE is not the incarnation this run created"
+		printf 'm1: REFUSED to delete namespace %s: it is not the incarnation this run created\n' "$NAMESPACE" >&2
+		return 0
+	fi
+	printf '{"kind":"DeleteOptions","apiVersion":"v1","preconditions":{"uid":"%s"}}\n' "$namespace_uid" |
+		k delete --raw "/api/v1/namespaces/$NAMESPACE" -f - >/dev/null 2>&1 ||
+		printf 'm1: deleting namespace %s failed; delete it by hand after checking UID %s\n' "$NAMESPACE" "$namespace_uid" >&2
 }
 trap cleanup_namespace EXIT
 
@@ -145,7 +163,13 @@ ready=$(k get node "$NODE_NAME" -o 'jsonpath={.status.conditions[?(@.type=="Read
 handler=$(k get runtimeclass "$RUNTIME_CLASS" -o 'jsonpath={.handler}') || hw_die "RuntimeClass $RUNTIME_CLASS is missing"
 printf 'node %s\nruntime_class %s\nhandler %s\nimage %s\nfeatures %s\n' \
 	"$NODE_NAME" "$RUNTIME_CLASS" "$handler" "$M1_IMAGE" "${M1_FEATURES:-none}" >"$EVIDENCE/inputs.txt"
-printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n' "$NAMESPACE" | k apply -f - >/dev/null
+namespace_manifest=$(printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n  labels:\n    %s: "%s"\n' \
+	"$NAMESPACE" "$HW_LABEL_KEY" "$RUN_ID")
+created_uid=$(k create -f - -o 'jsonpath={.metadata.uid}' <<<"$namespace_manifest") ||
+	hw_die "could not create namespace $NAMESPACE; refusing to reuse an existing namespace"
+[[ $created_uid =~ ^[0-9a-f-]{36}$ ]] || hw_die "namespace $NAMESPACE was created without a recognizable UID; delete it by hand after checking it"
+namespace_uid=$created_uid
+printf 'namespace %s\nnamespace_uid %s\n' "$NAMESPACE" "$namespace_uid" >>"$EVIDENCE/inputs.txt"
 
 # Networked Pod startup.
 pod_manifest m1-web >"$EVIDENCE/m1-web.yaml"

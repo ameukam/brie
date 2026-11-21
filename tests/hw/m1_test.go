@@ -11,6 +11,8 @@ import (
 	"testing"
 )
 
+const testNamespaceUID = "0b6c9f9e-1111-4222-8333-444455556666"
+
 const testImage = "docker.io/library/busybox@sha256:c542a2b3cb3c982440890284aac884e89dbf468d5ff1c206fd2ba8ea23257420"
 
 func m1Kubectl() []mockResponse {
@@ -18,6 +20,8 @@ func m1Kubectl() []mockResponse {
 		{Match: " version", Output: "Client Version: v1.37.0\n"},
 		{Match: `get node brie-worker-1 -o jsonpath={.status.conditions[?(@.type=="Ready")].status}`, Output: "True"},
 		{Match: "get runtimeclass kata-fc", Output: "kata-fc"},
+		{Match: "create -f - -o jsonpath={.metadata.uid}", Output: testNamespaceUID},
+		{Match: "get namespace brie-m1-r20261113 -o jsonpath={.metadata.uid} {.metadata.labels.brie-hw-run}", Output: testNamespaceUID + " " + testRunID},
 		{Match: "get pod m1-web -n brie-m1-r20261113 -o jsonpath={.metadata.uid}", Output: "uid-1 brie-worker-1 10.244.1.5 Running"},
 		{Match: "get pod m1-web -n brie-m1-r20261113 -o yaml", Output: "kind: Pod\n"},
 	}
@@ -188,6 +192,97 @@ func TestM1Harness(t *testing.T) {
 				if call.Tool == "kubectl" && call.Args[0] != "--kubeconfig="+l.env["M1_KUBECONFIG"] {
 					t.Errorf("kubectl call without the explicit kubeconfig: %q", call.Args)
 				}
+			}
+			if deletes := namespaceDeletes(l); len(deletes) != 1 || deletes[0] != "delete --raw /api/v1/namespaces/brie-m1-r20261113 -f -" {
+				t.Errorf("namespace deletes %q; want one UID-preconditioned raw delete", deletes)
+			}
+		})
+	}
+}
+
+// namespaceDeletes returns the kubectl calls that could delete a namespace.
+func namespaceDeletes(l *lab) []string {
+	var out []string
+	for _, call := range l.calls() {
+		args := strings.Join(call.Args, " ")
+		_, after, _ := strings.Cut(args, "--request-timeout=60s ")
+		if call.Tool == "kubectl" && strings.HasPrefix(after, "delete ") &&
+			(strings.Contains(after, "namespaces/") || strings.Contains(after, "namespace ") || strings.Contains(after, " ns ")) {
+			out = append(out, after)
+		}
+	}
+	return out
+}
+
+func TestM1HarnessNamespaceOwnership(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		kubectl []mockResponse
+		stderr  string
+		created bool
+	}{
+		{
+			name:    "existing namespace is never reused or deleted",
+			kubectl: []mockResponse{{Match: "create -f -", Exit: 1}},
+			stderr:  "refusing to reuse an existing namespace", created: true,
+		},
+		{
+			name:    "failed preflight deletes nothing",
+			kubectl: []mockResponse{{Match: " version", Exit: 1}},
+			stderr:  "cannot reach the API server",
+		},
+		{
+			name:    "node not Ready deletes nothing",
+			kubectl: []mockResponse{{Match: "get node brie-worker-1", Output: "False"}},
+			stderr:  "is not Ready",
+		},
+		{
+			name:    "unrecognizable UID is not used",
+			kubectl: []mockResponse{{Match: "create -f -", Output: "not-a-uid"}},
+			stderr:  "without a recognizable UID", created: true,
+		},
+		{
+			name: "replaced namespace is refused",
+			kubectl: []mockResponse{
+				{Match: "get namespace brie-m1-r20261113", Output: "aaaaaaaa-1111-4222-8333-444455556666 " + testRunID},
+			},
+			stderr: "REFUSED to delete namespace brie-m1-r20261113", created: true,
+		},
+		{
+			name:    "namespace relabelled by another run is refused",
+			kubectl: []mockResponse{{Match: "get namespace brie-m1-r20261113", Output: testNamespaceUID + " r20261112"}},
+			stderr:  "REFUSED to delete namespace", created: true,
+		},
+		{
+			name:    "unreadable namespace is not deleted",
+			kubectl: []mockResponse{{Match: "get namespace brie-m1-r20261113", Exit: 1}},
+			stderr:  "could not read namespace", created: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			l := m1Lab(t, mockState{Kubectl: append(tt.kubectl, m1Kubectl()...), SSH: m1SSH()})
+			r := l.run("m1-harness.sh")
+			if !strings.Contains(r.stderr, tt.stderr) {
+				t.Fatalf("exit=%d stderr=%q; want stderr containing %q", r.code, r.stderr, tt.stderr)
+			}
+			if r.code == 0 && !strings.Contains(tt.stderr, "REFUSED") && !strings.Contains(tt.stderr, "could not read") {
+				t.Fatalf("exit=0; want failure")
+			}
+			if deletes := namespaceDeletes(l); len(deletes) != 0 {
+				t.Errorf("namespace deleted: %q", deletes)
+			}
+			created := false
+			for _, call := range l.calls() {
+				args := strings.Join(call.Args, " ")
+				if call.Tool == "kubectl" && strings.Contains(args, "create -f -") {
+					created = true
+				}
+				if call.Tool == "kubectl" && strings.Contains(args, " apply ") && !strings.Contains(args, ".yaml") {
+					t.Errorf("namespace applied instead of created exclusively: %q", call.Args)
+				}
+			}
+			if created != tt.created {
+				t.Errorf("namespace create attempted=%v, want %v", created, tt.created)
 			}
 		})
 	}
