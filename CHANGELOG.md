@@ -40,7 +40,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - A versioned checkpoint manifest schema (`brie.checkpoint/v1alpha1`) with
   strict canonical JSON decoding and validation of identity, epoch, operation,
   generation, VM-state, memory, and disk artifacts by object generation, size,
-  SHA-256, and CRC32C, the restore compatibility tuple, device layout, resume
+  SHA-256, and CRC32C, the restore compatibility tuple (including the guest
+  agent version and security profile), device layout, resume
   protocol, safe point, watermark, creation time, and encryption, access, and
   retention references. No checkpoint is produced yet.
 - A standard-library Cloud Storage JSON API checkpoint store with immutable
