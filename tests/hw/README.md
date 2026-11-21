@@ -129,3 +129,29 @@ Its evidence records versions and settings, never a kubeconfig or token.
 
 Not covered: Pod routes between hosts, kube-proxy on Brie workers, Brie node
 credentials, and installing `brie-node` itself.
+
+## M1 harness
+
+`m1-harness.sh` runs the DESIGN.md section 15 M1 sequence against one labelled
+workload host. Besides the `lib.sh` inputs it requires `M1_KUBECONFIG` (an
+absolute path, passed to every `kubectl` call), `WORKER`, `WORKER_ZONE`,
+`NODE_NAME`, and a digest-pinned BusyBox `M1_IMAGE`. `RUNTIME_CLASS` defaults
+to `kata-fc` and `AGENT_UNIT` to `brie-node.service`. It submits a restricted
+Pod without `spec.nodeName` and records each step in `results.tsv`:
+
+| Step | How it is checked |
+| --- | --- |
+| startup | Pod Ready on `NODE_NAME`, Running, with an IP |
+| pod-network | HTTP from the worker host to the Pod IP returns the guest boot ID |
+| probes, exec, logs | Exercised only when listed in `M1_FEATURES`; otherwise `SKIPPED-UNSUPPORTED` |
+| volumes, warm-pause-resume | Always `SKIPPED-UNSUPPORTED`; Brie has neither |
+| agent-restart | Firecracker PIDs, CRI container IDs, and guest boot ID are identical before and after restarting `AGENT_UNIT` |
+| cleanup | The Pod and its CRI sandbox are gone after deletion |
+| service-and-dns, deletion-races, memory-footprint | `NOT-RUN`; the harness has no step for them yet |
+
+A skipped or not-run step is never reported as PASS. The harness exits 0 only
+if every step passed, 1 on any failure, and 2 when steps were skipped or not
+run. Evidence goes to `$HW_LOG_DIR/m1-<timestamp>/` with `SHA256SUMS`; it holds
+Pod manifests and status, versions, and host observations, never the
+kubeconfig. The harness assumes `brie-node` already runs on the host as
+`AGENT_UNIT`.

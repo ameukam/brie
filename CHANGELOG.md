@@ -119,6 +119,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
   ID, and journal stage fields, key-based redaction of environment values,
   commands, arguments, request bodies, and credentials, and rate limiting of
   repeated warnings and errors. It is not yet the default agent log format.
+- `tests/hw/m1-harness.sh`, a reproducible M1 sequence for one Brie host:
+  Pod startup, Pod networking, agent restart comparing VM PIDs, container IDs,
+  and guest boot IDs, and cleanup, with credential-free evidence and SHA-256
+  sums. Steps needing features Brie lacks are reported as
+  `SKIPPED-UNSUPPORTED`, never PASS. Tested only against mock `gcloud` and
+  `kubectl`.
 - `tests/hw` install scripts for the provisional D4 tuple and a kubeadm 1.37
   control plane with the Node authorizer, NodeRestriction, bridge CNI, and
   kube-proxy in iptables mode. Downloads are pinned by URL and SHA-256 from an
