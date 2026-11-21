@@ -46,7 +46,8 @@ versioning. Dated nightly prereleases are development builds, not stable release
 - A standard-library Cloud Storage JSON API checkpoint store with immutable
   `ifGenerationMatch=0` uploads, CRC32C/MD5, size, and generation read-back
   verification, manifest publication only after every artifact verifies,
-  strict manifest reads, a redacting GCE metadata-server token source, refused
+  strict manifest reads, errors that name only the HTTP status and a known
+  storage reason, a redacting GCE metadata-server token source, refused
   redirects, and bounded retries with per-attempt deadlines. It is tested only
   against an in-process fake server; no real bucket has been used.
 - A conditional checkpoint-reference commit helper. It updates a Sandbox's
