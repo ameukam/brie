@@ -43,6 +43,12 @@ versioning. Dated nightly prereleases are development builds, not stable release
   SHA-256, and CRC32C, the restore compatibility tuple, device layout, resume
   protocol, safe point, watermark, creation time, and encryption, access, and
   retention references. No checkpoint is produced yet.
+- A standard-library Cloud Storage JSON API checkpoint store with immutable
+  `ifGenerationMatch=0` uploads, CRC32C/MD5, size, and generation read-back
+  verification, manifest publication only after every artifact verifies,
+  strict manifest reads, a redacting GCE metadata-server token source, refused
+  redirects, and bounded retries with per-attempt deadlines. It is tested only
+  against an in-process fake server; no real bucket has been used.
 - Opt-in `brie-node` flags, all off by default: `--log-format=json`;
   `--enable-serving` with `--serving-address`, `--tls-cert-file`,
   `--tls-private-key-file`, and `--client-ca-file`; `--enable-events`; and
