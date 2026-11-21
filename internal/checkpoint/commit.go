@@ -97,7 +97,9 @@ func (r Reference) Validate() error {
 // were checked; a conflict re-reads and re-checks, at most three times.
 //
 // A retry after a lost reply succeeds without writing if the reference is
-// already committed. A rejected commit leaves the previous checkpoint
+// already committed and the Sandbox still authorizes it: same UID, not being
+// deleted, the same placement epoch, and suspension still requested by the
+// reference's operation. A rejected commit leaves the previous checkpoint
 // authoritative and the uploaded objects unreferenced.
 func CommitReference(ctx context.Context, client SandboxCheckpointClient, key SandboxKey, sandboxUID string, reference Reference) error {
 	if err := lifecycleid.UID("sandbox UID", sandboxUID); err != nil {
@@ -114,9 +116,6 @@ func CommitReference(ctx context.Context, client SandboxCheckpointClient, key Sa
 		if state.UID != sandboxUID {
 			return ErrSandboxReplaced
 		}
-		if state.Committed != nil && *state.Committed == reference {
-			return nil
-		}
 		switch {
 		case state.Deleting:
 			return ErrSandboxDeleting
@@ -124,6 +123,8 @@ func CommitReference(ctx context.Context, client SandboxCheckpointClient, key Sa
 			return ErrStaleEpoch
 		case state.SuspendOperationID != reference.OperationID:
 			return ErrNotSuspending
+		case state.Committed != nil && *state.Committed == reference:
+			return nil
 		case state.Committed != nil && state.Committed.CheckpointGeneration >= reference.CheckpointGeneration:
 			return ErrStaleGeneration
 		}
